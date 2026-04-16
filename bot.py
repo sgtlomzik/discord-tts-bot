@@ -6,9 +6,10 @@ import re
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlencode
 
+import aiohttp
 import discord
-import edge_tts
 from discord.ext import commands
 
 
@@ -20,12 +21,17 @@ TMP_DIR = Path(os.getenv("TTS_TMP_DIR", "/dev/shm"))
 DEFAULT_WHITELIST = "441612025286885397"
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-VOICE_NAME = os.getenv("TTS_VOICE", "ru-RU-DmitryNeural").strip()
-TTS_RATE = os.getenv("TTS_RATE", "+10%").strip()
 MAX_TEXT_LENGTH = int(os.getenv("TTS_MAX_TEXT_LENGTH", "500"))
 QUEUE_MAXSIZE = int(os.getenv("TTS_QUEUE_MAXSIZE", "50"))
-START_PAD_MS = int(os.getenv("TTS_START_PAD_MS", "220"))
-IDLE_DISCONNECT_SECONDS = int(os.getenv("TTS_IDLE_DISCONNECT_SECONDS", "300"))
+START_PAD_MS = int(os.getenv("TTS_START_PAD_MS", "120"))
+IDLE_DISCONNECT_SECONDS = int(os.getenv("TTS_IDLE_DISCONNECT_SECONDS", "900"))
+
+RHVOICE_URL = os.getenv("RHVOICE_URL", "http://127.0.0.1:8080").rstrip("/")
+RHVOICE_VOICE = os.getenv("RHVOICE_VOICE", "anna").strip()
+RHVOICE_RATE = int(os.getenv("RHVOICE_RATE", "55"))
+RHVOICE_PITCH = int(os.getenv("RHVOICE_PITCH", "50"))
+RHVOICE_VOLUME = int(os.getenv("RHVOICE_VOLUME", "70"))
+RHVOICE_TIMEOUT_SECONDS = int(os.getenv("RHVOICE_TIMEOUT_SECONDS", "15"))
 
 EMOJI_MAP = {
     "Blya2x": "Бля",
@@ -76,7 +82,9 @@ def process_text(text: str) -> str:
         return EMOJI_MAP.get(match.group(1), "")
 
     text = re.sub(r"<a?:([a-zA-Z0-9_]+):[0-9]+>", replace_emoji, text)
-    return " ".join(text.split())
+    text = text.replace("\n", ". ")
+    text = " ".join(text.split())
+    return text.strip()
 
 
 class TTSBot(commands.Bot):
@@ -87,35 +95,24 @@ class TTSBot(commands.Bot):
         )
         self.worker_task: asyncio.Task[None] | None = None
         self.idle_disconnect_tasks: dict[int, asyncio.Task[None]] = {}
-        self.last_active_channel_id: dict[int, int] = {}
+        self.http_session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self) -> None:
+        timeout = aiohttp.ClientTimeout(total=RHVOICE_TIMEOUT_SECONDS)
+        self.http_session = aiohttp.ClientSession(timeout=timeout)
         self.worker_task = asyncio.create_task(self.tts_worker(), name="tts-worker")
-        asyncio.create_task(self.warmup_tts(), name="tts-warmup")
 
     async def close(self) -> None:
         if self.worker_task:
             self.worker_task.cancel()
+
         for task in self.idle_disconnect_tasks.values():
             task.cancel()
-        await super().close()
 
-    async def warmup_tts(self) -> None:
-        await self.wait_until_ready()
-        filename = TMP_DIR / f"warmup_{uuid.uuid4().hex}.mp3"
-        try:
-            started = time.perf_counter()
-            communicate = edge_tts.Communicate("Привет", VOICE_NAME, rate=TTS_RATE)
-            await communicate.save(str(filename))
-            log.info("TTS warmup done took=%.3fs", time.perf_counter() - started)
-        except Exception:
-            log.exception("TTS warmup failed")
-        finally:
-            if filename.exists():
-                try:
-                    filename.unlink()
-                except OSError:
-                    log.exception("Failed to remove warmup file: %s", filename)
+        if self.http_session:
+            await self.http_session.close()
+
+        await super().close()
 
     def cancel_idle_disconnect(self, guild_id: int) -> None:
         task = self.idle_disconnect_tasks.pop(guild_id, None)
@@ -203,40 +200,96 @@ class TTSBot(commands.Bot):
                 time.perf_counter() - started,
             )
 
-        self.last_active_channel_id[guild_id] = voice_channel.id
         return vc
 
-    async def generate_tts_file(self, text: str) -> Path:
-        filename = TMP_DIR / f"tts_{uuid.uuid4().hex}.mp3"
+    async def wait_for_rhvoice(self) -> None:
+        if not self.http_session:
+            raise RuntimeError("HTTP session is not initialized")
+
+        started = time.perf_counter()
+        deadline = started + 30.0
+
+        while time.perf_counter() < deadline:
+            try:
+                async with self.http_session.get(f"{RHVOICE_URL}/info") as response:
+                    if response.status == 200:
+                        log.info("RHVoice is ready took=%.3fs", time.perf_counter() - started)
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+        raise RuntimeError("RHVoice did not become ready in time")
+
+    async def warmup_tts(self) -> None:
+        filename = TMP_DIR / f"warmup_{uuid.uuid4().hex}.wav"
+        try:
+            await self.generate_tts_file("Привет", filename)
+            log.info("RHVoice warmup completed")
+        except Exception:
+            log.exception("RHVoice warmup failed")
+        finally:
+            if filename.exists():
+                try:
+                    filename.unlink()
+                except OSError:
+                    log.exception("Failed to remove warmup file: %s", filename)
+
+    async def generate_tts_file(self, text: str, filename: Path) -> None:
+        if not self.http_session:
+            raise RuntimeError("HTTP session is not initialized")
+
+        params = {
+            "text": text,
+            "voice": RHVOICE_VOICE,
+            "format": "wav",
+            "rate": str(RHVOICE_RATE),
+            "pitch": str(RHVOICE_PITCH),
+            "volume": str(RHVOICE_VOLUME),
+        }
+
+        url = f"{RHVOICE_URL}/say?{urlencode(params)}"
         started = time.perf_counter()
 
-        log.info("Generating TTS chars=%s voice=%s", len(text), VOICE_NAME)
-        communicate = edge_tts.Communicate(text, VOICE_NAME, rate=TTS_RATE)
-        await communicate.save(str(filename))
+        log.info(
+            "Generating RHVoice TTS chars=%s voice=%s rate=%s pitch=%s volume=%s",
+            len(text),
+            RHVOICE_VOICE,
+            RHVOICE_RATE,
+            RHVOICE_PITCH,
+            RHVOICE_VOLUME,
+        )
+
+        async with self.http_session.get(url) as response:
+            response.raise_for_status()
+            content = await response.read()
+
+        filename.write_bytes(content)
 
         log.info(
-            "TTS generated file=%s size=%s took=%.3fs",
+            "RHVoice generated file=%s size=%s took=%.3fs",
             filename,
             filename.stat().st_size if filename.exists() else "unknown",
             time.perf_counter() - started,
         )
-        return filename
 
     async def tts_worker(self) -> None:
         await self.wait_until_ready()
+        await self.wait_for_rhvoice()
+        await self.warmup_tts()
         log.info("TTS worker started")
 
         while not self.is_closed():
             text, voice_channel, queued_at = await self.message_queue.get()
-            filename: Path | None = None
+            filename = TMP_DIR / f"tts_{uuid.uuid4().hex}.wav"
 
             try:
                 worker_started = time.perf_counter()
 
                 connect_task = asyncio.create_task(self.ensure_voice(voice_channel))
-                tts_task = asyncio.create_task(self.generate_tts_file(text))
+                tts_task = asyncio.create_task(self.generate_tts_file(text, filename))
 
-                vc, filename = await asyncio.gather(connect_task, tts_task)
+                vc, _ = await asyncio.gather(connect_task, tts_task)
 
                 log.info(
                     "Ready to play guild=%s channel=%s queue_wait=%.3fs prep_total=%.3fs",
@@ -263,7 +316,7 @@ class TTSBot(commands.Bot):
                 log.exception("TTS processing failed")
                 await self.disconnect_guild_voice(voice_channel.guild)
             finally:
-                if filename and filename.exists():
+                if filename.exists():
                     try:
                         filename.unlink()
                     except OSError:
@@ -421,6 +474,8 @@ async def join(ctx: commands.Context) -> None:
 
 
 def main() -> None:
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN is not set")
     if not WHITELIST_USERS:
