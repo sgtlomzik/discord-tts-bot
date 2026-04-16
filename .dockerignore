@@ -1,0 +1,14 @@
+.git
+.env
+*.env
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+*.tmp
+*.bak
+*.bak-*
+tts_*.mp3

@@ -1,0 +1,10 @@
+services:
+  tts_bot:
+    build: .
+    image: custom-tts-bot:latest
+    container_name: discord_tts_bot
+    env_file:
+      - path: .env
+        required: false
+    network_mode: "container:gluetun"
+    restart: unless-stopped
