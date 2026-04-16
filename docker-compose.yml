@@ -8,3 +8,6 @@ services:
         required: false
     network_mode: "container:gluetun"
     restart: unless-stopped
+
+    volumes:
+      - ./bot.py:/app/bot.py
