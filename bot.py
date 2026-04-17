@@ -6,7 +6,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, urlunparse
 
 import aiohttp
 import discord
@@ -26,7 +26,7 @@ QUEUE_MAXSIZE = int(os.getenv("TTS_QUEUE_MAXSIZE", "50"))
 START_PAD_MS = int(os.getenv("TTS_START_PAD_MS", "120"))
 IDLE_DISCONNECT_SECONDS = int(os.getenv("TTS_IDLE_DISCONNECT_SECONDS", "900"))
 
-RHVOICE_URL = os.getenv("RHVOICE_URL", "http://127.0.0.1:8080").rstrip("/")
+RAW_RHVOICE_URL = os.getenv("RHVOICE_URL", "http://172.20.0.1:5002").strip()
 RHVOICE_VOICE = os.getenv("RHVOICE_VOICE", "anna").strip()
 RHVOICE_RATE = int(os.getenv("RHVOICE_RATE", "55"))
 RHVOICE_PITCH = int(os.getenv("RHVOICE_PITCH", "50"))
@@ -85,6 +85,40 @@ def process_text(text: str) -> str:
     text = text.replace("\n", ". ")
     text = " ".join(text.split())
     return text.strip()
+
+
+def normalize_rhvoice_url(raw_url: str) -> str:
+    parsed = urlparse(raw_url)
+    if not parsed.scheme:
+        parsed = urlparse(f"http://{raw_url}")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"Invalid RHVOICE_URL: {raw_url!r}")
+
+    port = parsed.port if parsed.port is not None else 5002
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+
+    normalized_path = parsed.path.rstrip("/")
+    netloc = f"{hostname}:{port}"
+
+    return urlunparse((parsed.scheme or "http", netloc, normalized_path, "", "", "")).rstrip("/")
+
+
+RHVOICE_URL = normalize_rhvoice_url(RAW_RHVOICE_URL)
+
+
+def build_rhvoice_url(text: str) -> str:
+    params = {
+        "text": text,
+        "voice": RHVOICE_VOICE,
+        "format": "wav",
+        "rate": str(RHVOICE_RATE),
+        "pitch": str(RHVOICE_PITCH),
+        "volume": str(RHVOICE_VOLUME),
+    }
+    return f"{RHVOICE_URL}/say?{urlencode(params)}"
 
 
 class TTSBot(commands.Bot):
@@ -239,16 +273,7 @@ class TTSBot(commands.Bot):
         if not self.http_session:
             raise RuntimeError("HTTP session is not initialized")
 
-        params = {
-            "text": text,
-            "voice": RHVOICE_VOICE,
-            "format": "wav",
-            "rate": str(RHVOICE_RATE),
-            "pitch": str(RHVOICE_PITCH),
-            "volume": str(RHVOICE_VOLUME),
-        }
-
-        url = f"{RHVOICE_URL}/say?{urlencode(params)}"
+        url = build_rhvoice_url(text)
         started = time.perf_counter()
 
         log.info(
@@ -289,7 +314,19 @@ class TTSBot(commands.Bot):
                 connect_task = asyncio.create_task(self.ensure_voice(voice_channel))
                 tts_task = asyncio.create_task(self.generate_tts_file(text, filename))
 
-                vc, _ = await asyncio.gather(connect_task, tts_task)
+                try:
+                    vc, _ = await asyncio.gather(connect_task, tts_task)
+                except Exception:
+                    connect_error = connect_task.exception() if connect_task.done() else None
+                    tts_error = tts_task.exception() if tts_task.done() else None
+                    if connect_error:
+                        log.exception("Voice prepare failed", exc_info=connect_error)
+                        await self.disconnect_guild_voice(voice_channel.guild)
+                    elif tts_error:
+                        log.exception("TTS generation failed; keeping voice session", exc_info=tts_error)
+                    else:
+                        log.exception("TTS processing failed before playback")
+                    continue
 
                 log.info(
                     "Ready to play guild=%s channel=%s queue_wait=%.3fs prep_total=%.3fs",
@@ -299,7 +336,12 @@ class TTSBot(commands.Bot):
                     time.perf_counter() - worker_started,
                 )
 
-                await self.play_file(vc, filename)
+                try:
+                    await self.play_file(vc, filename)
+                except Exception:
+                    log.exception("Playback failed; disconnecting voice")
+                    await self.disconnect_guild_voice(voice_channel.guild)
+                    continue
 
                 log.info(
                     "Playback finished guild=%s channel=%s total_since_queue=%.3fs",
@@ -389,6 +431,7 @@ async def on_ready() -> None:
     log.info("TTS bot logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
     log.info("Opus loaded: %s", discord.opus.is_loaded())
     log.info("Whitelist users: %s", ",".join(str(user_id) for user_id in sorted(WHITELIST_USERS)))
+    log.info("RHVoice URL: %s", RHVOICE_URL)
 
 
 @bot.event
