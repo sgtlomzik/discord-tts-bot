@@ -32,6 +32,7 @@ RHVOICE_RATE = int(os.getenv("RHVOICE_RATE", "55"))
 RHVOICE_PITCH = int(os.getenv("RHVOICE_PITCH", "50"))
 RHVOICE_VOLUME = int(os.getenv("RHVOICE_VOLUME", "70"))
 RHVOICE_TIMEOUT_SECONDS = int(os.getenv("RHVOICE_TIMEOUT_SECONDS", "15"))
+VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
 
 EMOJI_MAP = {
     "Blya2x": "Бля",
@@ -130,6 +131,8 @@ class TTSBot(commands.Bot):
         self.worker_task: asyncio.Task[None] | None = None
         self.idle_disconnect_tasks: dict[int, asyncio.Task[None]] = {}
         self.http_session: aiohttp.ClientSession | None = None
+        self.voice_connect_locks: dict[int, asyncio.Lock] = {}
+        self.voice_connect_cooldown_until: dict[int, float] = {}
 
     async def setup_hook(self) -> None:
         timeout = aiohttp.ClientTimeout(total=RHVOICE_TIMEOUT_SECONDS)
@@ -153,6 +156,34 @@ class TTSBot(commands.Bot):
         if task and not task.done():
             task.cancel()
             log.info("Cancelled idle disconnect guild=%s", guild_id)
+
+    def get_voice_connect_lock(self, guild_id: int) -> asyncio.Lock:
+        lock = self.voice_connect_locks.get(guild_id)
+        if not lock:
+            lock = asyncio.Lock()
+            self.voice_connect_locks[guild_id] = lock
+        return lock
+
+    def set_voice_connect_cooldown(self, guild_id: int, reason: str) -> None:
+        until = time.monotonic() + VOICE_CONNECT_COOLDOWN_SECONDS
+        self.voice_connect_cooldown_until[guild_id] = until
+        log.warning(
+            "Voice connect cooldown set guild=%s seconds=%s reason=%s",
+            guild_id,
+            VOICE_CONNECT_COOLDOWN_SECONDS,
+            reason,
+        )
+
+    def voice_connect_cooldown_remaining(self, guild_id: int) -> float:
+        until = self.voice_connect_cooldown_until.get(guild_id)
+        if until is None:
+            return 0.0
+
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            self.voice_connect_cooldown_until.pop(guild_id, None)
+            return 0.0
+        return remaining
 
     def schedule_idle_disconnect(self, guild: discord.Guild) -> None:
         self.cancel_idle_disconnect(guild.id)
@@ -196,43 +227,59 @@ class TTSBot(commands.Bot):
         started = time.perf_counter()
         guild_id = voice_channel.guild.id
         self.cancel_idle_disconnect(guild_id)
+        lock = self.get_voice_connect_lock(guild_id)
 
-        vc = discord.utils.get(self.voice_clients, guild=voice_channel.guild)
+        async with lock:
+            remaining = self.voice_connect_cooldown_remaining(guild_id)
+            if remaining > 0:
+                raise RuntimeError(f"Voice connect cooldown active for {remaining:.1f}s")
 
-        if not vc or not vc.is_connected():
-            log.info(
-                "Connecting to voice channel guild=%s channel=%s",
-                guild_id,
-                voice_channel.id,
-            )
-            vc = await voice_channel.connect(timeout=60.0, self_deaf=True)
-            log.info(
-                "Voice connect done guild=%s channel=%s took=%.3fs",
-                guild_id,
-                voice_channel.id,
-                time.perf_counter() - started,
-            )
-        elif vc.channel != voice_channel:
-            log.info(
-                "Moving voice client guild=%s from=%s to=%s",
-                guild_id,
-                getattr(vc.channel, "id", "unknown"),
-                voice_channel.id,
-            )
-            await vc.move_to(voice_channel)
-            log.info(
-                "Voice move done guild=%s channel=%s took=%.3fs",
-                guild_id,
-                voice_channel.id,
-                time.perf_counter() - started,
-            )
-        else:
-            log.info(
-                "Voice ready guild=%s channel=%s took=%.3fs",
-                guild_id,
-                voice_channel.id,
-                time.perf_counter() - started,
-            )
+            vc = discord.utils.get(self.voice_clients, guild=voice_channel.guild)
+
+            if not vc or not vc.is_connected():
+                log.info(
+                    "Connecting to voice channel guild=%s channel=%s",
+                    guild_id,
+                    voice_channel.id,
+                )
+                try:
+                    vc = await voice_channel.connect(timeout=60.0, self_deaf=True)
+                except Exception as exc:
+                    self.set_voice_connect_cooldown(guild_id, type(exc).__name__)
+                    raise
+
+                log.info(
+                    "Voice connect done guild=%s channel=%s took=%.3fs",
+                    guild_id,
+                    voice_channel.id,
+                    time.perf_counter() - started,
+                )
+            elif vc.channel != voice_channel:
+                log.info(
+                    "Moving voice client guild=%s from=%s to=%s",
+                    guild_id,
+                    getattr(vc.channel, "id", "unknown"),
+                    voice_channel.id,
+                )
+                try:
+                    await vc.move_to(voice_channel)
+                except Exception as exc:
+                    self.set_voice_connect_cooldown(guild_id, f"move:{type(exc).__name__}")
+                    raise
+
+                log.info(
+                    "Voice move done guild=%s channel=%s took=%.3fs",
+                    guild_id,
+                    voice_channel.id,
+                    time.perf_counter() - started,
+                )
+            else:
+                log.info(
+                    "Voice ready guild=%s channel=%s took=%.3fs",
+                    guild_id,
+                    voice_channel.id,
+                    time.perf_counter() - started,
+                )
 
         return vc
 
@@ -321,7 +368,16 @@ class TTSBot(commands.Bot):
                     tts_error = tts_task.exception() if tts_task.done() else None
                     if connect_error:
                         log.exception("Voice prepare failed", exc_info=connect_error)
-                        await self.disconnect_guild_voice(voice_channel.guild)
+                        if not tts_task.done():
+                            tts_task.cancel()
+                        vc = discord.utils.get(self.voice_clients, guild=voice_channel.guild)
+                        if vc and vc.is_connected():
+                            await self.disconnect_guild_voice(voice_channel.guild)
+                        else:
+                            log.info(
+                                "Skip disconnect cleanup guild=%s reason=voice_not_connected",
+                                voice_channel.guild.id,
+                            )
                     elif tts_error:
                         log.exception("TTS generation failed; keeping voice session", exc_info=tts_error)
                     else:
@@ -404,6 +460,16 @@ class TTSBot(commands.Bot):
 
     async def auto_connect_for_member(self, member: discord.Member, channel: discord.VoiceChannel) -> None:
         if member.id not in WHITELIST_USERS:
+            return
+
+        remaining = self.voice_connect_cooldown_remaining(channel.guild.id)
+        if remaining > 0:
+            log.info(
+                "Skip auto-connect guild=%s member=%s reason=cooldown remaining=%.1fs",
+                channel.guild.id,
+                member.id,
+                remaining,
+            )
             return
 
         try:

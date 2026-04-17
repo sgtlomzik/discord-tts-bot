@@ -100,8 +100,47 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.wait_for(tts_bot.tts_worker(), timeout=1.0)
 
-        tts_bot.disconnect_guild_voice.assert_awaited_once_with(guild)
+        tts_bot.disconnect_guild_voice.assert_not_awaited()
         tts_bot.play_file.assert_not_awaited()
+
+    async def test_ensure_voice_sets_cooldown_on_connect_error(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+
+        guild = types.SimpleNamespace(id=77)
+        voice_channel = types.SimpleNamespace(
+            id=88,
+            guild=guild,
+            connect=AsyncMock(side_effect=RuntimeError("connect failed")),
+        )
+
+        with self.assertRaises(RuntimeError):
+            await tts_bot.ensure_voice(voice_channel)
+
+        self.assertGreater(tts_bot.voice_connect_cooldown_remaining(guild.id), 0.0)
+
+    async def test_auto_connect_skips_during_cooldown(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.ensure_voice = AsyncMock()
+
+        guild = types.SimpleNamespace(id=90)
+        member = types.SimpleNamespace(id=441612025286885397)
+        channel = types.SimpleNamespace(id=91, guild=guild)
+        tts_bot.voice_connect_cooldown_until[guild.id] = bot_mod.time.monotonic() + 30.0
+
+        await tts_bot.auto_connect_for_member(member, channel)
+
+        tts_bot.ensure_voice.assert_not_awaited()
+
+    async def test_ensure_voice_lock_is_reused_per_guild(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+
+        first = tts_bot.get_voice_connect_lock(5)
+        second = tts_bot.get_voice_connect_lock(5)
+
+        self.assertIs(first, second)
 
 
 if __name__ == "__main__":
