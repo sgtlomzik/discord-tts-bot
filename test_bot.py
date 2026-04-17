@@ -57,6 +57,13 @@ class TTSBotTests(unittest.TestCase):
         self.assertEqual(params["pitch"], [str(bot.RHVOICE_PITCH)])
         self.assertEqual(params["volume"], [str(bot.RHVOICE_VOLUME)])
 
+    def test_parse_tts_engine_order_contains_supported_engines(self):
+        bot = load_bot_module()
+
+        order = bot.parse_tts_engine_order()
+        self.assertGreaterEqual(len(order), 1)
+        self.assertTrue(all(item in {"piper", "rhvoice", "espeak"} for item in order))
+
 
 class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_tts_worker_does_not_disconnect_on_tts_generation_error(self):
@@ -141,6 +148,28 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         second = tts_bot.get_voice_connect_lock(5)
 
         self.assertIs(first, second)
+
+    async def test_generate_tts_file_fallbacks_to_next_engine(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.tts_engines = ["piper", "rhvoice"]
+        tts_bot.generate_piper_file = AsyncMock(side_effect=RuntimeError("missing piper"))
+        tts_bot.generate_rhvoice_file = AsyncMock(return_value=None)
+        tts_bot.generate_espeak_file = AsyncMock(return_value=None)
+
+        filename = Path("/tmp/test_fallback.wav")
+        await tts_bot.generate_tts_file("hello", filename)
+
+        tts_bot.generate_piper_file.assert_awaited_once()
+        tts_bot.generate_rhvoice_file.assert_awaited_once()
+
+    async def test_wait_for_rhvoice_skips_when_not_configured(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.tts_engines = ["piper", "espeak"]
+        tts_bot.http_session = None
+
+        await tts_bot.wait_for_rhvoice()
 
 
 if __name__ == "__main__":

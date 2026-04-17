@@ -33,6 +33,15 @@ RHVOICE_PITCH = int(os.getenv("RHVOICE_PITCH", "50"))
 RHVOICE_VOLUME = int(os.getenv("RHVOICE_VOLUME", "70"))
 RHVOICE_TIMEOUT_SECONDS = int(os.getenv("RHVOICE_TIMEOUT_SECONDS", "15"))
 VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
+TTS_ENGINE = os.getenv("TTS_ENGINE", "piper").strip().lower()
+TTS_ENGINE_FALLBACK_ORDER = os.getenv("TTS_ENGINE_FALLBACK_ORDER", "piper,rhvoice,espeak").strip()
+PIPER_CMD = os.getenv("PIPER_CMD", "piper").strip()
+PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "").strip()
+PIPER_CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH", "").strip()
+PIPER_SPEAKER = int(os.getenv("PIPER_SPEAKER", "-1"))
+ESPEAK_CMD = os.getenv("ESPEAK_CMD", "espeak-ng").strip()
+ESPEAK_VOICE = os.getenv("ESPEAK_VOICE", "ru").strip()
+ESPEAK_SPEED = int(os.getenv("ESPEAK_SPEED", "160"))
 
 EMOJI_MAP = {
     "Blya2x": "Бля",
@@ -122,6 +131,28 @@ def build_rhvoice_url(text: str) -> str:
     return f"{RHVOICE_URL}/say?{urlencode(params)}"
 
 
+def parse_tts_engine_order() -> list[str]:
+    allowed = {"piper", "rhvoice", "espeak"}
+    result: list[str] = []
+    for part in TTS_ENGINE_FALLBACK_ORDER.replace(";", ",").split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if name not in allowed:
+            log.warning("Ignoring unsupported TTS engine in order: %s", name)
+            continue
+        if name not in result:
+            result.append(name)
+
+    if TTS_ENGINE in allowed and TTS_ENGINE not in result:
+        result.insert(0, TTS_ENGINE)
+
+    if not result:
+        result = [TTS_ENGINE] if TTS_ENGINE in allowed else ["rhvoice"]
+
+    return result
+
+
 class TTSBot(commands.Bot):
     def __init__(self) -> None:
         super().__init__(command_prefix=("!tts ", "!tts"), intents=intents)
@@ -133,10 +164,12 @@ class TTSBot(commands.Bot):
         self.http_session: aiohttp.ClientSession | None = None
         self.voice_connect_locks: dict[int, asyncio.Lock] = {}
         self.voice_connect_cooldown_until: dict[int, float] = {}
+        self.tts_engines = parse_tts_engine_order()
 
     async def setup_hook(self) -> None:
-        timeout = aiohttp.ClientTimeout(total=RHVOICE_TIMEOUT_SECONDS)
-        self.http_session = aiohttp.ClientSession(timeout=timeout)
+        if "rhvoice" in self.tts_engines:
+            timeout = aiohttp.ClientTimeout(total=RHVOICE_TIMEOUT_SECONDS)
+            self.http_session = aiohttp.ClientSession(timeout=timeout)
         self.worker_task = asyncio.create_task(self.tts_worker(), name="tts-worker")
 
     async def close(self) -> None:
@@ -284,6 +317,8 @@ class TTSBot(commands.Bot):
         return vc
 
     async def wait_for_rhvoice(self) -> None:
+        if "rhvoice" not in self.tts_engines:
+            return
         if not self.http_session:
             raise RuntimeError("HTTP session is not initialized")
 
@@ -306,9 +341,9 @@ class TTSBot(commands.Bot):
         filename = TMP_DIR / f"warmup_{uuid.uuid4().hex}.wav"
         try:
             await self.generate_tts_file("Привет", filename)
-            log.info("RHVoice warmup completed")
+            log.info("TTS warmup completed")
         except Exception:
-            log.exception("RHVoice warmup failed")
+            log.exception("TTS warmup failed")
         finally:
             if filename.exists():
                 try:
@@ -316,7 +351,7 @@ class TTSBot(commands.Bot):
                 except OSError:
                     log.exception("Failed to remove warmup file: %s", filename)
 
-    async def generate_tts_file(self, text: str, filename: Path) -> None:
+    async def generate_rhvoice_file(self, text: str, filename: Path) -> None:
         if not self.http_session:
             raise RuntimeError("HTTP session is not initialized")
 
@@ -344,6 +379,98 @@ class TTSBot(commands.Bot):
             filename.stat().st_size if filename.exists() else "unknown",
             time.perf_counter() - started,
         )
+
+    async def generate_piper_file(self, text: str, filename: Path) -> None:
+        if not PIPER_MODEL_PATH:
+            raise RuntimeError("PIPER_MODEL_PATH is not set")
+
+        cmd = [
+            PIPER_CMD,
+            "--model",
+            PIPER_MODEL_PATH,
+            "--output_file",
+            str(filename),
+        ]
+        if PIPER_CONFIG_PATH:
+            cmd.extend(["--config", PIPER_CONFIG_PATH])
+        if PIPER_SPEAKER >= 0:
+            cmd.extend(["--speaker", str(PIPER_SPEAKER)])
+
+        started = time.perf_counter()
+        log.info("Generating Piper TTS chars=%s model=%s", len(text), PIPER_MODEL_PATH)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate((text + "\n").encode("utf-8"))
+        if proc.returncode != 0:
+            stderr_text = stderr.decode("utf-8", errors="ignore").strip()
+            stdout_text = stdout.decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(f"Piper failed rc={proc.returncode} stderr={stderr_text} stdout={stdout_text}")
+        if not filename.exists() or filename.stat().st_size == 0:
+            raise RuntimeError("Piper did not produce audio output")
+
+        log.info(
+            "Piper generated file=%s size=%s took=%.3fs",
+            filename,
+            filename.stat().st_size,
+            time.perf_counter() - started,
+        )
+
+    async def generate_espeak_file(self, text: str, filename: Path) -> None:
+        cmd = [
+            ESPEAK_CMD,
+            "-v",
+            ESPEAK_VOICE,
+            "-s",
+            str(ESPEAK_SPEED),
+            "-w",
+            str(filename),
+            text,
+        ]
+        started = time.perf_counter()
+        log.info("Generating eSpeak TTS chars=%s voice=%s", len(text), ESPEAK_VOICE)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            stderr_text = stderr.decode("utf-8", errors="ignore").strip()
+            stdout_text = stdout.decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(f"eSpeak failed rc={proc.returncode} stderr={stderr_text} stdout={stdout_text}")
+        if not filename.exists() or filename.stat().st_size == 0:
+            raise RuntimeError("eSpeak did not produce audio output")
+
+        log.info(
+            "eSpeak generated file=%s size=%s took=%.3fs",
+            filename,
+            filename.stat().st_size,
+            time.perf_counter() - started,
+        )
+
+    async def generate_tts_file(self, text: str, filename: Path) -> None:
+        errors: list[str] = []
+        for engine in self.tts_engines:
+            try:
+                if engine == "piper":
+                    await self.generate_piper_file(text, filename)
+                elif engine == "rhvoice":
+                    await self.generate_rhvoice_file(text, filename)
+                elif engine == "espeak":
+                    await self.generate_espeak_file(text, filename)
+                else:
+                    continue
+                log.info("TTS engine used: %s", engine)
+                return
+            except Exception as exc:
+                errors.append(f"{engine}:{exc}")
+                log.warning("TTS engine failed engine=%s error=%s", engine, exc)
+
+        raise RuntimeError(f"All TTS engines failed: {' | '.join(errors)}")
 
     async def tts_worker(self) -> None:
         await self.wait_until_ready()
@@ -498,6 +625,7 @@ async def on_ready() -> None:
     log.info("Opus loaded: %s", discord.opus.is_loaded())
     log.info("Whitelist users: %s", ",".join(str(user_id) for user_id in sorted(WHITELIST_USERS)))
     log.info("RHVoice URL: %s", RHVOICE_URL)
+    log.info("TTS engines order: %s", ",".join(bot.tts_engines))
 
 
 @bot.event

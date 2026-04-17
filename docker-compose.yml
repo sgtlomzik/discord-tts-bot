@@ -10,6 +10,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./bot.py:/app/bot.py
+      - ./models:/app/models:ro
 
   rhvoice:
     image: ghcr.io/aculeasis/rhvoice-rest:latest
