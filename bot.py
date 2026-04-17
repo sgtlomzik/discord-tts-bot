@@ -5,12 +5,19 @@ import os
 import re
 import time
 import uuid
+import wave
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, urlunparse
 
 import aiohttp
 import discord
 from discord.ext import commands
+
+try:
+    from piper import PiperVoice, SynthesisConfig
+except Exception:  # pragma: no cover - optional dependency
+    PiperVoice = None
+    SynthesisConfig = None
 
 
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -165,6 +172,7 @@ class TTSBot(commands.Bot):
         self.voice_connect_locks: dict[int, asyncio.Lock] = {}
         self.voice_connect_cooldown_until: dict[int, float] = {}
         self.tts_engines = parse_tts_engine_order()
+        self.piper_voice = None
 
     async def setup_hook(self) -> None:
         if "rhvoice" in self.tts_engines:
@@ -381,34 +389,36 @@ class TTSBot(commands.Bot):
         )
 
     async def generate_piper_file(self, text: str, filename: Path) -> None:
+        if PiperVoice is None:
+            raise RuntimeError("piper-tts is not installed")
         if not PIPER_MODEL_PATH:
             raise RuntimeError("PIPER_MODEL_PATH is not set")
+        model_path = Path(PIPER_MODEL_PATH)
+        if not model_path.exists():
+            raise RuntimeError(f"Piper model not found: {model_path}")
+        config_path = Path(PIPER_CONFIG_PATH) if PIPER_CONFIG_PATH else None
+        if config_path and not config_path.exists():
+            raise RuntimeError(f"Piper config not found: {config_path}")
 
-        cmd = [
-            PIPER_CMD,
-            "--model",
-            PIPER_MODEL_PATH,
-            "--output_file",
-            str(filename),
-        ]
-        if PIPER_CONFIG_PATH:
-            cmd.extend(["--config", PIPER_CONFIG_PATH])
-        if PIPER_SPEAKER >= 0:
-            cmd.extend(["--speaker", str(PIPER_SPEAKER)])
+        if self.piper_voice is None:
+            self.piper_voice = await asyncio.to_thread(
+                PiperVoice.load,
+                str(model_path),
+                str(config_path) if config_path else None,
+            )
 
         started = time.perf_counter()
         log.info("Generating Piper TTS chars=%s model=%s", len(text), PIPER_MODEL_PATH)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate((text + "\n").encode("utf-8"))
-        if proc.returncode != 0:
-            stderr_text = stderr.decode("utf-8", errors="ignore").strip()
-            stdout_text = stdout.decode("utf-8", errors="ignore").strip()
-            raise RuntimeError(f"Piper failed rc={proc.returncode} stderr={stderr_text} stdout={stdout_text}")
+
+        syn_config = None
+        if SynthesisConfig is not None and PIPER_SPEAKER >= 0:
+            syn_config = SynthesisConfig(speaker_id=PIPER_SPEAKER)
+
+        def _synthesize() -> None:
+            with wave.open(str(filename), "wb") as wav_file:
+                self.piper_voice.synthesize_wav(text, wav_file, syn_config=syn_config)
+
+        await asyncio.to_thread(_synthesize)
         if not filename.exists() or filename.stat().st_size == 0:
             raise RuntimeError("Piper did not produce audio output")
 
