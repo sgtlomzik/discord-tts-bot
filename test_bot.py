@@ -83,6 +83,58 @@ class TTSBotTests(unittest.TestCase):
         self.assertEqual(bot.validate_voice_profile("PIPER-RUSLAN"), "piper-ruslan")
         self.assertIsNone(bot.validate_voice_profile("missing"))
 
+    def test_resolve_tts_command_voice_channel_prefers_requested_channel(self):
+        bot = load_bot_module()
+
+        class FakeVoiceChannel:
+            pass
+
+        requested = FakeVoiceChannel()
+        with patch.object(bot.discord, "VoiceChannel", FakeVoiceChannel):
+            self.assertIs(bot.resolve_tts_command_voice_channel(None, requested), requested)
+
+    def test_resolve_tts_command_voice_channel_uses_connected_bot_channel_before_user_channel(self):
+        bot = load_bot_module()
+
+        class FakeVoiceChannel:
+            pass
+
+        guild = types.SimpleNamespace(id=10)
+        bot_channel = FakeVoiceChannel()
+        user_channel = FakeVoiceChannel()
+        voice_client = types.SimpleNamespace(
+            channel=bot_channel,
+            is_connected=MagicMock(return_value=True),
+        )
+        interaction = types.SimpleNamespace(
+            guild=guild,
+            user=types.SimpleNamespace(voice=types.SimpleNamespace(channel=user_channel)),
+        )
+
+        with (
+            patch.object(bot.discord, "VoiceChannel", FakeVoiceChannel),
+            patch.object(bot.discord.utils, "get", MagicMock(return_value=voice_client)),
+        ):
+            self.assertIs(bot.resolve_tts_command_voice_channel(interaction), bot_channel)
+
+    def test_resolve_tts_command_voice_channel_falls_back_to_user_channel(self):
+        bot = load_bot_module()
+
+        class FakeVoiceChannel:
+            pass
+
+        user_channel = FakeVoiceChannel()
+        interaction = types.SimpleNamespace(
+            guild=types.SimpleNamespace(id=10),
+            user=types.SimpleNamespace(voice=types.SimpleNamespace(channel=user_channel)),
+        )
+
+        with (
+            patch.object(bot.discord, "VoiceChannel", FakeVoiceChannel),
+            patch.object(bot.discord.utils, "get", MagicMock(return_value=None)),
+        ):
+            self.assertIs(bot.resolve_tts_command_voice_channel(interaction), user_channel)
+
     def test_slash_group_uses_non_reserved_name(self):
         bot = load_bot_module()
 

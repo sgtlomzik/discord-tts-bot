@@ -1306,6 +1306,25 @@ async def voice_profile_autocomplete(
     ][:25]
 
 
+def resolve_tts_command_voice_channel(
+    interaction: discord.Interaction,
+    requested_channel: discord.VoiceChannel | None = None,
+) -> discord.VoiceChannel | None:
+    if requested_channel is not None:
+        return requested_channel
+
+    if interaction.guild is not None:
+        vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+        if vc and vc.is_connected() and isinstance(vc.channel, discord.VoiceChannel):
+            return vc.channel
+
+    user_voice = getattr(getattr(interaction.user, "voice", None), "channel", None)
+    if isinstance(user_voice, discord.VoiceChannel):
+        return user_voice
+
+    return None
+
+
 tts_group = app_commands.Group(name="voicebot", description="Управление озвучкой сообщений")
 
 
@@ -1378,8 +1397,15 @@ async def slash_tts_status(interaction: discord.Interaction) -> None:
 
 
 @tts_group.command(name="test", description="Проиграть тестовую фразу")
-@app_commands.describe(text="Текст для проверки")
-async def slash_tts_test(interaction: discord.Interaction, text: str) -> None:
+@app_commands.describe(
+    text="Текст для проверки",
+    voice_channel="Голосовой канал для удаленного запуска",
+)
+async def slash_tts_test(
+    interaction: discord.Interaction,
+    text: str,
+    voice_channel: discord.VoiceChannel | None = None,
+) -> None:
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("Команда доступна только на сервере.", ephemeral=True)
         return
@@ -1387,14 +1413,18 @@ async def slash_tts_test(interaction: discord.Interaction, text: str) -> None:
     if not allowed and not is_guild_manager(interaction.user):
         await interaction.response.send_message("Вы не добавлены в озвучку.", ephemeral=True)
         return
-    if not interaction.user.voice or not isinstance(interaction.user.voice.channel, discord.VoiceChannel):
-        await interaction.response.send_message("Сначала зайдите в голосовой канал.", ephemeral=True)
+    target_channel = resolve_tts_command_voice_channel(interaction, voice_channel)
+    if target_channel is None:
+        await interaction.response.send_message(
+            "Выберите голосовой канал или зайдите в него сами.",
+            ephemeral=True,
+        )
         return
     final_text = process_text(text)
     if not final_text:
         await interaction.response.send_message("Нет текста для озвучки.", ephemeral=True)
         return
-    await bot.enqueue_tts(final_text, interaction.user.voice.channel, interaction.user.id, interaction.channel_id or 0)
+    await bot.enqueue_tts(final_text, target_channel, interaction.user.id, interaction.channel_id or 0)
     await interaction.response.send_message("Тестовая фраза добавлена в очередь.", ephemeral=True)
 
 
