@@ -5,7 +5,6 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
@@ -46,32 +45,13 @@ class TTSBotTests(unittest.TestCase):
 
         self.assertEqual(bot.process_text("hello\nworld"), "hello. world")
 
-    def test_normalize_rhvoice_url_adds_default_port(self):
+    def test_runtime_is_piper_ruslan_only(self):
         bot = load_bot_module()
 
-        self.assertEqual(bot.normalize_rhvoice_url("http://172.20.0.1"), "http://172.20.0.1:5002")
-
-    def test_build_rhvoice_url_contains_required_params(self):
-        bot = load_bot_module()
-
-        url = bot.build_rhvoice_url("test phrase")
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query)
-
-        self.assertEqual(parsed.path, "/say")
-        self.assertEqual(params["text"], ["test phrase"])
-        self.assertEqual(params["voice"], [bot.RHVOICE_VOICE])
-        self.assertEqual(params["format"], ["wav"])
-        self.assertEqual(params["rate"], [str(bot.RHVOICE_RATE)])
-        self.assertEqual(params["pitch"], [str(bot.RHVOICE_PITCH)])
-        self.assertEqual(params["volume"], [str(bot.RHVOICE_VOLUME)])
-
-    def test_parse_tts_engine_order_contains_supported_engines(self):
-        bot = load_bot_module()
-
-        order = bot.parse_tts_engine_order()
-        self.assertGreaterEqual(len(order), 1)
-        self.assertTrue(all(item in {"piper", "rhvoice", "espeak"} for item in order))
+        self.assertEqual(bot.DEFAULT_VOICE_PROFILE, "piper-ruslan")
+        self.assertEqual(list(bot.VOICE_PROFILES), ["piper-ruslan"])
+        self.assertFalse(hasattr(bot, "RHVOICE_URL"))
+        self.assertFalse(hasattr(bot, "ESPEAK_CMD"))
 
     def test_config_store_persists_guild_settings(self):
         bot = load_bot_module()
@@ -86,16 +66,16 @@ class TTSBotTests(unittest.TestCase):
 
             store.add_user(10, 222)
             store.set_enabled(10, False)
-            store.set_default_voice(10, "rhvoice-anna")
-            store.set_user_voice(10, 222, "rhvoice-pavel")
+            store.set_default_voice(10, "piper-ruslan")
+            store.set_user_voice(10, 222, "piper-ruslan")
 
             loaded = bot.BotConfigStore(path, set())
             loaded_config = loaded.get_guild(10)
 
             self.assertFalse(loaded_config.enabled)
             self.assertEqual(loaded_config.allowed_users, {111, 222})
-            self.assertEqual(loaded_config.default_voice, "rhvoice-anna")
-            self.assertEqual(loaded.voice_for_user(10, 222), "rhvoice-pavel")
+            self.assertEqual(loaded_config.default_voice, "piper-ruslan")
+            self.assertEqual(loaded.voice_for_user(10, 222), "piper-ruslan")
 
     def test_validate_voice_profile_rejects_unknown_voice(self):
         bot = load_bot_module()
@@ -108,21 +88,13 @@ class TTSBotTests(unittest.TestCase):
 
         self.assertEqual(bot.tts_group.name, "voicebot")
 
-    def test_build_rhvoice_url_accepts_profile_voice_override(self):
-        bot = load_bot_module()
-
-        url = bot.build_rhvoice_url("hello", voice="irina")
-        params = parse_qs(urlparse(url).query)
-
-        self.assertEqual(params["voice"], ["irina"])
-
     def test_config_store_removes_user_voice_when_user_denied(self):
         bot = load_bot_module()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             store = bot.BotConfigStore(Path(tmp_dir) / "config.json", set())
             store.add_user(10, 222)
-            store.set_user_voice(10, 222, "rhvoice-irina")
+            store.set_user_voice(10, 222, "piper-ruslan")
             store.remove_user(10, 222)
 
             config = store.get_guild(10)
@@ -155,8 +127,15 @@ class TTSBotTests(unittest.TestCase):
         self.assertIn("silenceremove", filter_complex)
         self.assertLess(filter_complex.index("silenceremove"), filter_complex.index("concat=n=3"))
         self.assertIn("[primer][speech][tail]concat=n=3:v=0:a=1[out]", filter_complex)
-        self.assertTrue(any("anoisesrc" in part for part in command))
+        self.assertTrue(any("anullsrc" in part for part in command))
         self.assertEqual(command[-1], "/tmp/out.wav")
+
+    def test_default_preroll_and_idle_frames_are_silent(self):
+        bot = load_bot_module()
+
+        self.assertEqual(bot.TTS_PREROLL_MODE, "silence")
+        self.assertEqual(bot.TTS_IDLE_FRAME_MODE, "silence")
+        self.assertIn("anullsrc", bot.build_preroll_lavfi_source(bot.TTS_PREROLL_MODE, "0.2"))
 
     def test_preroll_lavfi_source_supports_sine_noise_and_silence(self):
         bot = load_bot_module()
@@ -236,7 +215,6 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         tts_bot = bot_mod.TTSBot()
 
         tts_bot.wait_until_ready = AsyncMock()
-        tts_bot.wait_for_rhvoice = AsyncMock()
         tts_bot.warmup_tts = AsyncMock()
         tts_bot.ensure_voice = AsyncMock(return_value=object())
         tts_bot.generate_tts_file = AsyncMock(side_effect=RuntimeError("tts failed"))
@@ -270,7 +248,6 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         source = types.SimpleNamespace(enqueue_frames=MagicMock(), wait_until_drained=AsyncMock(return_value=True))
         tts_bot.wait_until_ready = AsyncMock()
-        tts_bot.wait_for_rhvoice = AsyncMock()
         tts_bot.warmup_tts = AsyncMock()
         tts_bot.ensure_voice = AsyncMock(return_value=types.SimpleNamespace(guild=types.SimpleNamespace(id=1)))
         tts_bot.generate_tts_file = AsyncMock(return_value=None)
@@ -301,7 +278,6 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         tts_bot = bot_mod.TTSBot()
 
         tts_bot.wait_until_ready = AsyncMock()
-        tts_bot.wait_for_rhvoice = AsyncMock()
         tts_bot.warmup_tts = AsyncMock()
         tts_bot.ensure_voice = AsyncMock(return_value=object())
         tts_bot.generate_tts_file = AsyncMock(return_value=None)
@@ -328,7 +304,6 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         tts_bot = bot_mod.TTSBot()
 
         tts_bot.wait_until_ready = AsyncMock()
-        tts_bot.wait_for_rhvoice = AsyncMock()
         tts_bot.warmup_tts = AsyncMock()
         tts_bot.ensure_voice = AsyncMock(side_effect=RuntimeError("connect failed"))
         tts_bot.generate_tts_file = AsyncMock(return_value=None)
@@ -386,6 +361,21 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         tts_bot.ensure_voice.assert_not_awaited()
 
+    async def test_auto_connect_skips_after_recent_idle_disconnect(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.config_store = temp_config_store(bot_mod, {441612025286885397})
+        tts_bot.ensure_voice = AsyncMock()
+
+        guild = types.SimpleNamespace(id=90)
+        member = types.SimpleNamespace(id=441612025286885397)
+        channel = types.SimpleNamespace(id=91, guild=guild)
+        tts_bot.suppress_auto_connect_until[guild.id] = bot_mod.time.monotonic() + 30.0
+
+        await tts_bot.auto_connect_for_member(member, channel)
+
+        tts_bot.ensure_voice.assert_not_awaited()
+
     async def test_auto_connect_skips_when_guild_disabled(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
@@ -411,35 +401,17 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(first, second)
 
-    async def test_generate_tts_file_fallbacks_to_next_engine(self):
+    async def test_generate_tts_file_uses_piper_only(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
-        tts_bot.tts_engines = ["piper", "rhvoice"]
-        tts_bot.generate_piper_file = AsyncMock(side_effect=RuntimeError("missing piper"))
-        tts_bot.generate_rhvoice_file = AsyncMock(return_value=None)
-        tts_bot.generate_espeak_file = AsyncMock(return_value=None)
+        tts_bot.generate_piper_file = AsyncMock(return_value=None)
 
-        filename = Path("/tmp/test_fallback.wav")
+        filename = Path("/tmp/test_piper_only.wav")
         await tts_bot.generate_tts_file("hello", filename)
 
         tts_bot.generate_piper_file.assert_awaited_once()
-        tts_bot.generate_rhvoice_file.assert_awaited_once()
-
-    async def test_generate_tts_file_uses_selected_rhvoice_profile_first(self):
-        bot_mod = load_bot_module()
-        tts_bot = bot_mod.TTSBot()
-        tts_bot.tts_engines = ["piper", "rhvoice", "espeak"]
-        tts_bot.generate_piper_file = AsyncMock(return_value=None)
-        tts_bot.generate_rhvoice_file = AsyncMock(return_value=None)
-        tts_bot.generate_espeak_file = AsyncMock(return_value=None)
-
-        filename = Path("/tmp/test_rhvoice_profile.wav")
-        await tts_bot.generate_tts_file("hello", filename, "rhvoice-irina")
-
-        tts_bot.generate_rhvoice_file.assert_awaited_once()
-        profile = tts_bot.generate_rhvoice_file.await_args.args[2]
-        self.assertEqual(profile.name, "rhvoice-irina")
-        tts_bot.generate_piper_file.assert_not_awaited()
+        profile = tts_bot.generate_piper_file.await_args.args[2]
+        self.assertEqual(profile.name, "piper-ruslan")
 
     async def test_clear_queue_for_guild_keeps_other_guild_jobs(self):
         bot_mod = load_bot_module()
@@ -509,27 +481,43 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(job.text, "one. two")
 
-    async def test_enqueue_tts_uses_personal_voice_profile(self):
+    async def test_enqueue_tts_uses_piper_ruslan_profile(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
         tts_bot.config_store = temp_config_store(bot_mod)
 
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
-        tts_bot.config_store.set_user_voice(guild.id, 300, "rhvoice-irina")
+        tts_bot.config_store.set_user_voice(guild.id, 300, "piper-ruslan")
 
         await tts_bot.enqueue_tts("hello", voice_channel, 300, 400)
 
         job = await tts_bot.message_queue.get()
-        self.assertEqual(job.voice_profile, "rhvoice-irina")
+        self.assertEqual(job.voice_profile, "piper-ruslan")
 
-    async def test_wait_for_rhvoice_skips_when_not_configured(self):
+    async def test_idle_disconnect_runs_even_when_allowed_user_is_present(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
-        tts_bot.tts_engines = ["piper", "espeak"]
-        tts_bot.http_session = None
+        guild = types.SimpleNamespace(id=123)
+        allowed_member = types.SimpleNamespace(id=441612025286885397, bot=False)
+        channel = types.SimpleNamespace(members=[allowed_member])
+        vc = types.SimpleNamespace(
+            channel=channel,
+            is_connected=MagicMock(return_value=True),
+            is_playing=MagicMock(return_value=False),
+            is_paused=MagicMock(return_value=False),
+            disconnect=AsyncMock(),
+        )
+        tts_bot.config_store = temp_config_store(bot_mod, {allowed_member.id})
 
-        await tts_bot.wait_for_rhvoice()
+        with (
+            patch.object(bot_mod.asyncio, "sleep", AsyncMock()),
+            patch.object(bot_mod.discord.utils, "get", MagicMock(return_value=vc)),
+        ):
+            await tts_bot._idle_disconnect_after_timeout(guild)
+
+        vc.disconnect.assert_awaited_once_with(force=True)
+        self.assertGreater(tts_bot.suppress_auto_connect_remaining(guild.id), 0.0)
 
     async def test_prepare_playback_file_raises_on_ffmpeg_error(self):
         bot_mod = load_bot_module()

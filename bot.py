@@ -13,9 +13,7 @@ import uuid
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlencode, urlparse, urlunparse
 
-import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -44,16 +42,17 @@ DEFAULT_VOICE_PROFILE = os.getenv("TTS_DEFAULT_VOICE_PROFILE", "piper-ruslan").s
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 MAX_TEXT_LENGTH = int(os.getenv("TTS_MAX_TEXT_LENGTH", "500"))
 QUEUE_MAXSIZE = int(os.getenv("TTS_QUEUE_MAXSIZE", "50"))
-TTS_PREROLL_MS = int(os.getenv("TTS_PREROLL_MS", os.getenv("TTS_START_PAD_MS", "500")))
-TTS_PREROLL_MODE = os.getenv("TTS_PREROLL_MODE", "noise").strip().lower()
-TTS_PREROLL_VOLUME_DB = float(os.getenv("TTS_PREROLL_VOLUME_DB", "-42"))
+TTS_PREROLL_MS = int(os.getenv("TTS_PREROLL_MS", os.getenv("TTS_START_PAD_MS", "250")))
+TTS_PREROLL_MODE = os.getenv("TTS_PREROLL_MODE", "silence").strip().lower()
+TTS_PREROLL_VOLUME_DB = float(os.getenv("TTS_PREROLL_VOLUME_DB", "-90"))
 TTS_SILENCE_TAIL_MS = int(os.getenv("TTS_SILENCE_TAIL_MS", "200"))
 TTS_CONTINUOUS_STREAM = os.getenv("TTS_CONTINUOUS_STREAM", "1").strip().lower() not in {"0", "false", "no"}
-TTS_IDLE_FRAME_MODE = os.getenv("TTS_IDLE_FRAME_MODE", "comfort_noise").strip().lower()
+TTS_IDLE_FRAME_MODE = os.getenv("TTS_IDLE_FRAME_MODE", "silence").strip().lower()
 TTS_IDLE_VOLUME_DB = float(os.getenv("TTS_IDLE_VOLUME_DB", "-60"))
 TTS_STREAM_TAIL_MS = int(os.getenv("TTS_STREAM_TAIL_MS", "200"))
 TTS_MAX_CONTINUOUS_IDLE_SECONDS = int(os.getenv("TTS_MAX_CONTINUOUS_IDLE_SECONDS", "900"))
 IDLE_DISCONNECT_SECONDS = int(os.getenv("TTS_IDLE_DISCONNECT_SECONDS", "900"))
+AUTO_CONNECT_SUPPRESS_SECONDS = int(os.getenv("TTS_AUTO_CONNECT_SUPPRESS_SECONDS", "30"))
 TTS_TRIM_SILENCE = os.getenv("TTS_TRIM_SILENCE", "1").strip().lower() not in {"0", "false", "no"}
 FFMPEG_LOW_DELAY = os.getenv("FFMPEG_LOW_DELAY", "1").strip().lower() not in {"0", "false", "no"}
 TTS_MERGE_SHORT_MESSAGES = os.getenv("TTS_MERGE_SHORT_MESSAGES", "1").strip().lower() not in {
@@ -65,23 +64,11 @@ TTS_MERGE_MAX_CHARS = int(os.getenv("TTS_MERGE_MAX_CHARS", "40"))
 TTS_MERGE_WINDOW_MS = int(os.getenv("TTS_MERGE_WINDOW_MS", "900"))
 TTS_MERGE_MAX_PARTS = int(os.getenv("TTS_MERGE_MAX_PARTS", "4"))
 
-RAW_RHVOICE_URL = os.getenv("RHVOICE_URL", "http://172.20.0.1:5002").strip()
-RHVOICE_VOICE = os.getenv("RHVOICE_VOICE", "anna").strip()
-RHVOICE_RATE = int(os.getenv("RHVOICE_RATE", "55"))
-RHVOICE_PITCH = int(os.getenv("RHVOICE_PITCH", "50"))
-RHVOICE_VOLUME = int(os.getenv("RHVOICE_VOLUME", "70"))
-RHVOICE_TIMEOUT_SECONDS = int(os.getenv("RHVOICE_TIMEOUT_SECONDS", "15"))
 VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
-TTS_ENGINE = os.getenv("TTS_ENGINE", "piper").strip().lower()
-TTS_ENGINE_FALLBACK_ORDER = os.getenv("TTS_ENGINE_FALLBACK_ORDER", "piper,rhvoice,espeak").strip()
-PIPER_CMD = os.getenv("PIPER_CMD", "piper").strip()
 PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "").strip()
 PIPER_CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH", "").strip()
 PIPER_SPEAKER = int(os.getenv("PIPER_SPEAKER", "-1"))
 PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.0"))
-ESPEAK_CMD = os.getenv("ESPEAK_CMD", "espeak-ng").strip()
-ESPEAK_VOICE = os.getenv("ESPEAK_VOICE", "ru").strip()
-ESPEAK_SPEED = int(os.getenv("ESPEAK_SPEED", "160"))
 
 EMOJI_MAP = {
     "Blya2x": "Бля",
@@ -109,15 +96,11 @@ WHITELIST_USERS = parse_user_ids(os.getenv("WHITELIST_USERS", DEFAULT_WHITELIST)
 @dataclass(frozen=True)
 class VoiceProfile:
     name: str
-    engine: str
     label: str
     piper_model_path: str = ""
     piper_config_path: str = ""
     piper_speaker: int = -1
     piper_length_scale: float = 1.0
-    rhvoice_voice: str = ""
-    espeak_voice: str = "ru"
-    espeak_speed: int = 160
 
 
 @dataclass
@@ -142,28 +125,11 @@ class TTSJob:
 VOICE_PROFILES: dict[str, VoiceProfile] = {
     "piper-ruslan": VoiceProfile(
         name="piper-ruslan",
-        engine="piper",
         label="Piper Ruslan",
         piper_model_path=PIPER_MODEL_PATH,
         piper_config_path=PIPER_CONFIG_PATH,
         piper_speaker=PIPER_SPEAKER,
         piper_length_scale=PIPER_LENGTH_SCALE,
-    ),
-    "rhvoice-pavel": VoiceProfile(name="rhvoice-pavel", engine="rhvoice", label="RHVoice Pavel", rhvoice_voice="pavel"),
-    "rhvoice-anna": VoiceProfile(name="rhvoice-anna", engine="rhvoice", label="RHVoice Anna", rhvoice_voice="anna"),
-    "rhvoice-irina": VoiceProfile(name="rhvoice-irina", engine="rhvoice", label="RHVoice Irina", rhvoice_voice="irina"),
-    "rhvoice-aleksandr": VoiceProfile(
-        name="rhvoice-aleksandr",
-        engine="rhvoice",
-        label="RHVoice Aleksandr",
-        rhvoice_voice="aleksandr",
-    ),
-    "espeak-ru": VoiceProfile(
-        name="espeak-ru",
-        engine="espeak",
-        label="eSpeak Russian",
-        espeak_voice=ESPEAK_VOICE,
-        espeak_speed=ESPEAK_SPEED,
     ),
 }
 
@@ -326,62 +292,6 @@ def process_text(text: str) -> str:
     text = text.replace("\n", ". ")
     text = " ".join(text.split())
     return text.strip()
-
-
-def normalize_rhvoice_url(raw_url: str) -> str:
-    parsed = urlparse(raw_url)
-    if not parsed.scheme:
-        parsed = urlparse(f"http://{raw_url}")
-
-    hostname = parsed.hostname
-    if not hostname:
-        raise ValueError(f"Invalid RHVOICE_URL: {raw_url!r}")
-
-    port = parsed.port if parsed.port is not None else 5002
-    if ":" in hostname and not hostname.startswith("["):
-        hostname = f"[{hostname}]"
-
-    normalized_path = parsed.path.rstrip("/")
-    netloc = f"{hostname}:{port}"
-
-    return urlunparse((parsed.scheme or "http", netloc, normalized_path, "", "", "")).rstrip("/")
-
-
-RHVOICE_URL = normalize_rhvoice_url(RAW_RHVOICE_URL)
-
-
-def build_rhvoice_url(text: str, voice: str | None = None) -> str:
-    params = {
-        "text": text,
-        "voice": voice or RHVOICE_VOICE,
-        "format": "wav",
-        "rate": str(RHVOICE_RATE),
-        "pitch": str(RHVOICE_PITCH),
-        "volume": str(RHVOICE_VOLUME),
-    }
-    return f"{RHVOICE_URL}/say?{urlencode(params)}"
-
-
-def parse_tts_engine_order() -> list[str]:
-    allowed = {"piper", "rhvoice", "espeak"}
-    result: list[str] = []
-    for part in TTS_ENGINE_FALLBACK_ORDER.replace(";", ",").split(","):
-        name = part.strip().lower()
-        if not name:
-            continue
-        if name not in allowed:
-            log.warning("Ignoring unsupported TTS engine in order: %s", name)
-            continue
-        if name not in result:
-            result.append(name)
-
-    if TTS_ENGINE in allowed and TTS_ENGINE not in result:
-        result.insert(0, TTS_ENGINE)
-
-    if not result:
-        result = [TTS_ENGINE] if TTS_ENGINE in allowed else ["rhvoice"]
-
-    return result
 
 
 def seconds_from_ms(value_ms: int) -> str:
@@ -578,10 +488,9 @@ class TTSBot(commands.Bot):
         self.worker_task: asyncio.Task[None] | None = None
         self.idle_disconnect_tasks: dict[int, asyncio.Task[None]] = {}
         self.continuous_idle_stop_tasks: dict[int, asyncio.Task[None]] = {}
-        self.http_session: aiohttp.ClientSession | None = None
         self.voice_connect_locks: dict[int, asyncio.Lock] = {}
         self.voice_connect_cooldown_until: dict[int, float] = {}
-        self.tts_engines = parse_tts_engine_order()
+        self.suppress_auto_connect_until: dict[int, float] = {}
         self.config_store = BotConfigStore(BOT_CONFIG_PATH, WHITELIST_USERS)
         self.piper_voices: dict[tuple[str, str], object] = {}
         self.continuous_sources: dict[int, ContinuousTTSAudioSource] = {}
@@ -590,9 +499,6 @@ class TTSBot(commands.Bot):
         self.merge_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
 
     async def setup_hook(self) -> None:
-        if "rhvoice" in self.tts_engines:
-            timeout = aiohttp.ClientTimeout(total=RHVOICE_TIMEOUT_SECONDS)
-            self.http_session = aiohttp.ClientSession(timeout=timeout)
         self.tree.add_command(tts_group)
         try:
             synced = await self.tree.sync()
@@ -613,9 +519,6 @@ class TTSBot(commands.Bot):
             task.cancel()
         for source in self.continuous_sources.values():
             source.stop()
-
-        if self.http_session:
-            await self.http_session.close()
 
         await super().close()
 
@@ -659,6 +562,29 @@ class TTSBot(commands.Bot):
             return 0.0
         return remaining
 
+    def suppress_auto_connect(self, guild_id: int, reason: str) -> None:
+        if AUTO_CONNECT_SUPPRESS_SECONDS <= 0:
+            return
+        until = time.monotonic() + AUTO_CONNECT_SUPPRESS_SECONDS
+        self.suppress_auto_connect_until[guild_id] = until
+        log.info(
+            "Auto-connect suppressed guild=%s seconds=%s reason=%s",
+            guild_id,
+            AUTO_CONNECT_SUPPRESS_SECONDS,
+            reason,
+        )
+
+    def suppress_auto_connect_remaining(self, guild_id: int) -> float:
+        until = self.suppress_auto_connect_until.get(guild_id)
+        if until is None:
+            return 0.0
+
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            self.suppress_auto_connect_until.pop(guild_id, None)
+            return 0.0
+        return remaining
+
     def schedule_idle_disconnect(self, guild: discord.Guild) -> None:
         self.cancel_idle_disconnect(guild.id)
         task = asyncio.create_task(
@@ -680,17 +606,8 @@ class TTSBot(commands.Bot):
                 log.info("Skip idle disconnect guild=%s reason=playback_active", guild.id)
                 return
 
-            channel = vc.channel
-            if isinstance(channel, discord.VoiceChannel):
-                whitelisted_present = any(
-                    (not member.bot) and self.config_store.is_allowed(guild.id, member.id)
-                    for member in channel.members
-                )
-                if whitelisted_present:
-                    log.info("Skip idle disconnect guild=%s reason=whitelisted_member_present", guild.id)
-                    return
-
             await vc.disconnect(force=True)
+            self.suppress_auto_connect(guild.id, "idle_disconnect")
             log.info("Idle disconnect executed guild=%s", guild.id)
         except asyncio.CancelledError:
             pass
@@ -796,27 +713,6 @@ class TTSBot(commands.Bot):
                 )
 
         return vc
-
-    async def wait_for_rhvoice(self) -> None:
-        if "rhvoice" not in self.tts_engines:
-            return
-        if not self.http_session:
-            raise RuntimeError("HTTP session is not initialized")
-
-        started = time.perf_counter()
-        deadline = started + 30.0
-
-        while time.perf_counter() < deadline:
-            try:
-                async with self.http_session.get(f"{RHVOICE_URL}/info") as response:
-                    if response.status == 200:
-                        log.info("RHVoice is ready took=%.3fs", time.perf_counter() - started)
-                        return
-            except Exception:
-                pass
-            await asyncio.sleep(1.0)
-
-        raise RuntimeError("RHVoice did not become ready in time")
 
     async def warmup_tts(self) -> None:
         filename = TMP_DIR / f"warmup_{uuid.uuid4().hex}.wav"
@@ -949,36 +845,6 @@ class TTSBot(commands.Bot):
             self.message_queue.put_nowait(job)
         return removed
 
-    async def generate_rhvoice_file(self, text: str, filename: Path, profile: VoiceProfile) -> None:
-        if not self.http_session:
-            raise RuntimeError("HTTP session is not initialized")
-
-        voice = profile.rhvoice_voice or RHVOICE_VOICE
-        url = build_rhvoice_url(text, voice=voice)
-        started = time.perf_counter()
-
-        log.info(
-            "Generating RHVoice TTS chars=%s voice=%s rate=%s pitch=%s volume=%s",
-            len(text),
-            voice,
-            RHVOICE_RATE,
-            RHVOICE_PITCH,
-            RHVOICE_VOLUME,
-        )
-
-        async with self.http_session.get(url) as response:
-            response.raise_for_status()
-            content = await response.read()
-
-        filename.write_bytes(content)
-
-        log.info(
-            "RHVoice generated file=%s size=%s took=%.3fs",
-            filename,
-            filename.stat().st_size if filename.exists() else "unknown",
-            time.perf_counter() - started,
-        )
-
     async def generate_piper_file(self, text: str, filename: Path, profile: VoiceProfile) -> None:
         if PiperVoice is None:
             raise RuntimeError("piper-tts is not installed")
@@ -1030,66 +896,13 @@ class TTSBot(commands.Bot):
             time.perf_counter() - started,
         )
 
-    async def generate_espeak_file(self, text: str, filename: Path, profile: VoiceProfile) -> None:
-        cmd = [
-            ESPEAK_CMD,
-            "-v",
-            profile.espeak_voice or ESPEAK_VOICE,
-            "-s",
-            str(profile.espeak_speed or ESPEAK_SPEED),
-            "-w",
-            str(filename),
-            text,
-        ]
-        started = time.perf_counter()
-        log.info("Generating eSpeak TTS chars=%s voice=%s", len(text), profile.espeak_voice or ESPEAK_VOICE)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            stderr_text = stderr.decode("utf-8", errors="ignore").strip()
-            stdout_text = stdout.decode("utf-8", errors="ignore").strip()
-            raise RuntimeError(f"eSpeak failed rc={proc.returncode} stderr={stderr_text} stdout={stdout_text}")
-        if not filename.exists() or filename.stat().st_size == 0:
-            raise RuntimeError("eSpeak did not produce audio output")
-
-        log.info(
-            "eSpeak generated file=%s size=%s took=%.3fs",
-            filename,
-            filename.stat().st_size,
-            time.perf_counter() - started,
-        )
-
     async def generate_tts_file(self, text: str, filename: Path, voice_profile: str | None = None) -> None:
         profile = VOICE_PROFILES.get(voice_profile or DEFAULT_VOICE_PROFILE, VOICE_PROFILES[DEFAULT_VOICE_PROFILE])
-        engines = [profile.engine] + [engine for engine in self.tts_engines if engine != profile.engine]
-        errors: list[str] = []
-        for engine in engines:
-            try:
-                if engine == "piper":
-                    await self.generate_piper_file(text, filename, profile)
-                elif engine == "rhvoice":
-                    fallback_profile = profile if profile.engine == "rhvoice" else VOICE_PROFILES["rhvoice-pavel"]
-                    await self.generate_rhvoice_file(text, filename, fallback_profile)
-                elif engine == "espeak":
-                    fallback_profile = profile if profile.engine == "espeak" else VOICE_PROFILES["espeak-ru"]
-                    await self.generate_espeak_file(text, filename, fallback_profile)
-                else:
-                    continue
-                log.info("TTS engine used: %s profile=%s", engine, profile.name)
-                return
-            except Exception as exc:
-                errors.append(f"{engine}:{exc}")
-                log.warning("TTS engine failed engine=%s error=%s", engine, exc)
-
-        raise RuntimeError(f"All TTS engines failed: {' | '.join(errors)}")
+        await self.generate_piper_file(text, filename, profile)
+        log.info("TTS engine used: piper profile=%s", profile.name)
 
     async def tts_worker(self) -> None:
         await self.wait_until_ready()
-        await self.wait_for_rhvoice()
         await self.warmup_tts()
         log.info("TTS worker started")
 
@@ -1319,6 +1132,7 @@ class TTSBot(commands.Bot):
             return
         try:
             await vc.disconnect(force=True)
+            self.suppress_auto_connect(guild.id, "explicit_disconnect")
             log.info("Voice disconnected guild=%s", guild.id)
         except Exception:
             log.exception("Voice disconnect cleanup failed")
@@ -1336,6 +1150,16 @@ class TTSBot(commands.Bot):
                 channel.guild.id,
                 member.id,
                 remaining,
+            )
+            return
+
+        suppress_remaining = self.suppress_auto_connect_remaining(channel.guild.id)
+        if suppress_remaining > 0:
+            log.info(
+                "Skip auto-connect guild=%s member=%s reason=recent_disconnect remaining=%.1fs",
+                channel.guild.id,
+                member.id,
+                suppress_remaining,
             )
             return
 
@@ -1365,8 +1189,6 @@ async def on_ready() -> None:
     log.info("Opus loaded: %s", discord.opus.is_loaded())
     log.info("Env fallback whitelist users: %s", ",".join(str(user_id) for user_id in sorted(WHITELIST_USERS)))
     log.info("Bot config path: %s", BOT_CONFIG_PATH)
-    log.info("RHVoice URL: %s", RHVOICE_URL)
-    log.info("TTS engines order: %s", ",".join(bot.tts_engines))
     log.info("Voice profiles: %s", ",".join(sorted(VOICE_PROFILES)))
     log.info("Piper tuning: speaker=%s length_scale=%.2f", PIPER_SPEAKER, PIPER_LENGTH_SCALE)
     log.info(
@@ -1530,64 +1352,6 @@ async def slash_tts_deny(interaction: discord.Interaction, user: discord.Member)
     assert guild is not None
     bot.config_store.remove_user(guild.id, user.id)
     await interaction.response.send_message(f"Исключен из озвучки: {user.mention}", ephemeral=True)
-
-
-@tts_group.command(name="voice-set", description="Сменить озвучку по умолчанию")
-@app_commands.describe(voice="Voice profile")
-@app_commands.autocomplete(voice=voice_profile_autocomplete)
-async def slash_tts_voice_set(interaction: discord.Interaction, voice: str) -> None:
-    if not await require_guild_manager(interaction):
-        return
-    voice_name = validate_voice_profile(voice)
-    if not voice_name:
-        await interaction.response.send_message(
-            "Неизвестный voice profile. Используйте `/voicebot voices`.",
-            ephemeral=True,
-        )
-        return
-    guild = interaction.guild
-    assert guild is not None
-    bot.config_store.set_default_voice(guild.id, voice_name)
-    await interaction.response.send_message(f"Озвучка по умолчанию: `{voice_name}`.", ephemeral=True)
-
-
-@tts_group.command(name="voice-user", description="Назначить отдельную озвучку пользователю")
-@app_commands.describe(user="Пользователь", voice="Voice profile")
-@app_commands.autocomplete(voice=voice_profile_autocomplete)
-async def slash_tts_voice_user(interaction: discord.Interaction, user: discord.Member, voice: str) -> None:
-    if not await require_guild_manager(interaction):
-        return
-    voice_name = validate_voice_profile(voice)
-    if not voice_name:
-        await interaction.response.send_message(
-            "Неизвестный voice profile. Используйте `/voicebot voices`.",
-            ephemeral=True,
-        )
-        return
-    guild = interaction.guild
-    assert guild is not None
-    bot.config_store.set_user_voice(guild.id, user.id, voice_name)
-    await interaction.response.send_message(f"Для {user.mention} назначено: `{voice_name}`.", ephemeral=True)
-
-
-@tts_group.command(name="voice-clear", description="Сбросить персональную озвучку пользователя")
-@app_commands.describe(user="Пользователь")
-async def slash_tts_voice_clear(interaction: discord.Interaction, user: discord.Member) -> None:
-    if not await require_guild_manager(interaction):
-        return
-    guild = interaction.guild
-    assert guild is not None
-    bot.config_store.clear_user_voice(guild.id, user.id)
-    await interaction.response.send_message(f"Персональная озвучка сброшена: {user.mention}", ephemeral=True)
-
-
-@tts_group.command(name="voices", description="Показать доступные озвучки")
-async def slash_tts_voices(interaction: discord.Interaction) -> None:
-    lines = [
-        f"`{name}` - {profile.label} ({profile.engine})"
-        for name, profile in sorted(VOICE_PROFILES.items())
-    ]
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @tts_group.command(name="status", description="Показать состояние TTS на сервере")
