@@ -11,6 +11,7 @@ services:
     volumes:
       - ./bot.py:/app/bot.py
       - ./models:/app/models:ro
+      - ./data:/app/data
 
   rhvoice:
     image: ghcr.io/aculeasis/rhvoice-rest:latest

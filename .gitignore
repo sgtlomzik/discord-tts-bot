@@ -13,6 +13,7 @@ __pycache__/
 *.bak
 *.bak-*
 tts_*.mp3
+data/*.json
 
 .DS_Store
 Thumbs.db
