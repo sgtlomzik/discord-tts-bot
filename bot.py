@@ -1424,8 +1424,8 @@ async def slash_tts_test(
     if not final_text:
         await interaction.response.send_message("Нет текста для озвучки.", ephemeral=True)
         return
-    await bot.enqueue_tts(final_text, target_channel, interaction.user.id, interaction.channel_id or 0)
     await interaction.response.send_message("Тестовая фраза добавлена в очередь.", ephemeral=True)
+    await bot.enqueue_tts(final_text, target_channel, interaction.user.id, interaction.channel_id or 0)
 
 
 @tts_group.command(name="queue-clear", description="Очистить очередь TTS")

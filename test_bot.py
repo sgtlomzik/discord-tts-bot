@@ -547,6 +547,34 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         job = await tts_bot.message_queue.get()
         self.assertEqual(job.voice_profile, "piper-ruslan")
 
+    async def test_slash_tts_test_responds_before_enqueueing_audio(self):
+        bot_mod = load_bot_module()
+
+        class FakeMember:
+            pass
+
+        call_order = []
+        target_channel = types.SimpleNamespace(id=200, guild=types.SimpleNamespace(id=100))
+        interaction = types.SimpleNamespace(
+            guild=types.SimpleNamespace(id=100),
+            user=FakeMember(),
+            channel_id=300,
+            response=types.SimpleNamespace(
+                send_message=AsyncMock(side_effect=lambda *args, **kwargs: call_order.append("response")),
+            ),
+        )
+        interaction.user.id = 400
+        bot_mod.bot.config_store.is_allowed = MagicMock(return_value=True)
+        bot_mod.bot.enqueue_tts = AsyncMock(side_effect=lambda *args, **kwargs: call_order.append("enqueue"))
+
+        with (
+            patch.object(bot_mod.discord, "Member", FakeMember),
+            patch.object(bot_mod, "resolve_tts_command_voice_channel", MagicMock(return_value=target_channel)),
+        ):
+            await bot_mod.slash_tts_test.callback(interaction, "проверка")
+
+        self.assertEqual(call_order, ["response", "enqueue"])
+
     async def test_idle_disconnect_runs_even_when_allowed_user_is_present(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()

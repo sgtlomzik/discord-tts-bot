@@ -2,6 +2,10 @@
 *.env
 !.env.example
 
+.codex
+.venv/
+models/
+
 __pycache__/
 *.py[cod]
 .pytest_cache/
