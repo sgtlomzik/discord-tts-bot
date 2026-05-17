@@ -65,6 +65,9 @@ TTS_MERGE_MAX_CHARS = int(os.getenv("TTS_MERGE_MAX_CHARS", "40"))
 TTS_MERGE_WINDOW_MS = int(os.getenv("TTS_MERGE_WINDOW_MS", "900"))
 TTS_MERGE_MAX_PARTS = int(os.getenv("TTS_MERGE_MAX_PARTS", "4"))
 TTS_MERGE_ALGORITHM = os.getenv("TTS_MERGE_ALGORITHM", "legacy").strip().lower()
+if TTS_MERGE_ALGORITHM not in {"legacy", "selective_hold_v2", "off"}:
+    log.warning("Unknown TTS_MERGE_ALGORITHM=%s; using legacy", TTS_MERGE_ALGORITHM)
+    TTS_MERGE_ALGORITHM = "legacy"
 TTS_SELECTIVE_HOLD_ENABLED = os.getenv("TTS_SELECTIVE_HOLD_ENABLED", "1").strip().lower() not in {
     "0",
     "false",
@@ -475,6 +478,18 @@ def analyze_message_for_merge(raw_text: str) -> ParsedMessage:
         is_caps_shout=is_caps_shout,
         is_keyboard_smash=is_keyboard_smash,
         is_question_or_terminal=is_question_or_terminal,
+    )
+
+
+def is_reaction_like(parsed: ParsedMessage) -> bool:
+    return (
+        bool(parsed.spoken_text)
+        and not parsed.is_special_only
+        and not parsed.is_caps_shout
+        and not parsed.is_keyboard_smash
+        and not parsed.is_question_or_terminal
+        and parsed.effective_length <= 5
+        and parsed.word_count <= 1
     )
 
 
@@ -951,7 +966,7 @@ class TTSBot(commands.Bot):
             )
             return True
         except (asyncio.QueueFull, TimeoutError):
-            log.warning("TTS queue full; dropping message author=%s", author_id)
+            log.warning("TTS enqueue failed author=%s enqueue_fail_reason=queue_timeout", author_id)
             return False
 
     def _merge_lock(self, key: tuple[int, int]) -> asyncio.Lock:
@@ -999,7 +1014,14 @@ class TTSBot(commands.Bot):
                 message_ts=state.first_ts,
             )
             if ok:
-                log.info("Merged buffer flushed key=%s parts=%s reason=%s", state.key, len(state.items), reason)
+                log.info(
+                    "Merged buffer flushed key=%s parts=%s reason=%s buffer_age_ms=%s effective_length=%s",
+                    state.key,
+                    len(state.items),
+                    reason,
+                    round((time.perf_counter() - state.first_ts) * 1000),
+                    state.effective_len_total,
+                )
             return ok
         except Exception:
             log.exception("Failed to enqueue merged state key=%s reason=%s", state.key, reason)
@@ -1010,6 +1032,12 @@ class TTSBot(commands.Bot):
         if not state:
             return True
         if expected_generation is not None and state.generation_id != expected_generation:
+            log.info(
+                "Selective hold stale_timer_ignored key=%s expected_generation=%s current_generation=%s",
+                key,
+                expected_generation,
+                state.generation_id,
+            )
             return False
         if state.timer_task and not state.timer_task.done():
             state.timer_task.cancel()
@@ -1041,6 +1069,8 @@ class TTSBot(commands.Bot):
         key = (author_id, voice_channel.id)
         now = time.perf_counter()
         parsed = analyze_message_for_merge(text)
+        previous_ts = self.last_user_message_ts.get(key)
+        gap_prev_ms = None if previous_ts is None else round((now - previous_ts) * 1000)
         self.last_user_message_ts[key] = now
 
         if TTS_MERGE_ALGORITHM == "off":
@@ -1048,7 +1078,13 @@ class TTSBot(commands.Bot):
                 await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
             return
 
-        if TTS_MERGE_ALGORITHM != "selective_hold_v2" or not TTS_SELECTIVE_HOLD_ENABLED:
+        selective_enabled_for_author = (
+            TTS_MERGE_ALGORITHM == "selective_hold_v2"
+            and TTS_SELECTIVE_HOLD_ENABLED
+            and bool(TTS_SELECTIVE_HOLD_TARGET_USERS)
+            and author_id in TTS_SELECTIVE_HOLD_TARGET_USERS
+        )
+        if not selective_enabled_for_author:
             if not parsed.spoken_text:
                 return
             if not TTS_MERGE_SHORT_MESSAGES or len(parsed.spoken_text) > TTS_MERGE_MAX_CHARS:
@@ -1079,11 +1115,6 @@ class TTSBot(commands.Bot):
                 )
             return
 
-        if TTS_SELECTIVE_HOLD_TARGET_USERS and author_id not in TTS_SELECTIVE_HOLD_TARGET_USERS:
-            if parsed.spoken_text:
-                await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
-            return
-
         async with self._merge_lock(key):
             state = self.merge_buffers.get(key)
             if state is None:
@@ -1098,6 +1129,21 @@ class TTSBot(commands.Bot):
                     self._decision_log("immediate_special", parsed)
                     if parsed.spoken_text:
                         await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                    return
+                if (
+                    is_reaction_like(parsed)
+                    and (
+                        previous_ts is None
+                        or gap_prev_ms is not None
+                        and gap_prev_ms > TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS
+                    )
+                ):
+                    self._decision_log(
+                        "immediate_isolated_reaction",
+                        parsed,
+                        gap_prev_ms=gap_prev_ms,
+                    )
+                    await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
                     return
                 strong = (
                     parsed.effective_length >= TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN
@@ -1128,7 +1174,13 @@ class TTSBot(commands.Bot):
                 )
                 state.timer_task = asyncio.create_task(self._flush_merge_after_delay(key, generation, deadline))
                 self.merge_buffers[key] = state
-                self._decision_log("hold_start", parsed, chosen_timeout_ms=TTS_SELECTIVE_HOLD_HARD_CAP_MS)
+                self._decision_log(
+                    "hold_start",
+                    parsed,
+                    chosen_timeout_ms=TTS_SELECTIVE_HOLD_HARD_CAP_MS,
+                    messages_in_buffer=1,
+                    buffer_age_ms=0,
+                )
                 return
 
             if state.voice_channel.id != voice_channel.id or state.text_channel_id != text_channel_id:
@@ -1145,6 +1197,13 @@ class TTSBot(commands.Bot):
                 or now > state.deadline_ts
             )
             if hard_break:
+                self._decision_log(
+                    "hard_break",
+                    parsed,
+                    messages_in_buffer=len(state.items),
+                    buffer_effective_length=state.effective_len_total,
+                    buffer_age_ms=round((now - state.first_ts) * 1000),
+                )
                 ok = await self._flush_buffer_locked(key, "flush_before_hard_break")
                 if ok and parsed.spoken_text:
                     await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
@@ -1168,6 +1227,7 @@ class TTSBot(commands.Bot):
                 parsed,
                 messages_in_buffer=len(state.items),
                 buffer_effective_length=state.effective_len_total,
+                buffer_age_ms=round((now - state.first_ts) * 1000),
             )
 
     def clear_merge_buffers(self, guild_id: int) -> None:
@@ -1569,11 +1629,15 @@ async def on_ready() -> None:
         TTS_MAX_CONTINUOUS_IDLE_SECONDS,
     )
     log.info(
-        "Merge tuning: enabled=%s max_chars=%s window_ms=%s max_parts=%s",
+        "Merge tuning: algorithm=%s enabled=%s max_chars=%s window_ms=%s max_parts=%s selective_enabled=%s selective_target_users=%s reaction_pause_ms=%s",
+        TTS_MERGE_ALGORITHM,
         TTS_MERGE_SHORT_MESSAGES,
         TTS_MERGE_MAX_CHARS,
         TTS_MERGE_WINDOW_MS,
         TTS_MERGE_MAX_PARTS,
+        TTS_SELECTIVE_HOLD_ENABLED,
+        ",".join(str(user_id) for user_id in sorted(TTS_SELECTIVE_HOLD_TARGET_USERS)) or "-",
+        TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS,
     )
 
 
