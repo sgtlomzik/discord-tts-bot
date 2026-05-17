@@ -206,6 +206,7 @@ class MergeBufferState:
     last_ts: float
     deadline_ts: float
     generation_id: int
+    join_separator: str
     items: list[ParsedMessage] = field(default_factory=list)
     timer_task: asyncio.Task[None] | None = None
     has_substantive_starter: bool = False
@@ -679,6 +680,7 @@ class TTSBot(commands.Bot):
         self.continuous_sources: dict[int, ContinuousTTSAudioSource] = {}
         self.merge_buffers: dict[tuple[int, int], MergeBufferState] = {}
         self.merge_locks: dict[tuple[int, int], asyncio.Lock] = {}
+        self.merge_generations: dict[tuple[int, int], int] = {}
         self.last_user_message_ts: dict[tuple[int, int], float] = {}
 
     async def setup_hook(self) -> None:
@@ -919,7 +921,7 @@ class TTSBot(commands.Bot):
         author_id: int,
         text_channel_id: int,
         message_ts: float | None = None,
-    ) -> None:
+    ) -> bool:
         try:
             now = time.perf_counter()
             voice_profile = self.config_store.voice_for_user(voice_channel.guild.id, author_id)
@@ -947,8 +949,10 @@ class TTSBot(commands.Bot):
                 len(text),
                 voice_profile,
             )
+            return True
         except (asyncio.QueueFull, TimeoutError):
             log.warning("TTS queue full; dropping message author=%s", author_id)
+            return False
 
     def _merge_lock(self, key: tuple[int, int]) -> asyncio.Lock:
         lock = self.merge_locks.get(key)
@@ -956,6 +960,11 @@ class TTSBot(commands.Bot):
             lock = asyncio.Lock()
             self.merge_locks[key] = lock
         return lock
+
+    def _next_merge_generation(self, key: tuple[int, int]) -> int:
+        generation = self.merge_generations.get(key, 0) + 1
+        self.merge_generations[key] = generation
+        return generation
 
     def _decision_log(self, decision: str, parsed: ParsedMessage, **extra: object) -> None:
         if not TTS_SELECTIVE_HOLD_LOG_DECISIONS:
@@ -978,19 +987,20 @@ class TTSBot(commands.Bot):
     async def _enqueue_buffer_state(self, state: MergeBufferState, reason: str) -> bool:
         if not state.items:
             return True
-        text = TTS_SELECTIVE_HOLD_JOIN_SEPARATOR.join(item.spoken_text for item in state.items if item.spoken_text).strip()
+        text = state.join_separator.join(item.spoken_text for item in state.items if item.spoken_text).strip()
         if not text:
             return True
         try:
-            await self.enqueue_tts(
+            ok = await self.enqueue_tts(
                 text,
                 state.voice_channel,
                 state.author_id,
                 state.text_channel_id,
                 message_ts=state.first_ts,
             )
-            log.info("Merged buffer flushed key=%s parts=%s reason=%s", state.key, len(state.items), reason)
-            return True
+            if ok:
+                log.info("Merged buffer flushed key=%s parts=%s reason=%s", state.key, len(state.items), reason)
+            return ok
         except Exception:
             log.exception("Failed to enqueue merged state key=%s reason=%s", state.key, reason)
             return False
@@ -1034,12 +1044,15 @@ class TTSBot(commands.Bot):
         self.last_user_message_ts[key] = now
 
         if TTS_MERGE_ALGORITHM == "off":
-            await self.enqueue_tts(parsed.spoken_text or text, voice_channel, author_id, text_channel_id, message_ts=now)
+            if parsed.spoken_text:
+                await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
             return
 
         if TTS_MERGE_ALGORITHM != "selective_hold_v2" or not TTS_SELECTIVE_HOLD_ENABLED:
-            if not TTS_MERGE_SHORT_MESSAGES or len(text) > TTS_MERGE_MAX_CHARS:
-                await self.enqueue_tts(text, voice_channel, author_id, text_channel_id, message_ts=now)
+            if not parsed.spoken_text:
+                return
+            if not TTS_MERGE_SHORT_MESSAGES or len(parsed.spoken_text) > TTS_MERGE_MAX_CHARS:
+                await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
                 return
             async with self._merge_lock(key):
                 state = self.merge_buffers.get(key)
@@ -1052,7 +1065,8 @@ class TTSBot(commands.Bot):
                         first_ts=now,
                         last_ts=now,
                         deadline_ts=now + max(TTS_MERGE_WINDOW_MS, 0) / 1000.0,
-                        generation_id=1,
+                        generation_id=self._next_merge_generation(key),
+                        join_separator=". ",
                         items=[],
                     )
                     self.merge_buffers[key] = state
@@ -1066,7 +1080,8 @@ class TTSBot(commands.Bot):
             return
 
         if TTS_SELECTIVE_HOLD_TARGET_USERS and author_id not in TTS_SELECTIVE_HOLD_TARGET_USERS:
-            await self.enqueue_tts(parsed.spoken_text or text, voice_channel, author_id, text_channel_id, message_ts=now)
+            if parsed.spoken_text:
+                await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
             return
 
         async with self._merge_lock(key):
@@ -1081,7 +1096,8 @@ class TTSBot(commands.Bot):
                     return
                 if parsed.is_special_only or parsed.is_caps_shout or parsed.is_keyboard_smash or parsed.is_question_or_terminal:
                     self._decision_log("immediate_special", parsed)
-                    await self.enqueue_tts(parsed.spoken_text or text, voice_channel, author_id, text_channel_id, message_ts=now)
+                    if parsed.spoken_text:
+                        await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
                     return
                 strong = (
                     parsed.effective_length >= TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN
@@ -1095,7 +1111,7 @@ class TTSBot(commands.Bot):
                     self._decision_log("immediate_default", parsed)
                     await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
                     return
-                generation = 1
+                generation = self._next_merge_generation(key)
                 deadline = now + max(TTS_SELECTIVE_HOLD_HARD_CAP_MS, 1) / 1000.0
                 state = MergeBufferState(
                     key=key,
@@ -1106,6 +1122,7 @@ class TTSBot(commands.Bot):
                     last_ts=now,
                     deadline_ts=deadline,
                     generation_id=generation,
+                    join_separator=TTS_SELECTIVE_HOLD_JOIN_SEPARATOR,
                     items=[parsed],
                     has_substantive_starter=True,
                 )
@@ -1116,7 +1133,8 @@ class TTSBot(commands.Bot):
 
             if state.voice_channel.id != voice_channel.id or state.text_channel_id != text_channel_id:
                 await self._flush_buffer_locked(key, "voice_context_changed")
-                await self.enqueue_tts(parsed.spoken_text or text, voice_channel, author_id, text_channel_id, message_ts=now)
+                if parsed.spoken_text:
+                    await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
                 return
 
             hard_break = (
@@ -1128,8 +1146,8 @@ class TTSBot(commands.Bot):
             )
             if hard_break:
                 ok = await self._flush_buffer_locked(key, "flush_before_hard_break")
-                if ok:
-                    await self.enqueue_tts(parsed.spoken_text or text, voice_channel, author_id, text_channel_id, message_ts=now)
+                if ok and parsed.spoken_text:
+                    await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
                 return
 
             prospective_parts = len(state.items) + 1
@@ -1282,26 +1300,26 @@ class TTSBot(commands.Bot):
 
                 try:
                     if TTS_CONTINUOUS_STREAM:
-                        playback_start_ts = time.perf_counter()
                         source = self.ensure_continuous_player(vc)
                         frames = await self.prepare_tts_pcm_frames(filename)
+                        audio_enqueue_ts = time.perf_counter()
                         source.enqueue_frames(frames)
                         log.info(
-                            "Queued continuous playback guild=%s channel=%s frames=%s duration=%.3fs message_to_playback_start_s=%.3f queue_to_playback_start_s=%.3f",
+                            "Queued continuous playback guild=%s channel=%s frames=%s duration=%.3fs message_to_audio_enqueue_s=%.3f queue_to_audio_enqueue_s=%.3f",
                             job.voice_channel.guild.id,
                             job.voice_channel.id,
                             len(frames),
                             len(frames) * PCM_FRAME_MS / 1000,
-                            playback_start_ts - job.message_ts,
-                            playback_start_ts - job.queued_at,
+                            audio_enqueue_ts - job.message_ts,
+                            audio_enqueue_ts - job.queued_at,
                         )
                         await source.wait_until_drained()
                     else:
-                        playback_start_ts = time.perf_counter()
+                        playback_request_ts = time.perf_counter()
                         log.info(
-                            "Starting non-continuous playback metrics message_to_playback_start_s=%.3f queue_to_playback_start_s=%.3f",
-                            playback_start_ts - job.message_ts,
-                            playback_start_ts - job.queued_at,
+                            "Starting non-continuous playback metrics message_to_playback_request_s=%.3f queue_to_playback_request_s=%.3f",
+                            playback_request_ts - job.message_ts,
+                            playback_request_ts - job.queued_at,
                         )
                         await self.play_file(vc, filename)
                 except Exception:
@@ -1571,14 +1589,12 @@ async def on_message(message: discord.Message) -> None:
         and message.author.voice
         and isinstance(message.author.voice.channel, discord.VoiceChannel)
     ):
-        final_text = process_text(message.clean_content)
-        if final_text:
-            await bot.queue_or_merge_message(
-                final_text,
-                message.author.voice.channel,
-                message.author.id,
-                message.channel.id,
-            )
+        await bot.queue_or_merge_message(
+            message.content,
+            message.author.voice.channel,
+            message.author.id,
+            message.channel.id,
+        )
 
     await bot.process_commands(message)
 

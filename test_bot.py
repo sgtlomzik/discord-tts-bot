@@ -51,6 +51,12 @@ class TTSBotTests(unittest.TestCase):
         self.assertLessEqual(parsed.effective_length, 2)
         self.assertTrue(parsed.is_custom_emoji_only)
 
+    def test_analyze_message_animated_custom_emoji_not_spoken_with_raw_id(self):
+        bot = load_bot_module()
+        parsed = bot.analyze_message_for_merge("<a:pepe_sad:1035577866370416721>")
+        self.assertTrue(parsed.is_animated_custom_emoji_only)
+        self.assertNotIn("1035577866370416721", parsed.spoken_text)
+
     def test_analyze_message_mention_only_not_spoken_with_raw_id(self):
         bot = load_bot_module()
         parsed = bot.analyze_message_for_merge("<@123456789>")
@@ -62,6 +68,10 @@ class TTSBotTests(unittest.TestCase):
         parsed = bot.analyze_message_for_merge("https://example.com/aaaa")
         self.assertEqual(parsed.spoken_text, "")
         self.assertTrue(parsed.is_url_only)
+
+    def test_selective_hold_default_separator_is_comma(self):
+        bot = load_bot_module()
+        self.assertEqual(bot.TTS_SELECTIVE_HOLD_JOIN_SEPARATOR, ", ")
 
     def test_runtime_is_piper_ruslan_only(self):
         bot = load_bot_module()
@@ -516,8 +526,8 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         task_two = asyncio.create_task(asyncio.sleep(10))
         now = bot_mod.time.perf_counter()
         parsed = bot_mod.analyze_message_for_merge("a")
-        st_one = bot_mod.MergeBufferState((100, 10), channel_one, 100, 1000, now, now, now + 10, 1, [parsed], task_one, True)
-        st_two = bot_mod.MergeBufferState((200, 20), channel_two, 200, 2000, now, now, now + 10, 1, [parsed], task_two, True)
+        st_one = bot_mod.MergeBufferState((100, 10), channel_one, 100, 1000, now, now, now + 10, 1, ", ", [parsed], task_one, True)
+        st_two = bot_mod.MergeBufferState((200, 20), channel_two, 200, 2000, now, now, now + 10, 1, ", ", [parsed], task_two, True)
         tts_bot.merge_buffers[(100, 10)] = st_one
         tts_bot.merge_buffers[(200, 20)] = st_two
 
@@ -550,7 +560,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         await tts_bot._flush_merge_after_delay((300, 200), state.generation_id, bot_mod.time.perf_counter())
         job = await tts_bot.message_queue.get()
 
-        self.assertEqual(job.text, "one, two")
+        self.assertEqual(job.text, "one. two")
 
     async def test_selective_hold_starts_buffer_for_meaningful_starter(self):
         bot_mod = load_bot_module()
@@ -573,9 +583,154 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         await tts_bot.queue_or_merge_message("<:Kekis:1035577866370416721>", voice_channel, 300, 400)
 
         first = await tts_bot.message_queue.get()
-        second = await tts_bot.message_queue.get()
         self.assertIn("где нет шансов", first.text)
-        self.assertTrue(second.text)
+        self.assertTrue(tts_bot.message_queue.empty())
+
+    async def test_selective_hold_fixture_meaningful_series_stays_together_until_limit(self):
+        bot_mod = load_bot_module()
+        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.TTS_SELECTIVE_HOLD_MAX_PARTS = 5
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+
+        for text in ["ну там просто дается хп", "при нажатии", "манты", "почему-то", "даже под думом"]:
+            await tts_bot.queue_or_merge_message(text, voice_channel, 300, 400)
+
+        state = tts_bot.merge_buffers[(300, 200)]
+        self.assertEqual(
+            [item.spoken_text for item in state.items],
+            ["ну там просто дается хп", "при нажатии", "манты", "почему-то", "даже под думом"],
+        )
+
+    async def test_selective_hold_fixture_single_digit_appends_inside_buffer(self):
+        bot_mod = load_bot_module()
+        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+
+        for text in ["где нет шансов", "уже с минуты", "3"]:
+            await tts_bot.queue_or_merge_message(text, voice_channel, 300, 400)
+
+        state = tts_bot.merge_buffers[(300, 200)]
+        self.assertEqual([item.spoken_text for item in state.items], ["где нет шансов", "уже с минуты", "3"])
+
+    async def test_selective_hold_fixture_single_reaction_after_pause_is_immediate(self):
+        bot_mod = load_bot_module()
+        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+
+        await tts_bot.queue_or_merge_message("бб", voice_channel, 300, 400)
+
+        job = await tts_bot.message_queue.get()
+        self.assertEqual(job.text, "бб")
+        self.assertNotIn((300, 200), tts_bot.merge_buffers)
+
+    async def test_selective_hold_custom_emoji_raw_length_over_40_is_not_long_or_spoken_raw(self):
+        bot_mod = load_bot_module()
+        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+        raw = "<:VeryLongEmojiNameForTesting:1035577866370416721>"
+
+        await tts_bot.queue_or_merge_message(raw, voice_channel, 300, 400)
+
+        self.assertTrue(tts_bot.message_queue.empty())
+        self.assertNotIn((300, 200), tts_bot.merge_buffers)
+
+    async def test_selective_hold_active_buffer_plus_question_flushes_before_question(self):
+        bot_mod = load_bot_module()
+        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+
+        await tts_bot.queue_or_merge_message("где нет шансов", voice_channel, 300, 400)
+        await tts_bot.queue_or_merge_message("почему?", voice_channel, 300, 400)
+
+        first = await tts_bot.message_queue.get()
+        second = await tts_bot.message_queue.get()
+        self.assertEqual(first.text, "где нет шансов")
+        self.assertEqual(second.text, "почему?")
+
+    async def test_selective_hold_hard_cap_is_based_on_first_message(self):
+        bot_mod = load_bot_module()
+        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.TTS_SELECTIVE_HOLD_HARD_CAP_MS = 1200
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+
+        with patch.object(bot_mod.time, "perf_counter", side_effect=[10.0, 10.5, 10.9]):
+            await tts_bot.queue_or_merge_message("ну там просто дается хп", voice_channel, 300, 400)
+            await tts_bot.queue_or_merge_message("при нажатии", voice_channel, 300, 400)
+            await tts_bot.queue_or_merge_message("манты", voice_channel, 300, 400)
+
+        state = tts_bot.merge_buffers[(300, 200)]
+        self.assertEqual(state.deadline_ts, 11.2)
+
+    async def test_selective_hold_old_buffer_enqueue_failure_blocks_later_message(self):
+        bot_mod = load_bot_module()
+        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+        await tts_bot.queue_or_merge_message("где нет шансов", voice_channel, 300, 400)
+        tts_bot.enqueue_tts = AsyncMock(return_value=False)
+
+        await tts_bot.queue_or_merge_message("почему?", voice_channel, 300, 400)
+
+        self.assertEqual(tts_bot.enqueue_tts.await_count, 1)
+
+    async def test_selective_hold_active_buffer_plus_immediate_long_preserves_order(self):
+        bot_mod = load_bot_module()
+        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+
+        await tts_bot.queue_or_merge_message("где нет шансов", voice_channel, 300, 400)
+        await tts_bot.queue_or_merge_message("это уже достаточно длинное сообщение чтобы его не держать в буфере", voice_channel, 300, 400)
+
+        first = await tts_bot.message_queue.get()
+        second = await tts_bot.message_queue.get()
+        self.assertEqual(first.text, "где нет шансов")
+        self.assertIn("это уже достаточно длинное сообщение", second.text)
+
+    async def test_selective_hold_stale_timer_does_not_flush_new_generation(self):
+        bot_mod = load_bot_module()
+        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+
+        await tts_bot.queue_or_merge_message("где нет шансов", voice_channel, 300, 400)
+        old_state = tts_bot.merge_buffers[(300, 200)]
+        await tts_bot._flush_buffer_locked((300, 200), "manual")
+        await tts_bot.queue_or_merge_message("ну там просто дается хп", voice_channel, 300, 400)
+
+        await tts_bot._flush_buffer_locked((300, 200), "timer_flush", expected_generation=old_state.generation_id)
+
+        self.assertIn((300, 200), tts_bot.merge_buffers)
+
+    async def test_selective_hold_double_flush_emits_once(self):
+        bot_mod = load_bot_module()
+        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+        await tts_bot.queue_or_merge_message("где нет шансов", voice_channel, 300, 400)
+
+        await tts_bot._flush_buffer_locked((300, 200), "manual")
+        await tts_bot._flush_buffer_locked((300, 200), "manual")
+
+        first = await tts_bot.message_queue.get()
+        self.assertEqual(first.text, "где нет шансов")
+        self.assertTrue(tts_bot.message_queue.empty())
 
     async def test_enqueue_tts_uses_piper_ruslan_profile(self):
         bot_mod = load_bot_module()
