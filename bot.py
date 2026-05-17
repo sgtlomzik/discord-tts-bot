@@ -9,6 +9,7 @@ import struct
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 import wave
 from dataclasses import dataclass, field
@@ -63,6 +64,40 @@ TTS_MERGE_SHORT_MESSAGES = os.getenv("TTS_MERGE_SHORT_MESSAGES", "1").strip().lo
 TTS_MERGE_MAX_CHARS = int(os.getenv("TTS_MERGE_MAX_CHARS", "40"))
 TTS_MERGE_WINDOW_MS = int(os.getenv("TTS_MERGE_WINDOW_MS", "900"))
 TTS_MERGE_MAX_PARTS = int(os.getenv("TTS_MERGE_MAX_PARTS", "4"))
+TTS_MERGE_ALGORITHM = os.getenv("TTS_MERGE_ALGORITHM", "legacy").strip().lower()
+TTS_SELECTIVE_HOLD_ENABLED = os.getenv("TTS_SELECTIVE_HOLD_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+TTS_SELECTIVE_HOLD_TARGET_USERS_RAW = os.getenv("TTS_SELECTIVE_HOLD_TARGET_USERS", "")
+TTS_SELECTIVE_HOLD_HARD_CAP_MS = int(os.getenv("TTS_SELECTIVE_HOLD_HARD_CAP_MS", "1200"))
+TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN = int(os.getenv("TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN", "10"))
+TTS_SELECTIVE_HOLD_START_MIN_WORDS_ALT = int(os.getenv("TTS_SELECTIVE_HOLD_START_MIN_WORDS_ALT", "2"))
+TTS_SELECTIVE_HOLD_START_MIN_EFFECTIVE_LEN_ALT = int(os.getenv("TTS_SELECTIVE_HOLD_START_MIN_EFFECTIVE_LEN_ALT", "6"))
+TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS = int(os.getenv("TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS", "5000"))
+TTS_SELECTIVE_HOLD_MAX_PARTS = int(os.getenv("TTS_SELECTIVE_HOLD_MAX_PARTS", "3"))
+TTS_SELECTIVE_HOLD_MAX_GROUP_EFFECTIVE_LEN = int(os.getenv("TTS_SELECTIVE_HOLD_MAX_GROUP_EFFECTIVE_LEN", "56"))
+TTS_SELECTIVE_HOLD_JOIN_SEPARATOR = os.getenv("TTS_SELECTIVE_HOLD_JOIN_SEPARATOR", ", ")
+TTS_SELECTIVE_HOLD_DROP_URL_ONLY = os.getenv("TTS_SELECTIVE_HOLD_DROP_URL_ONLY", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY = os.getenv("TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+TTS_SELECTIVE_HOLD_LOG_DECISIONS = os.getenv("TTS_SELECTIVE_HOLD_LOG_DECISIONS", "0").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+TTS_SELECTIVE_HOLD_ENABLE_ORDER_PRESERVING_FLUSH = os.getenv(
+    "TTS_SELECTIVE_HOLD_ENABLE_ORDER_PRESERVING_FLUSH", "1"
+).strip().lower() not in {"0", "false", "no"}
+TTS_QUEUE_PUT_TIMEOUT_MS = int(os.getenv("TTS_QUEUE_PUT_TIMEOUT_MS", "500"))
 
 VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
 PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "").strip()
@@ -75,6 +110,10 @@ EMOJI_MAP = {
     "pepe_sad": "Грустно",
     "kekw": "Кек",
 }
+CUSTOM_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]+):(\d+)>")
+MENTION_RE = re.compile(r"<@!?\d+>|<@&\d+>|<#\d+>")
+URL_RE = re.compile(r"https?://\S+|www\.\S+")
+DISCORD_TOKEN_RE = re.compile(r"(<a?:[A-Za-z0-9_]+:\d+>|<@!?\d+>|<@&\d+>|<#\d+>|https?://\S+|www\.\S+)")
 
 
 def parse_user_ids(value: str) -> set[int]:
@@ -91,6 +130,7 @@ def parse_user_ids(value: str) -> set[int]:
 
 
 WHITELIST_USERS = parse_user_ids(os.getenv("WHITELIST_USERS", DEFAULT_WHITELIST))
+TTS_SELECTIVE_HOLD_TARGET_USERS = parse_user_ids(TTS_SELECTIVE_HOLD_TARGET_USERS_RAW)
 
 
 @dataclass(frozen=True)
@@ -120,6 +160,59 @@ class TTSJob:
     guild_id: int
     text_channel_id: int
     voice_profile: str
+    message_ts: float = field(default_factory=time.perf_counter)
+
+
+@dataclass
+class ParsedMessage:
+    spoken_text: str
+    raw_length: int
+    effective_length: int
+    word_count: int
+    emoji_count: int
+    custom_emoji_count: int
+    animated_custom_emoji_count: int
+    mention_count: int
+    url_count: int
+    is_unicode_emoji_only: bool
+    is_custom_emoji_only: bool
+    is_animated_custom_emoji_only: bool
+    is_mention_only: bool
+    is_url_only: bool
+    is_single_digit: bool
+    is_single_symbol: bool
+    is_caps_shout: bool
+    is_keyboard_smash: bool
+    is_question_or_terminal: bool
+
+    @property
+    def is_special_only(self) -> bool:
+        return (
+            self.is_unicode_emoji_only
+            or self.is_custom_emoji_only
+            or self.is_animated_custom_emoji_only
+            or self.is_mention_only
+            or self.is_url_only
+        )
+
+
+@dataclass
+class MergeBufferState:
+    key: tuple[int, int]
+    voice_channel: discord.VoiceChannel
+    author_id: int
+    text_channel_id: int
+    first_ts: float
+    last_ts: float
+    deadline_ts: float
+    generation_id: int
+    items: list[ParsedMessage] = field(default_factory=list)
+    timer_task: asyncio.Task[None] | None = None
+    has_substantive_starter: bool = False
+
+    @property
+    def effective_len_total(self) -> int:
+        return sum(item.effective_length for item in self.items)
 
 
 VOICE_PROFILES: dict[str, VoiceProfile] = {
@@ -292,6 +385,96 @@ def process_text(text: str) -> str:
     text = text.replace("\n", ". ")
     text = " ".join(text.split())
     return text.strip()
+
+
+def _is_emoji_char(ch: str) -> bool:
+    if not ch:
+        return False
+    if "\u2600" <= ch <= "\u27BF":
+        return True
+    if "\U0001F300" <= ch <= "\U0001FAFF":
+        return True
+    return unicodedata.category(ch) == "So"
+
+
+def _is_keyboard_smash_word(word: str) -> bool:
+    cleaned = re.sub(r"[^A-Za-zА-Яа-яЁё]", "", word)
+    if len(cleaned) < 4:
+        return False
+    unique_chars = len(set(cleaned.lower()))
+    return unique_chars <= 3 and len(cleaned) >= 5
+
+
+def _strip_discord_tokens_for_speech(raw_text: str) -> str:
+    text = CUSTOM_EMOJI_RE.sub(lambda m: f" {EMOJI_MAP.get(m.group(1), '')} ", raw_text)
+    text = MENTION_RE.sub(" ", text)
+    text = URL_RE.sub(" ", text)
+    text = text.replace("\n", ". ")
+    text = " ".join(text.split())
+    return text.strip()
+
+
+def analyze_message_for_merge(raw_text: str) -> ParsedMessage:
+    raw_text = raw_text or ""
+    raw_length = len(raw_text)
+    spoken_text = _strip_discord_tokens_for_speech(raw_text)
+    custom_tokens = list(CUSTOM_EMOJI_RE.finditer(raw_text))
+    mention_tokens = list(MENTION_RE.finditer(raw_text))
+    url_tokens = list(URL_RE.finditer(raw_text))
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", spoken_text)
+    punctuationless = re.sub(r"\s+", "", re.sub(r"[.,!?;:()\[\]{}\"'`~\-_/\\|]", "", spoken_text))
+    emoji_count = sum(1 for ch in punctuationless if _is_emoji_char(ch))
+    animated_custom_emoji_count = sum(1 for m in custom_tokens if m.group(0).startswith("<a:"))
+    custom_emoji_count = len(custom_tokens)
+    mention_count = len(mention_tokens)
+    url_count = len(url_tokens)
+    has_letters = bool(re.search(r"[A-Za-zА-Яа-яЁё]", spoken_text))
+    raw_no_ws = re.sub(r"\s+", "", raw_text)
+    is_mention_only = bool(raw_no_ws) and bool(MENTION_RE.fullmatch(raw_no_ws))
+    is_url_only = bool(raw_no_ws) and bool(URL_RE.fullmatch(raw_no_ws))
+    is_custom_emoji_only = bool(raw_no_ws) and bool(CUSTOM_EMOJI_RE.fullmatch(raw_no_ws))
+    is_animated_custom_emoji_only = is_custom_emoji_only and raw_no_ws.startswith("<a:")
+    is_unicode_emoji_only = bool(raw_no_ws) and all(
+        _is_emoji_char(ch) or unicodedata.category(ch) in {"Cf", "Sk"} for ch in raw_no_ws
+    )
+    is_single_digit = bool(re.fullmatch(r"\d", spoken_text))
+    is_single_symbol = len(spoken_text) == 1 and not spoken_text.isalnum()
+    is_caps_shout = has_letters and spoken_text.upper() == spoken_text and len(spoken_text) >= 4
+    is_keyboard_smash = any(_is_keyboard_smash_word(w) for w in spoken_text.split())
+    is_question_or_terminal = bool(re.search(r"[!?]|[.]\s*$", spoken_text))
+    effective_length = min(emoji_count, 4) + custom_emoji_count
+    for word in words:
+        if word.isdigit():
+            effective_length += min(len(word), 3)
+        else:
+            effective_length += min(len(word), 12)
+    if is_url_only and TTS_SELECTIVE_HOLD_DROP_URL_ONLY:
+        spoken_text = ""
+        effective_length = 0
+    if is_mention_only and TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY:
+        spoken_text = ""
+        effective_length = 0
+    return ParsedMessage(
+        spoken_text=spoken_text,
+        raw_length=raw_length,
+        effective_length=effective_length,
+        word_count=len(words),
+        emoji_count=emoji_count,
+        custom_emoji_count=custom_emoji_count,
+        animated_custom_emoji_count=animated_custom_emoji_count,
+        mention_count=mention_count,
+        url_count=url_count,
+        is_unicode_emoji_only=is_unicode_emoji_only,
+        is_custom_emoji_only=is_custom_emoji_only,
+        is_animated_custom_emoji_only=is_animated_custom_emoji_only,
+        is_mention_only=is_mention_only,
+        is_url_only=is_url_only,
+        is_single_digit=is_single_digit,
+        is_single_symbol=is_single_symbol,
+        is_caps_shout=is_caps_shout,
+        is_keyboard_smash=is_keyboard_smash,
+        is_question_or_terminal=is_question_or_terminal,
+    )
 
 
 def seconds_from_ms(value_ms: int) -> str:
@@ -494,9 +677,9 @@ class TTSBot(commands.Bot):
         self.config_store = BotConfigStore(BOT_CONFIG_PATH, WHITELIST_USERS)
         self.piper_voices: dict[tuple[str, str], object] = {}
         self.continuous_sources: dict[int, ContinuousTTSAudioSource] = {}
-        self.merge_buffers: dict[tuple[int, int], list[str]] = {}
-        self.merge_targets: dict[tuple[int, int], tuple[discord.VoiceChannel, int, int]] = {}
-        self.merge_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
+        self.merge_buffers: dict[tuple[int, int], MergeBufferState] = {}
+        self.merge_locks: dict[tuple[int, int], asyncio.Lock] = {}
+        self.last_user_message_ts: dict[tuple[int, int], float] = {}
 
     async def setup_hook(self) -> None:
         self.tree.add_command(tts_group)
@@ -515,8 +698,9 @@ class TTSBot(commands.Bot):
             task.cancel()
         for task in self.continuous_idle_stop_tasks.values():
             task.cancel()
-        for task in self.merge_tasks.values():
-            task.cancel()
+        for state in self.merge_buffers.values():
+            if state.timer_task and not state.timer_task.done():
+                state.timer_task.cancel()
         for source in self.continuous_sources.values():
             source.stop()
 
@@ -734,20 +918,24 @@ class TTSBot(commands.Bot):
         voice_channel: discord.VoiceChannel,
         author_id: int,
         text_channel_id: int,
+        message_ts: float | None = None,
     ) -> None:
         try:
             now = time.perf_counter()
             voice_profile = self.config_store.voice_for_user(voice_channel.guild.id, author_id)
-            self.message_queue.put_nowait(
-                TTSJob(
-                    text=text[:MAX_TEXT_LENGTH],
-                    voice_channel=voice_channel,
-                    queued_at=now,
-                    author_id=author_id,
-                    guild_id=voice_channel.guild.id,
-                    text_channel_id=text_channel_id,
-                    voice_profile=voice_profile,
-                )
+            job = TTSJob(
+                text=text[:MAX_TEXT_LENGTH],
+                voice_channel=voice_channel,
+                queued_at=now,
+                author_id=author_id,
+                guild_id=voice_channel.guild.id,
+                text_channel_id=text_channel_id,
+                voice_profile=voice_profile,
+                message_ts=message_ts or now,
+            )
+            await asyncio.wait_for(
+                self.message_queue.put(job),
+                timeout=max(TTS_QUEUE_PUT_TIMEOUT_MS, 1) / 1000.0,
             )
             log.info(
                 "Queued TTS guild=%s text_channel=%s voice_channel=%s author=%s queue=%s chars=%s voice=%s",
@@ -759,32 +947,77 @@ class TTSBot(commands.Bot):
                 len(text),
                 voice_profile,
             )
-        except asyncio.QueueFull:
+        except (asyncio.QueueFull, TimeoutError):
             log.warning("TTS queue full; dropping message author=%s", author_id)
 
-    async def _flush_merge_after_delay(self, key: tuple[int, int]) -> None:
-        try:
-            await asyncio.sleep(max(TTS_MERGE_WINDOW_MS, 0) / 1000.0)
-            parts = self.merge_buffers.pop(key, [])
-            target = self.merge_targets.pop(key, None)
-            self.merge_tasks.pop(key, None)
-            if not parts or not target:
-                return
+    def _merge_lock(self, key: tuple[int, int]) -> asyncio.Lock:
+        lock = self.merge_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.merge_locks[key] = lock
+        return lock
 
-            voice_channel, author_id, text_channel_id = target
-            merged_text = ". ".join(parts).strip()
-            if not merged_text:
-                return
-            await self.enqueue_tts(merged_text, voice_channel, author_id, text_channel_id)
-            log.info(
-                "Merged short messages author=%s voice_channel=%s parts=%s chars=%s",
-                author_id,
-                voice_channel.id,
-                len(parts),
-                len(merged_text),
+    def _decision_log(self, decision: str, parsed: ParsedMessage, **extra: object) -> None:
+        if not TTS_SELECTIVE_HOLD_LOG_DECISIONS:
+            return
+        payload = {
+            "decision_policy": TTS_MERGE_ALGORITHM,
+            "decision": decision,
+            "raw_length": parsed.raw_length,
+            "effective_length": parsed.effective_length,
+            "word_count": parsed.word_count,
+            "emoji_count": parsed.emoji_count,
+            "custom_emoji_count": parsed.custom_emoji_count,
+            "animated_custom_emoji_count": parsed.animated_custom_emoji_count,
+            "mention_count": parsed.mention_count,
+            "url_count": parsed.url_count,
+        }
+        payload.update(extra)
+        log.info("Selective hold decision %s", payload)
+
+    async def _enqueue_buffer_state(self, state: MergeBufferState, reason: str) -> bool:
+        if not state.items:
+            return True
+        text = TTS_SELECTIVE_HOLD_JOIN_SEPARATOR.join(item.spoken_text for item in state.items if item.spoken_text).strip()
+        if not text:
+            return True
+        try:
+            await self.enqueue_tts(
+                text,
+                state.voice_channel,
+                state.author_id,
+                state.text_channel_id,
+                message_ts=state.first_ts,
             )
+            log.info("Merged buffer flushed key=%s parts=%s reason=%s", state.key, len(state.items), reason)
+            return True
+        except Exception:
+            log.exception("Failed to enqueue merged state key=%s reason=%s", state.key, reason)
+            return False
+
+    async def _flush_buffer_locked(self, key: tuple[int, int], reason: str, expected_generation: int | None = None) -> bool:
+        state = self.merge_buffers.get(key)
+        if not state:
+            return True
+        if expected_generation is not None and state.generation_id != expected_generation:
+            return False
+        if state.timer_task and not state.timer_task.done():
+            state.timer_task.cancel()
+        ok = await self._enqueue_buffer_state(state, reason)
+        if ok:
+            self.merge_buffers.pop(key, None)
+        return ok
+
+    async def _flush_merge_after_delay(self, key: tuple[int, int], generation_id: int, deadline_ts: float) -> None:
+        sleep_for = max(0.0, deadline_ts - time.perf_counter())
+        try:
+            await asyncio.sleep(sleep_for)
+            async with self._merge_lock(key):
+                await self._flush_buffer_locked(key, "timer_flush", expected_generation=generation_id)
         except asyncio.CancelledError:
-            pass
+            return
+        except asyncio.QueueFull:
+            return
         except Exception:
             log.exception("Failed to flush merged messages key=%s", key)
 
@@ -795,36 +1028,136 @@ class TTSBot(commands.Bot):
         author_id: int,
         text_channel_id: int,
     ) -> None:
-        if not TTS_MERGE_SHORT_MESSAGES or len(text) > TTS_MERGE_MAX_CHARS:
-            await self.enqueue_tts(text, voice_channel, author_id, text_channel_id)
+        key = (author_id, voice_channel.id)
+        now = time.perf_counter()
+        parsed = analyze_message_for_merge(text)
+        self.last_user_message_ts[key] = now
+
+        if TTS_MERGE_ALGORITHM == "off":
+            await self.enqueue_tts(parsed.spoken_text or text, voice_channel, author_id, text_channel_id, message_ts=now)
             return
 
-        key = (author_id, voice_channel.id)
-        parts = self.merge_buffers.setdefault(key, [])
-        if len(parts) >= max(TTS_MERGE_MAX_PARTS, 1):
-            await self.enqueue_tts(". ".join(parts), voice_channel, author_id, text_channel_id)
-            parts.clear()
+        if TTS_MERGE_ALGORITHM != "selective_hold_v2" or not TTS_SELECTIVE_HOLD_ENABLED:
+            if not TTS_MERGE_SHORT_MESSAGES or len(text) > TTS_MERGE_MAX_CHARS:
+                await self.enqueue_tts(text, voice_channel, author_id, text_channel_id, message_ts=now)
+                return
+            async with self._merge_lock(key):
+                state = self.merge_buffers.get(key)
+                if state is None:
+                    state = MergeBufferState(
+                        key=key,
+                        voice_channel=voice_channel,
+                        author_id=author_id,
+                        text_channel_id=text_channel_id,
+                        first_ts=now,
+                        last_ts=now,
+                        deadline_ts=now + max(TTS_MERGE_WINDOW_MS, 0) / 1000.0,
+                        generation_id=1,
+                        items=[],
+                    )
+                    self.merge_buffers[key] = state
+                state.items.append(parsed)
+                if state.timer_task and not state.timer_task.done():
+                    state.timer_task.cancel()
+                state.generation_id += 1
+                state.timer_task = asyncio.create_task(
+                    self._flush_merge_after_delay(key, state.generation_id, time.perf_counter() + max(TTS_MERGE_WINDOW_MS, 0) / 1000.0)
+                )
+            return
 
-        parts.append(text)
-        self.merge_targets[key] = (voice_channel, author_id, text_channel_id)
+        if TTS_SELECTIVE_HOLD_TARGET_USERS and author_id not in TTS_SELECTIVE_HOLD_TARGET_USERS:
+            await self.enqueue_tts(parsed.spoken_text or text, voice_channel, author_id, text_channel_id, message_ts=now)
+            return
 
-        task = self.merge_tasks.get(key)
-        if task and not task.done():
-            task.cancel()
-        self.merge_tasks[key] = asyncio.create_task(self._flush_merge_after_delay(key))
+        async with self._merge_lock(key):
+            state = self.merge_buffers.get(key)
+            if state is None:
+                if not parsed.spoken_text:
+                    self._decision_log("drop_empty", parsed)
+                    return
+                if parsed.effective_length >= max(TTS_MERGE_MAX_CHARS, 40):
+                    self._decision_log("immediate_long", parsed)
+                    await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                    return
+                if parsed.is_special_only or parsed.is_caps_shout or parsed.is_keyboard_smash or parsed.is_question_or_terminal:
+                    self._decision_log("immediate_special", parsed)
+                    await self.enqueue_tts(parsed.spoken_text or text, voice_channel, author_id, text_channel_id, message_ts=now)
+                    return
+                strong = (
+                    parsed.effective_length >= TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN
+                    or (
+                        parsed.effective_length >= TTS_SELECTIVE_HOLD_START_MIN_EFFECTIVE_LEN_ALT
+                        and parsed.word_count >= TTS_SELECTIVE_HOLD_START_MIN_WORDS_ALT
+                    )
+                    or (parsed.is_single_digit and parsed.effective_length >= 4)
+                )
+                if not strong:
+                    self._decision_log("immediate_default", parsed)
+                    await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                    return
+                generation = 1
+                deadline = now + max(TTS_SELECTIVE_HOLD_HARD_CAP_MS, 1) / 1000.0
+                state = MergeBufferState(
+                    key=key,
+                    voice_channel=voice_channel,
+                    author_id=author_id,
+                    text_channel_id=text_channel_id,
+                    first_ts=now,
+                    last_ts=now,
+                    deadline_ts=deadline,
+                    generation_id=generation,
+                    items=[parsed],
+                    has_substantive_starter=True,
+                )
+                state.timer_task = asyncio.create_task(self._flush_merge_after_delay(key, generation, deadline))
+                self.merge_buffers[key] = state
+                self._decision_log("hold_start", parsed, chosen_timeout_ms=TTS_SELECTIVE_HOLD_HARD_CAP_MS)
+                return
+
+            if state.voice_channel.id != voice_channel.id or state.text_channel_id != text_channel_id:
+                await self._flush_buffer_locked(key, "voice_context_changed")
+                await self.enqueue_tts(parsed.spoken_text or text, voice_channel, author_id, text_channel_id, message_ts=now)
+                return
+
+            hard_break = (
+                parsed.is_special_only
+                or parsed.is_question_or_terminal
+                or parsed.is_caps_shout
+                or parsed.is_keyboard_smash
+                or now > state.deadline_ts
+            )
+            if hard_break:
+                ok = await self._flush_buffer_locked(key, "flush_before_hard_break")
+                if ok:
+                    await self.enqueue_tts(parsed.spoken_text or text, voice_channel, author_id, text_channel_id, message_ts=now)
+                return
+
+            prospective_parts = len(state.items) + 1
+            prospective_effective = state.effective_len_total + parsed.effective_length
+            if (
+                prospective_parts > max(TTS_SELECTIVE_HOLD_MAX_PARTS, 1)
+                or prospective_effective > max(TTS_SELECTIVE_HOLD_MAX_GROUP_EFFECTIVE_LEN, 1)
+            ):
+                ok = await self._flush_buffer_locked(key, "flush_before_reclassify")
+                if ok:
+                    await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                return
+
+            state.items.append(parsed)
+            state.last_ts = now
+            self._decision_log(
+                "append_soft",
+                parsed,
+                messages_in_buffer=len(state.items),
+                buffer_effective_length=state.effective_len_total,
+            )
 
     def clear_merge_buffers(self, guild_id: int) -> None:
-        stale_keys = [
-            key
-            for key, target in self.merge_targets.items()
-            if target[0].guild.id == guild_id
-        ]
+        stale_keys = [key for key, state in self.merge_buffers.items() if state.voice_channel.guild.id == guild_id]
         for key in stale_keys:
-            task = self.merge_tasks.pop(key, None)
-            if task and not task.done():
-                task.cancel()
-            self.merge_buffers.pop(key, None)
-            self.merge_targets.pop(key, None)
+            state = self.merge_buffers.pop(key, None)
+            if state and state.timer_task and not state.timer_task.done():
+                state.timer_task.cancel()
 
     def clear_queue_for_guild(self, guild_id: int) -> int:
         kept: list[TTSJob] = []
@@ -949,18 +1282,27 @@ class TTSBot(commands.Bot):
 
                 try:
                     if TTS_CONTINUOUS_STREAM:
+                        playback_start_ts = time.perf_counter()
                         source = self.ensure_continuous_player(vc)
                         frames = await self.prepare_tts_pcm_frames(filename)
                         source.enqueue_frames(frames)
                         log.info(
-                            "Queued continuous playback guild=%s channel=%s frames=%s duration=%.3fs",
+                            "Queued continuous playback guild=%s channel=%s frames=%s duration=%.3fs message_to_playback_start_s=%.3f queue_to_playback_start_s=%.3f",
                             job.voice_channel.guild.id,
                             job.voice_channel.id,
                             len(frames),
                             len(frames) * PCM_FRAME_MS / 1000,
+                            playback_start_ts - job.message_ts,
+                            playback_start_ts - job.queued_at,
                         )
                         await source.wait_until_drained()
                     else:
+                        playback_start_ts = time.perf_counter()
+                        log.info(
+                            "Starting non-continuous playback metrics message_to_playback_start_s=%.3f queue_to_playback_start_s=%.3f",
+                            playback_start_ts - job.message_ts,
+                            playback_start_ts - job.queued_at,
+                        )
                         await self.play_file(vc, filename)
                 except Exception:
                     log.exception("Playback failed; disconnecting voice")
