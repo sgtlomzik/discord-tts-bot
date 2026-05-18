@@ -1650,36 +1650,6 @@ class TTSBot(commands.Bot):
                 channel.id,
             )
 
-    async def restore_voice_connections_on_startup(self) -> None:
-        for guild in self.guilds:
-            if not self.config_store.is_enabled(guild.id):
-                continue
-            allowed_user_ids = self.config_store.get_guild(guild.id).allowed_users
-            for channel in guild.voice_channels:
-                member = next(
-                    (
-                        user
-                        for user in channel.members
-                        if (not user.bot) and self.config_store.is_allowed(guild.id, user.id)
-                    ),
-                    None,
-                )
-                if member is None:
-                    candidate_ids = allowed_user_ids.intersection(getattr(channel, "voice_states", {}).keys())
-                    if candidate_ids:
-                        try:
-                            member = await guild.fetch_member(next(iter(candidate_ids)))
-                        except Exception:
-                            log.exception(
-                                "Failed to fetch startup voice member guild=%s channel=%s",
-                                guild.id,
-                                channel.id,
-                            )
-                if member is None:
-                    continue
-                await self.auto_connect_for_member(member, channel)
-                break
-
 
 bot = TTSBot()
 
@@ -1720,7 +1690,6 @@ async def on_ready() -> None:
         ",".join(str(user_id) for user_id in sorted(TTS_SELECTIVE_HOLD_TARGET_USERS)) or "-",
         TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS,
     )
-    await bot.restore_voice_connections_on_startup()
 
 
 @bot.event
