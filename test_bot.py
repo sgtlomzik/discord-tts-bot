@@ -5,7 +5,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 
 def load_bot_module():
@@ -552,6 +552,46 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         await tts_bot.auto_connect_for_member(member, channel)
 
         tts_bot.ensure_voice.assert_not_awaited()
+
+    async def test_restore_voice_connections_on_startup_connects_existing_allowed_member(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.config_store = temp_config_store(bot_mod, {441612025286885397})
+        tts_bot.auto_connect_for_member = AsyncMock()
+
+        allowed_member = types.SimpleNamespace(id=441612025286885397, bot=False)
+        other_member = types.SimpleNamespace(id=123, bot=False)
+        guild = types.SimpleNamespace(id=90)
+        empty_channel = types.SimpleNamespace(id=91, guild=guild, members=[other_member])
+        target_channel = types.SimpleNamespace(id=92, guild=guild, members=[allowed_member])
+        guild.voice_channels = [empty_channel, target_channel]
+
+        with patch.object(type(tts_bot), "guilds", new_callable=PropertyMock, return_value=[guild]):
+            await tts_bot.restore_voice_connections_on_startup()
+
+        tts_bot.auto_connect_for_member.assert_awaited_once_with(allowed_member, target_channel)
+
+    async def test_restore_voice_connections_on_startup_fetches_allowed_member_from_voice_state(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.config_store = temp_config_store(bot_mod, {441612025286885397})
+        tts_bot.auto_connect_for_member = AsyncMock()
+
+        allowed_member = types.SimpleNamespace(id=441612025286885397, bot=False)
+        guild = types.SimpleNamespace(id=90, fetch_member=AsyncMock(return_value=allowed_member))
+        target_channel = types.SimpleNamespace(
+            id=92,
+            guild=guild,
+            members=[],
+            voice_states={441612025286885397: object()},
+        )
+        guild.voice_channels = [target_channel]
+
+        with patch.object(type(tts_bot), "guilds", new_callable=PropertyMock, return_value=[guild]):
+            await tts_bot.restore_voice_connections_on_startup()
+
+        guild.fetch_member.assert_awaited_once_with(441612025286885397)
+        tts_bot.auto_connect_for_member.assert_awaited_once_with(allowed_member, target_channel)
 
     async def test_ensure_voice_lock_is_reused_per_guild(self):
         bot_mod = load_bot_module()
