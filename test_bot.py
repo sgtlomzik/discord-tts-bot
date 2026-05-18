@@ -431,12 +431,36 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(tts_bot.voice_connect_cooldown_remaining(guild.id), 0.0)
 
+    async def test_ensure_voice_connects_without_self_deaf_for_receive_client(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=77)
+        voice_client = types.SimpleNamespace(is_connected=MagicMock(return_value=True))
+        voice_channel = types.SimpleNamespace(
+            id=88,
+            guild=guild,
+            connect=AsyncMock(return_value=voice_client),
+        )
+
+        with patch.object(bot_mod.discord.utils, "get", MagicMock(return_value=None)):
+            await tts_bot.ensure_voice(voice_channel)
+
+        voice_channel.connect.assert_awaited_once()
+        kwargs = voice_channel.connect.await_args.kwargs
+        self.assertIs(kwargs["cls"], bot_mod.voice_recv.VoiceRecvClient)
+        self.assertFalse(kwargs["self_deaf"])
+        self.assertFalse(kwargs["self_mute"])
+
     async def test_start_voice_recording_uses_receiver_session_and_sink(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
-        guild = types.SimpleNamespace(id=10)
+        guild = types.SimpleNamespace(id=10, change_voice_state=AsyncMock())
         channel = types.SimpleNamespace(id=20, guild=guild)
-        voice_client = types.SimpleNamespace(listen=MagicMock(), is_listening=MagicMock(return_value=False))
+        voice_client = types.SimpleNamespace(
+            channel=channel,
+            listen=MagicMock(),
+            is_listening=MagicMock(return_value=False),
+        )
         session = types.SimpleNamespace(start=AsyncMock())
         tts_bot.ensure_voice = AsyncMock(return_value=voice_client)
 
@@ -448,6 +472,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result, session)
         session.start.assert_awaited_once_with(guild_id=10, channel_id=20)
+        guild.change_voice_state.assert_awaited_once_with(channel=channel, self_deaf=False, self_mute=False)
         voice_client.listen.assert_called_once_with("sink")
 
     async def test_stop_voice_recording_stops_listening_and_session(self):

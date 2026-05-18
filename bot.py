@@ -884,7 +884,7 @@ class TTSBot(commands.Bot):
                     voice_channel.id,
                 )
                 try:
-                    connect_kwargs = {"timeout": 60.0, "self_deaf": True}
+                    connect_kwargs = {"timeout": 60.0, "self_deaf": False, "self_mute": False}
                     if voice_recv is not None:
                         connect_kwargs["cls"] = voice_recv.VoiceRecvClient
                     vc = await voice_channel.connect(**connect_kwargs)
@@ -937,6 +937,11 @@ class TTSBot(commands.Bot):
         if not hasattr(vc, "listen"):
             raise RuntimeError("Voice client does not support receiving audio")
 
+        await voice_channel.guild.change_voice_state(
+            channel=vc.channel,
+            self_deaf=False,
+            self_mute=False,
+        )
         session = VoiceRecorderSession()
         await session.start(guild_id=guild_id, channel_id=voice_channel.id)
         vc.listen(QueueingVoiceSink(session))
