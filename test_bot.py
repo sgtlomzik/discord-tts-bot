@@ -435,14 +435,18 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=77)
-        voice_client = types.SimpleNamespace(is_connected=MagicMock(return_value=True))
-        voice_channel = types.SimpleNamespace(
-            id=88,
-            guild=guild,
-            connect=AsyncMock(return_value=voice_client),
+        voice_channel = types.SimpleNamespace(id=88, guild=guild)
+        voice_client = types.SimpleNamespace(
+            channel=voice_channel,
+            is_connected=MagicMock(return_value=True),
+            listen=MagicMock(),
         )
+        voice_channel.connect = AsyncMock(return_value=voice_client)
 
-        with patch.object(bot_mod.discord.utils, "get", MagicMock(return_value=None)):
+        with (
+            patch.object(bot_mod.discord.utils, "get", MagicMock(return_value=None)),
+            patch.object(tts_bot, "_start_voice_recording_on_client", AsyncMock()),
+        ):
             await tts_bot.ensure_voice(voice_channel)
 
         voice_channel.connect.assert_awaited_once()
@@ -450,6 +454,19 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(kwargs["cls"], bot_mod.voice_recv.VoiceRecvClient)
         self.assertFalse(kwargs["self_deaf"])
         self.assertFalse(kwargs["self_mute"])
+
+    async def test_ensure_voice_auto_starts_recording_on_ready_client(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=77)
+        voice_channel = types.SimpleNamespace(id=88, guild=guild)
+        voice_client = types.SimpleNamespace(channel=voice_channel, is_connected=MagicMock(return_value=True))
+        tts_bot._start_voice_recording_on_client = AsyncMock()
+
+        with patch.object(bot_mod.discord.utils, "get", MagicMock(return_value=voice_client)):
+            await tts_bot.ensure_voice(voice_channel)
+
+        tts_bot._start_voice_recording_on_client.assert_awaited_once_with(voice_channel, voice_client)
 
     async def test_start_voice_recording_uses_receiver_session_and_sink(self):
         bot_mod = load_bot_module()

@@ -925,15 +925,23 @@ class TTSBot(commands.Bot):
                     time.perf_counter() - started,
                 )
 
+        await self._start_voice_recording_on_client(voice_channel, vc)
         return vc
 
     async def start_voice_recording(self, voice_channel: discord.VoiceChannel) -> VoiceRecorderSession:
+        vc = await self.ensure_voice(voice_channel)
+        return await self._start_voice_recording_on_client(voice_channel, vc)
+
+    async def _start_voice_recording_on_client(
+        self,
+        voice_channel: discord.VoiceChannel,
+        vc: discord.VoiceClient,
+    ) -> VoiceRecorderSession:
         guild_id = voice_channel.guild.id
         existing = self.voice_recorders.get(guild_id)
         if existing is not None:
             return existing
 
-        vc = await self.ensure_voice(voice_channel)
         if not hasattr(vc, "listen"):
             raise RuntimeError("Voice client does not support receiving audio")
 
