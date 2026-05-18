@@ -431,6 +431,40 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(tts_bot.voice_connect_cooldown_remaining(guild.id), 0.0)
 
+    async def test_start_voice_recording_uses_receiver_session_and_sink(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=10)
+        channel = types.SimpleNamespace(id=20, guild=guild)
+        voice_client = types.SimpleNamespace(listen=MagicMock(), is_listening=MagicMock(return_value=False))
+        session = types.SimpleNamespace(start=AsyncMock())
+        tts_bot.ensure_voice = AsyncMock(return_value=voice_client)
+
+        with (
+            patch.object(bot_mod, "VoiceRecorderSession", MagicMock(return_value=session)),
+            patch.object(bot_mod, "QueueingVoiceSink", MagicMock(return_value="sink")),
+        ):
+            result = await tts_bot.start_voice_recording(channel)
+
+        self.assertIs(result, session)
+        session.start.assert_awaited_once_with(guild_id=10, channel_id=20)
+        voice_client.listen.assert_called_once_with("sink")
+
+    async def test_stop_voice_recording_stops_listening_and_session(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=10)
+        voice_client = types.SimpleNamespace(stop_listening=MagicMock())
+        session = types.SimpleNamespace(stop=AsyncMock())
+        tts_bot.voice_recorders[10] = session
+
+        with patch.object(bot_mod.discord.utils, "get", MagicMock(return_value=voice_client)):
+            await tts_bot.stop_voice_recording(guild)
+
+        voice_client.stop_listening.assert_called_once_with()
+        session.stop.assert_awaited_once_with(interrupted=False)
+        self.assertNotIn(10, tts_bot.voice_recorders)
+
     async def test_auto_connect_skips_during_cooldown(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()

@@ -20,6 +20,14 @@ from discord import app_commands
 from discord.ext import commands
 
 try:
+    from discord.ext import voice_recv
+except Exception:  # pragma: no cover - optional runtime dependency
+    voice_recv = None
+
+from voice_receiver import VoiceRecorderSession
+from voice_receiver.sink import QueueingVoiceSink
+
+try:
     from piper import PiperVoice, SynthesisConfig
 except Exception:  # pragma: no cover - optional dependency
     PiperVoice = None
@@ -690,6 +698,7 @@ class TTSBot(commands.Bot):
         self.voice_connect_locks: dict[int, asyncio.Lock] = {}
         self.voice_connect_cooldown_until: dict[int, float] = {}
         self.suppress_auto_connect_until: dict[int, float] = {}
+        self.voice_recorders: dict[int, VoiceRecorderSession] = {}
         self.config_store = BotConfigStore(BOT_CONFIG_PATH, WHITELIST_USERS)
         self.piper_voices: dict[tuple[str, str], object] = {}
         self.continuous_sources: dict[int, ContinuousTTSAudioSource] = {}
@@ -875,7 +884,10 @@ class TTSBot(commands.Bot):
                     voice_channel.id,
                 )
                 try:
-                    vc = await voice_channel.connect(timeout=60.0, self_deaf=True)
+                    connect_kwargs = {"timeout": 60.0, "self_deaf": True}
+                    if voice_recv is not None:
+                        connect_kwargs["cls"] = voice_recv.VoiceRecvClient
+                    vc = await voice_channel.connect(**connect_kwargs)
                 except Exception as exc:
                     self.set_voice_connect_cooldown(guild_id, type(exc).__name__)
                     raise
@@ -914,6 +926,32 @@ class TTSBot(commands.Bot):
                 )
 
         return vc
+
+    async def start_voice_recording(self, voice_channel: discord.VoiceChannel) -> VoiceRecorderSession:
+        guild_id = voice_channel.guild.id
+        existing = self.voice_recorders.get(guild_id)
+        if existing is not None:
+            return existing
+
+        vc = await self.ensure_voice(voice_channel)
+        if not hasattr(vc, "listen"):
+            raise RuntimeError("Voice client does not support receiving audio")
+
+        session = VoiceRecorderSession()
+        await session.start(guild_id=guild_id, channel_id=voice_channel.id)
+        vc.listen(QueueingVoiceSink(session))
+        self.voice_recorders[guild_id] = session
+        return session
+
+    async def stop_voice_recording(self, guild: discord.Guild, interrupted: bool = False) -> None:
+        session = self.voice_recorders.pop(guild.id, None)
+        if session is None:
+            return
+
+        vc = discord.utils.get(self.voice_clients, guild=guild)
+        if vc is not None and hasattr(vc, "stop_listening"):
+            vc.stop_listening()
+        await session.stop(interrupted=interrupted)
 
     async def warmup_tts(self) -> None:
         filename = TMP_DIR / f"warmup_{uuid.uuid4().hex}.wav"
