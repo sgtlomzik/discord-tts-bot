@@ -10,6 +10,5 @@ services:
     restart: unless-stopped
     volumes:
       - ./bot.py:/app/bot.py
-      - ./voice_receiver:/app/voice_receiver
       - ./models:/app/models:ro
       - ./data:/app/data
