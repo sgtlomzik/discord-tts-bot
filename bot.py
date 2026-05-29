@@ -53,6 +53,11 @@ TTS_IDLE_VOLUME_DB = float(os.getenv("TTS_IDLE_VOLUME_DB", "-60"))
 TTS_STREAM_TAIL_MS = int(os.getenv("TTS_STREAM_TAIL_MS", "200"))
 TTS_MAX_CONTINUOUS_IDLE_SECONDS = int(os.getenv("TTS_MAX_CONTINUOUS_IDLE_SECONDS", "900"))
 IDLE_DISCONNECT_SECONDS = int(os.getenv("TTS_IDLE_DISCONNECT_SECONDS", "60"))
+TTS_AUTO_CONNECT_ENABLED = os.getenv("TTS_AUTO_CONNECT_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
 AUTO_CONNECT_SUPPRESS_SECONDS = int(os.getenv("TTS_AUTO_CONNECT_SUPPRESS_SECONDS", "30"))
 TTS_TRIM_SILENCE = os.getenv("TTS_TRIM_SILENCE", "1").strip().lower() not in {"0", "false", "no"}
 FFMPEG_LOW_DELAY = os.getenv("FFMPEG_LOW_DELAY", "1").strip().lower() not in {"0", "false", "no"}
@@ -73,7 +78,6 @@ TTS_SELECTIVE_HOLD_ENABLED = os.getenv("TTS_SELECTIVE_HOLD_ENABLED", "1").strip(
     "false",
     "no",
 }
-TTS_SELECTIVE_HOLD_TARGET_USERS_RAW = os.getenv("TTS_SELECTIVE_HOLD_TARGET_USERS", "")
 TTS_SELECTIVE_HOLD_HARD_CAP_MS = int(os.getenv("TTS_SELECTIVE_HOLD_HARD_CAP_MS", "1200"))
 TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN = int(os.getenv("TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN", "10"))
 TTS_SELECTIVE_HOLD_START_MIN_WORDS_ALT = int(os.getenv("TTS_SELECTIVE_HOLD_START_MIN_WORDS_ALT", "2"))
@@ -133,7 +137,6 @@ def parse_user_ids(value: str) -> set[int]:
 
 
 WHITELIST_USERS = parse_user_ids(os.getenv("WHITELIST_USERS", DEFAULT_WHITELIST))
-TTS_SELECTIVE_HOLD_TARGET_USERS = parse_user_ids(TTS_SELECTIVE_HOLD_TARGET_USERS_RAW)
 
 
 @dataclass(frozen=True)
@@ -1081,8 +1084,6 @@ class TTSBot(commands.Bot):
         selective_enabled_for_author = (
             TTS_MERGE_ALGORITHM == "selective_hold_v2"
             and TTS_SELECTIVE_HOLD_ENABLED
-            and bool(TTS_SELECTIVE_HOLD_TARGET_USERS)
-            and author_id in TTS_SELECTIVE_HOLD_TARGET_USERS
         )
         if not selective_enabled_for_author:
             if not parsed.spoken_text:
@@ -1558,6 +1559,13 @@ class TTSBot(commands.Bot):
             log.exception("Voice disconnect cleanup failed")
 
     async def auto_connect_for_member(self, member: discord.Member, channel: discord.VoiceChannel) -> None:
+        if not TTS_AUTO_CONNECT_ENABLED:
+            log.info(
+                "Skip auto-connect guild=%s member=%s reason=disabled",
+                channel.guild.id,
+                member.id,
+            )
+            return
         if not self.config_store.is_enabled(channel.guild.id):
             return
         if not self.config_store.is_allowed(channel.guild.id, member.id):
@@ -1629,14 +1637,13 @@ async def on_ready() -> None:
         TTS_MAX_CONTINUOUS_IDLE_SECONDS,
     )
     log.info(
-        "Merge tuning: algorithm=%s enabled=%s max_chars=%s window_ms=%s max_parts=%s selective_enabled=%s selective_target_users=%s reaction_pause_ms=%s",
+        "Merge tuning: algorithm=%s enabled=%s max_chars=%s window_ms=%s max_parts=%s selective_enabled=%s selective_scope=all_allowed_users reaction_pause_ms=%s",
         TTS_MERGE_ALGORITHM,
         TTS_MERGE_SHORT_MESSAGES,
         TTS_MERGE_MAX_CHARS,
         TTS_MERGE_WINDOW_MS,
         TTS_MERGE_MAX_PARTS,
         TTS_SELECTIVE_HOLD_ENABLED,
-        ",".join(str(user_id) for user_id in sorted(TTS_SELECTIVE_HOLD_TARGET_USERS)) or "-",
         TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS,
     )
 

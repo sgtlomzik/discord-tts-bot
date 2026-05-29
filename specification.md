@@ -100,7 +100,6 @@ Feature flags и конфиг
 
 - TTS_MERGE_ALGORITHM = legacy | selective_hold_v2 | off
 - TTS_SELECTIVE_HOLD_ENABLED = true/false
-- TTS_SELECTIVE_HOLD_TARGET_USERS = list или аналогичный механизм, если бот уже имеет allowed users
 - TTS_SELECTIVE_HOLD_HARD_CAP_MS = 1200
 - TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN = 10
 - TTS_SELECTIVE_HOLD_START_MIN_WORDS_ALT = 2

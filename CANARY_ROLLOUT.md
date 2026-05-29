@@ -1,21 +1,21 @@
-# Selective Hold Canary Rollout
+# Selective Hold Rollout
 
 ## Safe defaults
 
 - Default mode is `TTS_MERGE_ALGORITHM=legacy`.
 - `selective_hold_v2` only activates when both are true:
   - `TTS_MERGE_ALGORITHM=selective_hold_v2`
-  - `TTS_SELECTIVE_HOLD_TARGET_USERS` contains the author's Discord user ID.
-- If `TTS_SELECTIVE_HOLD_TARGET_USERS` is empty, the bot stays on the legacy path.
+  - `TTS_SELECTIVE_HOLD_ENABLED=1`
+- When enabled, all users that pass the normal TTS allow checks use `selective_hold_v2`.
 - `TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS` only affects messages when there is no active buffer.
 
-## Enable for one user
+## Enable for all spoken users
 
 Edit `.env`:
 
 ```env
 TTS_MERGE_ALGORITHM=selective_hold_v2
-TTS_SELECTIVE_HOLD_TARGET_USERS=441612025286885397
+TTS_SELECTIVE_HOLD_ENABLED=1
 TTS_SELECTIVE_HOLD_LOG_DECISIONS=1
 ```
 
@@ -31,7 +31,7 @@ docker logs --tail 120 discord_tts_bot
 Expected startup log includes:
 
 ```text
-Merge tuning: algorithm=selective_hold_v2 ... selective_target_users=441612025286885397
+Merge tuning: algorithm=selective_hold_v2 ... selective_scope=all_allowed_users ...
 ```
 
 ## Roll back
@@ -76,4 +76,3 @@ For the first 20-30 minutes, watch:
 - `enqueue_fail_reason=...`
 - `message_to_audio_enqueue_s`
 - `queue_to_audio_enqueue_s`
-
