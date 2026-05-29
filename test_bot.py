@@ -78,11 +78,14 @@ class TTSBotTests(unittest.TestCase):
             bot = load_bot_module()
         self.assertEqual(bot.TTS_MERGE_ALGORITHM, "legacy")
 
-    def test_runtime_is_piper_ruslan_only(self):
+    def test_runtime_keeps_piper_default_and_adds_optional_supertonic_profiles(self):
         bot = load_bot_module()
 
         self.assertEqual(bot.DEFAULT_VOICE_PROFILE, "piper-ruslan")
-        self.assertEqual(list(bot.VOICE_PROFILES), ["piper-ruslan"])
+        self.assertEqual(bot.VOICE_PROFILES["piper-ruslan"].engine, "piper")
+        self.assertIn("supertonic-m1-ru", bot.VOICE_PROFILES)
+        self.assertEqual(bot.VOICE_PROFILES["supertonic-m1-ru"].engine, "supertonic")
+        self.assertTrue(bot.VOICE_PROFILES["supertonic-m1-ru"].experimental)
         self.assertFalse(hasattr(bot, "RHVOICE_URL"))
         self.assertFalse(hasattr(bot, "ESPEAK_CMD"))
 
@@ -513,6 +516,132 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         profile = tts_bot.generate_piper_file.await_args.args[2]
         self.assertEqual(profile.name, "piper-ruslan")
 
+    async def test_generate_tts_file_routes_supertonic_profile_to_supertonic_engine(self):
+        bot_mod = load_bot_module()
+        bot_mod.SUPERTONIC_ENABLED = True
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.generate_supertonic_file = AsyncMock(return_value=None)
+        tts_bot.generate_piper_file = AsyncMock(return_value=None)
+
+        filename = Path("/tmp/test_supertonic.wav")
+        await tts_bot.generate_tts_file("hello", filename, "supertonic-m1-ru")
+
+        tts_bot.generate_supertonic_file.assert_awaited_once()
+        tts_bot.generate_piper_file.assert_not_awaited()
+
+    async def test_generate_tts_file_falls_back_to_piper_when_supertonic_fails(self):
+        bot_mod = load_bot_module()
+        bot_mod.SUPERTONIC_ENABLED = True
+        bot_mod.TTS_SUPERTONIC_FALLBACK_TO_PIPER = True
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.generate_supertonic_file = AsyncMock(side_effect=bot_mod.TTSEngineError("down"))
+        tts_bot.generate_piper_file = AsyncMock(return_value=None)
+
+        filename = Path("/tmp/test_supertonic_fallback.wav")
+        await tts_bot.generate_tts_file("hello", filename, "supertonic-m1-ru")
+
+        tts_bot.generate_supertonic_file.assert_awaited_once()
+        tts_bot.generate_piper_file.assert_awaited_once()
+        fallback_profile = tts_bot.generate_piper_file.await_args.args[2]
+        self.assertEqual(fallback_profile.name, "piper-ruslan")
+
+    async def test_generate_tts_file_raises_when_supertonic_disabled_without_fallback(self):
+        bot_mod = load_bot_module()
+        bot_mod.SUPERTONIC_ENABLED = False
+        bot_mod.TTS_SUPERTONIC_FALLBACK_TO_PIPER = False
+        tts_bot = bot_mod.TTSBot()
+
+        with self.assertRaises(bot_mod.TTSEngineError):
+            await tts_bot.generate_tts_file("hello", Path("/tmp/test_disabled.wav"), "supertonic-m1-ru")
+
+    async def test_supertonic_engine_writes_valid_wav_response(self):
+        bot_mod = load_bot_module()
+        bot_mod.SUPERTONIC_ENABLED = True
+
+        class FakeResponse:
+            headers = {"content-type": "audio/wav"}
+            content = b"RIFF" + b"\x00" * 20
+
+            def raise_for_status(self):
+                return None
+
+        class FakeClient:
+            async def post(self, url, json):
+                self.url = url
+                self.payload = json
+                return FakeResponse()
+
+        engine = bot_mod.SupertonicTTSEngine(client=FakeClient())
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = Path(tmp_dir) / "out.wav"
+            await engine.synthesize_to_wav("hello", bot_mod.VOICE_PROFILES["supertonic-m1-ru"], output)
+
+            self.assertTrue(output.read_bytes().startswith(b"RIFF"))
+
+    async def test_supertonic_engine_rejects_bad_response_and_opens_circuit(self):
+        bot_mod = load_bot_module()
+        bot_mod.SUPERTONIC_ENABLED = True
+        bot_mod.TTS_SUPERTONIC_CIRCUIT_BREAKER_FAILURES = 1
+
+        class FakeResponse:
+            headers = {"content-type": "application/json"}
+            content = b'{"error":"bad"}'
+
+            def raise_for_status(self):
+                return None
+
+        class FakeClient:
+            async def post(self, url, json):
+                return FakeResponse()
+
+        engine = bot_mod.SupertonicTTSEngine(client=FakeClient())
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.assertRaises(bot_mod.TTSEngineError):
+                await engine.synthesize_to_wav("hello", bot_mod.VOICE_PROFILES["supertonic-m1-ru"], Path(tmp_dir) / "out.wav")
+
+        self.assertTrue(engine.is_circuit_open())
+
+    async def test_validate_voice_profile_rejects_disabled_supertonic_for_persistence(self):
+        bot_mod = load_bot_module()
+        bot_mod.SUPERTONIC_ENABLED = False
+
+        self.assertIsNone(bot_mod.validate_voice_profile("supertonic-m1-ru"))
+        self.assertEqual(bot_mod.validate_voice_profile("piper-ruslan"), "piper-ruslan")
+
+    async def test_slash_set_voice_rejects_disabled_supertonic_profile(self):
+        bot_mod = load_bot_module()
+        bot_mod.SUPERTONIC_ENABLED = False
+        bot_mod.bot.config_store.set_default_voice = MagicMock()
+        interaction = types.SimpleNamespace(
+            guild=types.SimpleNamespace(id=100),
+            user=types.SimpleNamespace(guild_permissions=types.SimpleNamespace(manage_guild=True, administrator=False)),
+            response=types.SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        await bot_mod.slash_tts_set_voice.callback(interaction, "supertonic-m1-ru")
+
+        bot_mod.bot.config_store.set_default_voice.assert_not_called()
+        interaction.response.send_message.assert_awaited_once()
+
+    async def test_slash_reset_voice_restores_piper_default(self):
+        bot_mod = load_bot_module()
+
+        class FakeMember:
+            pass
+
+        bot_mod.bot.config_store.set_default_voice = MagicMock()
+        interaction = types.SimpleNamespace(
+            guild=types.SimpleNamespace(id=100),
+            user=FakeMember(),
+            response=types.SimpleNamespace(send_message=AsyncMock()),
+        )
+        interaction.user.guild_permissions = types.SimpleNamespace(manage_guild=True, administrator=False)
+
+        with patch.object(bot_mod.discord, "Member", FakeMember):
+            await bot_mod.slash_tts_reset_voice.callback(interaction)
+
+        bot_mod.bot.config_store.set_default_voice.assert_called_once_with(100, "piper-ruslan")
+
     async def test_clear_queue_for_guild_keeps_other_guild_jobs(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
@@ -851,6 +980,33 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
             await bot_mod.slash_tts_test.callback(interaction, "проверка")
 
         self.assertEqual(call_order, ["response", "enqueue"])
+
+    async def test_slash_tts_test_profile_override_does_not_persist_config(self):
+        bot_mod = load_bot_module()
+
+        class FakeMember:
+            pass
+
+        target_channel = types.SimpleNamespace(id=200, guild=types.SimpleNamespace(id=100))
+        interaction = types.SimpleNamespace(
+            guild=types.SimpleNamespace(id=100),
+            user=FakeMember(),
+            channel_id=300,
+            response=types.SimpleNamespace(send_message=AsyncMock()),
+        )
+        interaction.user.id = 400
+        bot_mod.bot.config_store.is_allowed = MagicMock(return_value=True)
+        bot_mod.bot.config_store.set_user_voice = MagicMock()
+        bot_mod.bot.enqueue_tts = AsyncMock()
+
+        with (
+            patch.object(bot_mod.discord, "Member", FakeMember),
+            patch.object(bot_mod, "resolve_tts_command_voice_channel", MagicMock(return_value=target_channel)),
+        ):
+            await bot_mod.slash_tts_test.callback(interaction, "проверка", None, "piper-ruslan")
+
+        bot_mod.bot.config_store.set_user_voice.assert_not_called()
+        bot_mod.bot.enqueue_tts.assert_awaited_once()
 
     async def test_idle_disconnect_runs_even_when_allowed_user_is_present(self):
         bot_mod = load_bot_module()
