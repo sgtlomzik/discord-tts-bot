@@ -14,16 +14,10 @@ import uuid
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
 from discord.ext import commands
-
-try:
-    import httpx
-except Exception:  # pragma: no cover - optional dependency until Supertonic is enabled
-    httpx = None
 
 try:
     from piper import PiperVoice, SynthesisConfig
@@ -117,26 +111,6 @@ PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "").strip()
 PIPER_CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH", "").strip()
 PIPER_SPEAKER = int(os.getenv("PIPER_SPEAKER", "-1"))
 PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.0"))
-SUPERTONIC_ENABLED = os.getenv("SUPERTONIC_ENABLED", "0").strip().lower() not in {"0", "false", "no"}
-SUPERTONIC_BASE_URL = os.getenv("SUPERTONIC_BASE_URL", "http://127.0.0.1:7788").strip().rstrip("/")
-SUPERTONIC_TIMEOUT_SECONDS = float(os.getenv("SUPERTONIC_TIMEOUT_SECONDS", "20"))
-SUPERTONIC_CONNECT_TIMEOUT_SECONDS = float(os.getenv("SUPERTONIC_CONNECT_TIMEOUT_SECONDS", "3"))
-SUPERTONIC_MAX_TEXT_CHARS = int(os.getenv("SUPERTONIC_MAX_TEXT_CHARS", "500"))
-SUPERTONIC_MAX_CONCURRENCY = int(os.getenv("SUPERTONIC_MAX_CONCURRENCY", "1"))
-SUPERTONIC_DEFAULT_VOICE = os.getenv("SUPERTONIC_DEFAULT_VOICE", "M1").strip()
-SUPERTONIC_DEFAULT_LANG = os.getenv("SUPERTONIC_DEFAULT_LANG", "ru").strip()
-SUPERTONIC_DEFAULT_STEPS = int(os.getenv("SUPERTONIC_DEFAULT_STEPS", "8"))
-SUPERTONIC_DEFAULT_SPEED = float(os.getenv("SUPERTONIC_DEFAULT_SPEED", "1.05"))
-SUPERTONIC_RESPONSE_FORMAT = os.getenv("SUPERTONIC_RESPONSE_FORMAT", "wav").strip().lower()
-TTS_SUPERTONIC_FALLBACK_TO_PIPER = os.getenv("TTS_SUPERTONIC_FALLBACK_TO_PIPER", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-}
-TTS_SUPERTONIC_CIRCUIT_BREAKER_FAILURES = int(os.getenv("TTS_SUPERTONIC_CIRCUIT_BREAKER_FAILURES", "3"))
-TTS_SUPERTONIC_CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(
-    os.getenv("TTS_SUPERTONIC_CIRCUIT_BREAKER_COOLDOWN_SECONDS", "60")
-)
 
 EMOJI_MAP = {
     "Blya2x": "Бля",
@@ -169,17 +143,10 @@ WHITELIST_USERS = parse_user_ids(os.getenv("WHITELIST_USERS", DEFAULT_WHITELIST)
 class VoiceProfile:
     name: str
     label: str
-    engine: str = "piper"
-    lang: str = "ru"
     piper_model_path: str = ""
     piper_config_path: str = ""
     piper_speaker: int = -1
     piper_length_scale: float = 1.0
-    supertonic_voice: str = ""
-    supertonic_steps: int = SUPERTONIC_DEFAULT_STEPS
-    supertonic_speed: float = SUPERTONIC_DEFAULT_SPEED
-    supertonic_response_format: str = SUPERTONIC_RESPONSE_FORMAT
-    experimental: bool = False
 
 
 @dataclass
@@ -259,32 +226,10 @@ VOICE_PROFILES: dict[str, VoiceProfile] = {
     "piper-ruslan": VoiceProfile(
         name="piper-ruslan",
         label="Piper Ruslan",
-        engine="piper",
-        lang="ru",
         piper_model_path=PIPER_MODEL_PATH,
         piper_config_path=PIPER_CONFIG_PATH,
         piper_speaker=PIPER_SPEAKER,
         piper_length_scale=PIPER_LENGTH_SCALE,
-    ),
-    "supertonic-m1-ru": VoiceProfile(
-        name="supertonic-m1-ru",
-        label="Supertonic M1 RU",
-        engine="supertonic",
-        lang="ru",
-        supertonic_voice="M1",
-        supertonic_steps=SUPERTONIC_DEFAULT_STEPS,
-        supertonic_speed=SUPERTONIC_DEFAULT_SPEED,
-        experimental=True,
-    ),
-    "supertonic-f1-ru": VoiceProfile(
-        name="supertonic-f1-ru",
-        label="Supertonic F1 RU",
-        engine="supertonic",
-        lang="ru",
-        supertonic_voice="F1",
-        supertonic_steps=SUPERTONIC_DEFAULT_STEPS,
-        supertonic_speed=SUPERTONIC_DEFAULT_SPEED,
-        experimental=True,
     ),
 }
 
@@ -680,120 +625,6 @@ def build_idle_pcm_frame(mode: str, volume_db: float) -> bytes:
     return struct.pack("<" + "h" * len(samples), *samples)
 
 
-class TTSEngineError(RuntimeError):
-    pass
-
-
-def _is_trusted_supertonic_base_url(value: str) -> bool:
-    parsed = urlparse(value)
-    return parsed.scheme == "http" and parsed.hostname in {"supertonic", "127.0.0.1", "localhost"}
-
-
-def _write_bytes_atomically(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("wb", dir=str(path.parent), delete=False) as tmp_file:
-        tmp_file.write(data)
-        tmp_path = Path(tmp_file.name)
-    tmp_path.replace(path)
-
-
-class SupertonicTTSEngine:
-    name = "supertonic"
-
-    def __init__(self, client: object | None = None) -> None:
-        self.base_url = SUPERTONIC_BASE_URL
-        self.semaphore = asyncio.Semaphore(max(SUPERTONIC_MAX_CONCURRENCY, 1))
-        self.failure_count = 0
-        self.circuit_open_until = 0.0
-        if not _is_trusted_supertonic_base_url(self.base_url):
-            log.warning("Ignoring untrusted SUPERTONIC_BASE_URL=%s", self.base_url)
-            self.client = None
-        elif client is not None:
-            self.client = client
-        elif httpx is not None:
-            self.client = httpx.AsyncClient(
-                timeout=httpx.Timeout(
-                    SUPERTONIC_TIMEOUT_SECONDS,
-                    connect=SUPERTONIC_CONNECT_TIMEOUT_SECONDS,
-                ),
-                follow_redirects=False,
-            )
-        else:
-            self.client = None
-
-    async def close(self) -> None:
-        close = getattr(self.client, "aclose", None)
-        if close is not None:
-            await close()
-
-    def is_circuit_open(self) -> bool:
-        if self.circuit_open_until <= 0:
-            return False
-        if time.monotonic() >= self.circuit_open_until:
-            self.circuit_open_until = 0.0
-            self.failure_count = 0
-            return False
-        return True
-
-    def _record_success(self) -> None:
-        self.failure_count = 0
-        self.circuit_open_until = 0.0
-
-    def _record_failure(self) -> None:
-        self.failure_count += 1
-        if self.failure_count >= max(TTS_SUPERTONIC_CIRCUIT_BREAKER_FAILURES, 1):
-            self.circuit_open_until = time.monotonic() + max(
-                TTS_SUPERTONIC_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
-                1,
-            )
-
-    async def synthesize_to_wav(self, text: str, profile: VoiceProfile, output_path: Path) -> Path:
-        if not SUPERTONIC_ENABLED:
-            raise TTSEngineError("Supertonic is disabled")
-        if self.is_circuit_open():
-            raise TTSEngineError("Supertonic circuit breaker is open")
-        if self.client is None:
-            raise TTSEngineError("httpx is not installed")
-
-        safe_text = text[: max(SUPERTONIC_MAX_TEXT_CHARS, 1)]
-        payload = {
-            "text": safe_text,
-            "voice": profile.supertonic_voice or SUPERTONIC_DEFAULT_VOICE,
-            "lang": profile.lang or SUPERTONIC_DEFAULT_LANG,
-            "steps": int(profile.supertonic_steps or SUPERTONIC_DEFAULT_STEPS),
-            "speed": float(profile.supertonic_speed or SUPERTONIC_DEFAULT_SPEED),
-            "response_format": profile.supertonic_response_format or SUPERTONIC_RESPONSE_FORMAT,
-        }
-
-        started = time.perf_counter()
-        try:
-            async with self.semaphore:
-                response = await self.client.post(f"{self.base_url}/v1/tts", json=payload)
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "")
-            content = response.content
-            if "audio" not in content_type.lower() and not content.startswith(b"RIFF"):
-                raise TTSEngineError(f"Unexpected Supertonic response type: {content_type}")
-            if not content.startswith(b"RIFF"):
-                raise TTSEngineError("Supertonic response is not a WAV file")
-            _write_bytes_atomically(output_path, content)
-            self._record_success()
-            log.info(
-                "TTS engine used: supertonic profile=%s text_len=%s wav_bytes=%s took=%.3fs",
-                profile.name,
-                len(safe_text),
-                output_path.stat().st_size if output_path.exists() else 0,
-                time.perf_counter() - started,
-            )
-            return output_path
-        except TTSEngineError:
-            self._record_failure()
-            raise
-        except Exception as exc:
-            self._record_failure()
-            raise TTSEngineError(f"Supertonic request failed: {type(exc).__name__}") from exc
-
-
 class ContinuousTTSAudioSource(discord.AudioSource):
     def __init__(self, idle_frame: bytes) -> None:
         self.idle_frame = idle_frame
@@ -864,7 +695,6 @@ class TTSBot(commands.Bot):
         self.suppress_auto_connect_until: dict[int, float] = {}
         self.config_store = BotConfigStore(BOT_CONFIG_PATH, WHITELIST_USERS)
         self.piper_voices: dict[tuple[str, str], object] = {}
-        self.supertonic_engine = SupertonicTTSEngine()
         self.continuous_sources: dict[int, ContinuousTTSAudioSource] = {}
         self.merge_buffers: dict[tuple[int, int], MergeBufferState] = {}
         self.merge_locks: dict[tuple[int, int], asyncio.Lock] = {}
@@ -879,8 +709,6 @@ class TTSBot(commands.Bot):
         except Exception:
             log.exception("Failed to sync slash commands")
         self.worker_task = asyncio.create_task(self.tts_worker(), name="tts-worker")
-        if SUPERTONIC_ENABLED:
-            asyncio.create_task(self.warmup_supertonic(), name="supertonic-warmup")
 
     async def close(self) -> None:
         if self.worker_task:
@@ -895,7 +723,6 @@ class TTSBot(commands.Bot):
                 state.timer_task.cancel()
         for source in self.continuous_sources.values():
             source.stop()
-        await self.supertonic_engine.close()
 
         await super().close()
 
@@ -1105,27 +932,6 @@ class TTSBot(commands.Bot):
                 except OSError:
                     log.exception("Failed to remove warmup file: %s", filename)
 
-    async def warmup_supertonic(self) -> None:
-        filename = TMP_DIR / f"warmup_supertonic_{uuid.uuid4().hex}.wav"
-        try:
-            await asyncio.wait_for(
-                self.generate_supertonic_file(
-                    "Проверка синтеза речи.",
-                    filename,
-                    VOICE_PROFILES["supertonic-m1-ru"],
-                ),
-                timeout=max(SUPERTONIC_TIMEOUT_SECONDS, 1.0),
-            )
-            log.info("Supertonic warmup completed")
-        except Exception:
-            log.warning("Supertonic warmup failed", exc_info=True)
-        finally:
-            if filename.exists():
-                try:
-                    filename.unlink()
-                except OSError:
-                    log.exception("Failed to remove Supertonic warmup file: %s", filename)
-
     async def enqueue_tts(
         self,
         text: str,
@@ -1133,11 +939,10 @@ class TTSBot(commands.Bot):
         author_id: int,
         text_channel_id: int,
         message_ts: float | None = None,
-        voice_profile: str | None = None,
     ) -> bool:
         try:
             now = time.perf_counter()
-            selected_profile = voice_profile or self.config_store.voice_for_user(voice_channel.guild.id, author_id)
+            voice_profile = self.config_store.voice_for_user(voice_channel.guild.id, author_id)
             job = TTSJob(
                 text=text[:MAX_TEXT_LENGTH],
                 voice_channel=voice_channel,
@@ -1145,7 +950,7 @@ class TTSBot(commands.Bot):
                 author_id=author_id,
                 guild_id=voice_channel.guild.id,
                 text_channel_id=text_channel_id,
-                voice_profile=selected_profile,
+                voice_profile=voice_profile,
                 message_ts=message_ts or now,
             )
             await asyncio.wait_for(
@@ -1160,7 +965,7 @@ class TTSBot(commands.Bot):
                 author_id,
                 self.message_queue.qsize(),
                 len(text),
-                selected_profile,
+                voice_profile,
             )
             return True
         except (asyncio.QueueFull, TimeoutError):
@@ -1505,32 +1310,8 @@ class TTSBot(commands.Bot):
 
     async def generate_tts_file(self, text: str, filename: Path, voice_profile: str | None = None) -> None:
         profile = VOICE_PROFILES.get(voice_profile or DEFAULT_VOICE_PROFILE, VOICE_PROFILES[DEFAULT_VOICE_PROFILE])
-        if profile.engine == "piper":
-            await self.generate_piper_file(text, filename, profile)
-            log.info("TTS engine used: piper profile=%s", profile.name)
-            return
-
-        if profile.engine == "supertonic":
-            try:
-                await self.generate_supertonic_file(text, filename, profile)
-                return
-            except Exception as exc:
-                log.warning(
-                    "tts_fallback engine=supertonic profile=%s fallback=piper-ruslan error_type=%s",
-                    profile.name,
-                    type(exc).__name__,
-                )
-                if not TTS_SUPERTONIC_FALLBACK_TO_PIPER:
-                    raise TTSEngineError(str(exc)) from exc
-                fallback_profile = VOICE_PROFILES["piper-ruslan"]
-                await self.generate_piper_file(text, filename, fallback_profile)
-                log.info("TTS engine used: piper profile=%s fallback_from=%s", fallback_profile.name, profile.name)
-                return
-
-        raise TTSEngineError(f"Unknown TTS engine: {profile.engine}")
-
-    async def generate_supertonic_file(self, text: str, filename: Path, profile: VoiceProfile) -> None:
-        await self.supertonic_engine.synthesize_to_wav(text, profile, filename)
+        await self.generate_piper_file(text, filename, profile)
+        log.info("TTS engine used: piper profile=%s", profile.name)
 
     async def tts_worker(self) -> None:
         await self.wait_until_ready()
@@ -1939,20 +1720,7 @@ async def require_guild_manager(interaction: discord.Interaction) -> bool:
 
 def validate_voice_profile(voice: str) -> str | None:
     voice_name = voice.strip().lower()
-    profile = VOICE_PROFILES.get(voice_name)
-    if profile is None:
-        return None
-    if profile.engine == "supertonic" and not SUPERTONIC_ENABLED:
-        return None
-    return voice_name
-
-
-def voice_profile_status(profile: VoiceProfile) -> str:
-    if profile.engine == "supertonic" and not SUPERTONIC_ENABLED:
-        return "disabled"
-    if profile.engine == "supertonic":
-        return "experimental"
-    return "available"
+    return voice_name if voice_name in VOICE_PROFILES else None
 
 
 async def voice_profile_autocomplete(
@@ -2051,82 +1819,21 @@ async def slash_tts_status(interaction: discord.Interaction) -> None:
                 f"Default voice: `{config.default_voice}`",
                 f"Allowed users: `{len(config.allowed_users)}`",
                 f"Merge: `{TTS_MERGE_SHORT_MESSAGES}`",
-                f"Supertonic: `{SUPERTONIC_ENABLED}`",
             ]
         ),
         ephemeral=True,
     )
 
 
-@tts_group.command(name="voices", description="Показать доступные голоса")
-async def slash_tts_voices(interaction: discord.Interaction) -> None:
-    lines = []
-    for name, profile in sorted(VOICE_PROFILES.items()):
-        default_mark = " default" if name == DEFAULT_VOICE_PROFILE else ""
-        lines.append(
-            f"`{name}` - {profile.label} engine=`{profile.engine}` status=`{voice_profile_status(profile)}`{default_mark}"
-        )
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
-
-@tts_group.command(name="set-voice", description="Установить голос по умолчанию")
-@app_commands.describe(profile="Профиль голоса")
-@app_commands.autocomplete(profile=voice_profile_autocomplete)
-async def slash_tts_set_voice(interaction: discord.Interaction, profile: str) -> None:
-    if not await require_guild_manager(interaction):
-        return
-    guild = interaction.guild
-    assert guild is not None
-    voice_name = validate_voice_profile(profile)
-    if voice_name is None:
-        await interaction.response.send_message("Неизвестный или отключенный профиль голоса.", ephemeral=True)
-        return
-    bot.config_store.set_default_voice(guild.id, voice_name)
-    await interaction.response.send_message(f"Профиль по умолчанию: `{voice_name}`.", ephemeral=True)
-
-
-@tts_group.command(name="set-user-voice", description="Установить голос пользователя")
-@app_commands.describe(member="Пользователь", profile="Профиль голоса")
-@app_commands.autocomplete(profile=voice_profile_autocomplete)
-async def slash_tts_set_user_voice(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    profile: str,
-) -> None:
-    if not await require_guild_manager(interaction):
-        return
-    guild = interaction.guild
-    assert guild is not None
-    voice_name = validate_voice_profile(profile)
-    if voice_name is None:
-        await interaction.response.send_message("Неизвестный или отключенный профиль голоса.", ephemeral=True)
-        return
-    bot.config_store.set_user_voice(guild.id, member.id, voice_name)
-    await interaction.response.send_message(f"Профиль для {member.mention}: `{voice_name}`.", ephemeral=True)
-
-
-@tts_group.command(name="reset-voice", description="Вернуть Piper как голос по умолчанию")
-async def slash_tts_reset_voice(interaction: discord.Interaction) -> None:
-    if not await require_guild_manager(interaction):
-        return
-    guild = interaction.guild
-    assert guild is not None
-    bot.config_store.set_default_voice(guild.id, "piper-ruslan")
-    await interaction.response.send_message("Профиль по умолчанию возвращен на `piper-ruslan`.", ephemeral=True)
-
-
 @tts_group.command(name="test", description="Проиграть тестовую фразу")
 @app_commands.describe(
     text="Текст для проверки",
     voice_channel="Голосовой канал для удаленного запуска",
-    profile="Профиль голоса для разовой проверки",
 )
-@app_commands.autocomplete(profile=voice_profile_autocomplete)
 async def slash_tts_test(
     interaction: discord.Interaction,
     text: str,
     voice_channel: discord.VoiceChannel | None = None,
-    profile: str | None = None,
 ) -> None:
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("Команда доступна только на сервере.", ephemeral=True)
@@ -2146,23 +1853,8 @@ async def slash_tts_test(
     if not final_text:
         await interaction.response.send_message("Нет текста для озвучки.", ephemeral=True)
         return
-    voice_name = None
-    if profile:
-        voice_name = validate_voice_profile(profile)
-        if voice_name is None:
-            await interaction.response.send_message("Неизвестный или отключенный профиль голоса.", ephemeral=True)
-            return
     await interaction.response.send_message("Тестовая фраза добавлена в очередь.", ephemeral=True)
-    if voice_name:
-        await bot.enqueue_tts(
-            final_text,
-            target_channel,
-            interaction.user.id,
-            interaction.channel_id or 0,
-            voice_profile=voice_name,
-        )
-    else:
-        await bot.enqueue_tts(final_text, target_channel, interaction.user.id, interaction.channel_id or 0)
+    await bot.enqueue_tts(final_text, target_channel, interaction.user.id, interaction.channel_id or 0)
 
 
 @tts_group.command(name="queue-clear", description="Очистить очередь TTS")

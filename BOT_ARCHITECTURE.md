@@ -12,7 +12,7 @@ The bot is a single-process Discord service that:
 3. normalizes and classifies message text;
 4. optionally merges short messages into a buffer;
 5. queues TTS jobs;
-6. synthesizes speech with the selected TTS engine;
+6. synthesizes speech with Piper;
 7. converts the generated WAV into PCM frames;
 8. plays the frames into a Discord voice channel;
 9. disconnects when the voice channel goes idle.
@@ -23,7 +23,6 @@ The current production runtime is intentionally small:
 - one unittest file for coverage;
 - one container image;
 - one local Piper voice model;
-- optional Supertonic sidecar service, disabled by default;
 - one JSON config file for guild state.
 
 ## 2. Runtime Layout
@@ -37,7 +36,6 @@ The active runtime pieces are:
 - `requirements.txt` - Python dependencies.
 - `.env.example` - runtime flag reference.
 - `models/ru_RU-ruslan-medium.onnx` and `.json` - Piper voice model files.
-- optional `supertonic` compose service - local HTTP sidecar for Supertonic 3.
 - `data/config.json` - persisted guild/user settings.
 
 At runtime, the container mounts:
@@ -220,17 +218,16 @@ Important behavior:
 
 This is the part to preserve if a new TTS engine is introduced. The engine can change, but the worker contract should stay stable.
 
-## 7. TTS Engine Path
+## 7. Piper Synthesis Path
 
-Piper remains the default engine. Supertonic 3 is available as an optional experimental engine when `SUPERTONIC_ENABLED=1`.
+Piper is the only active engine in production right now.
 
-The common synthesis path is:
+The synthesis path is:
 
 ```text
 text
   -> generate_tts_file()
-  -> profile.engine
-  -> generate_piper_file() or generate_supertonic_file()
+  -> generate_piper_file()
   -> WAV file in tmp storage
   -> ffmpeg PCM conversion
   -> Discord playback
@@ -238,12 +235,11 @@ text
 
 The key runtime objects are:
 
-- `VOICE_PROFILES` - contains `piper-ruslan` plus disabled-by-default Supertonic profiles;
+- `VOICE_PROFILES` - currently contains only `piper-ruslan`;
 - `PiperVoice` - loaded lazily and cached by model path;
 - `SynthesisConfig` - used for speaker and length-scale tuning when needed.
-- `SupertonicTTSEngine` - HTTP client for the local `/v1/tts` sidecar endpoint.
 
-This is the main extension point for voice engines. The outer worker and playback path stay shared as long as the engine produces a valid WAV file.
+This is the main extension point for a new engine. The outer worker and playback path do not need to change if the new engine can produce compatible audio.
 
 ## 8. Playback Path
 
@@ -340,8 +336,6 @@ The important current engine-specific values are:
 - `TTS_DEFAULT_VOICE_PROFILE=piper-ruslan`
 - `PIPER_MODEL_PATH=/app/models/ru_RU-ruslan-medium.onnx`
 - `PIPER_CONFIG_PATH=/app/models/ru_RU-ruslan-medium.onnx.json`
-- `SUPERTONIC_ENABLED=0`
-- `SUPERTONIC_BASE_URL=http://127.0.0.1:7788`
 
 ## 13. Tests
 
@@ -399,11 +393,12 @@ Stores the active Piper voice model files.
 
 If the goal is to add a new voice engine, the architecture points that matter most are:
 
-1. keep `on_message()` and `queue_or_merge_message()` stable;
-2. keep new engine work behind `generate_tts_file()` and profile metadata;
+1. keep `on_message()` and `queue_or_merge_message()` mostly stable;
+2. introduce a real engine boundary near `generate_tts_file()`;
 3. preserve `TTSJob`, queueing, and worker flow;
 4. make engine selection a profile-level concern, not a scattered global `if`;
 5. keep playback and voice lifecycle unchanged unless the new engine genuinely needs a different artifact format;
 6. add tests around engine selection, fallback, and missing-model behavior.
 
 That is the smallest clean seam in the current codebase.
+
