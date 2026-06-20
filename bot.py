@@ -941,6 +941,23 @@ class TTSBot(commands.Bot):
                 )
                 try:
                     vc = await voice_channel.connect(timeout=60.0, self_deaf=True)
+                except discord.errors.ClientException as exc:
+                    if "Already connected" in str(exc):
+                        # State desync: discord.py internal state has an active voice client
+                        # that isn't reflected in self.voice_clients yet. Recover it instead
+                        # of setting a cooldown and looping forever.
+                        existing_vc = voice_channel.guild.voice_client
+                        if existing_vc and existing_vc.is_connected():
+                            log.warning(
+                                "Voice state desync recovered guild=%s channel=%s",
+                                guild_id,
+                                voice_channel.id,
+                            )
+                            if existing_vc.channel != voice_channel:
+                                await existing_vc.move_to(voice_channel)
+                            return existing_vc
+                    self.set_voice_connect_cooldown(guild_id, type(exc).__name__)
+                    raise
                 except Exception as exc:
                     self.set_voice_connect_cooldown(guild_id, type(exc).__name__)
                     raise
