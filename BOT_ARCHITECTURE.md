@@ -235,7 +235,7 @@ text
 
 The key runtime objects are:
 
-- `VOICE_PROFILES` - currently contains only `piper-ruslan`;
+- `VOICE_PROFILES` - contains the Ruslan and Irina Piper profiles;
 - `PiperVoice` - loaded lazily and cached by model path;
 - `SynthesisConfig` - used for speaker and length-scale tuning when needed.
 
@@ -307,6 +307,10 @@ Current commands:
 - `off` - disable TTS and clear active work;
 - `allow` - add a member to the allowed list;
 - `deny` - remove a member from the allowed list;
+- `voices` - list available voice profiles;
+- `voice-set` - change the guild default voice;
+- `voice-user` - assign a voice profile to one member;
+- `voice-clear` - clear a member's voice override;
 - `status` - show current runtime state;
 - `queue-clear` - clear queued work;
 - `test` - enqueue a test phrase, optionally to a specific voice channel.
@@ -401,4 +405,3 @@ If the goal is to add a new voice engine, the architecture points that matter mo
 6. add tests around engine selection, fallback, and missing-model behavior.
 
 That is the smallest clean seam in the current codebase.
-

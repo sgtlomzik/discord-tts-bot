@@ -107,8 +107,11 @@ TTS_SELECTIVE_HOLD_ENABLE_ORDER_PRESERVING_FLUSH = os.getenv(
 TTS_QUEUE_PUT_TIMEOUT_MS = int(os.getenv("TTS_QUEUE_PUT_TIMEOUT_MS", "500"))
 
 VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
-PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "").strip()
-PIPER_CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH", "").strip()
+PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "/app/models/ru_RU-ruslan-medium.onnx").strip()
+PIPER_CONFIG_PATH = os.getenv(
+    "PIPER_CONFIG_PATH",
+    "/app/models/ru_RU-ruslan-medium.onnx.json",
+).strip()
 PIPER_SPEAKER = int(os.getenv("PIPER_SPEAKER", "-1"))
 PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.0"))
 
@@ -228,6 +231,14 @@ VOICE_PROFILES: dict[str, VoiceProfile] = {
         label="Piper Ruslan",
         piper_model_path=PIPER_MODEL_PATH,
         piper_config_path=PIPER_CONFIG_PATH,
+        piper_speaker=PIPER_SPEAKER,
+        piper_length_scale=PIPER_LENGTH_SCALE,
+    ),
+    "piper-irina": VoiceProfile(
+        name="piper-irina",
+        label="Piper Irina",
+        piper_model_path="/app/models/ru_RU-irina-medium.onnx",
+        piper_config_path="/app/models/ru_RU-irina-medium.onnx.json",
         piper_speaker=PIPER_SPEAKER,
         piper_length_scale=PIPER_LENGTH_SCALE,
     ),
@@ -798,17 +809,68 @@ class TTSBot(commands.Bot):
         self.idle_disconnect_tasks[guild.id] = task
         log.info("Scheduled idle disconnect guild=%s timeout=%ss", guild.id, IDLE_DISCONNECT_SECONDS)
 
+    def has_active_voice_playback(self, guild_id: int, vc: discord.VoiceClient) -> bool:
+        source = self.continuous_sources.get(guild_id)
+        if source and not source.stopped:
+            return not source.is_drained
+        return vc.is_playing() or vc.is_paused()
+
+    def _whitelisted_user_in_channel(
+        self, guild: discord.Guild, channel: discord.VoiceChannel | None
+    ) -> bool:
+        if channel is None:
+            return False
+        return any(
+            (not user.bot) and self.config_store.is_allowed(guild.id, user.id)
+            for user in channel.members
+        )
+
     async def _idle_disconnect_after_timeout(self, guild: discord.Guild) -> None:
         try:
-            await asyncio.sleep(IDLE_DISCONNECT_SECONDS)
+            poll_interval = 5.0
+            elapsed = 0.0
+            while elapsed < IDLE_DISCONNECT_SECONDS:
+                remaining = IDLE_DISCONNECT_SECONDS - elapsed
+                await asyncio.sleep(min(poll_interval, remaining))
+                elapsed += poll_interval
+
+                vc = discord.utils.get(self.voice_clients, guild=guild)
+                if not vc or not vc.is_connected():
+                    return
+
+                channel = vc.channel if isinstance(vc.channel, discord.VoiceChannel) else None
+                if self._whitelisted_user_in_channel(guild, channel):
+                    log.info(
+                        "Cancel idle disconnect guild=%s reason=whitelisted_user_present",
+                        guild.id,
+                    )
+                    return
+
+                if self.has_active_voice_playback(guild.id, vc):
+                    log.info("Skip idle disconnect guild=%s reason=playback_active", guild.id)
+                    return
 
             vc = discord.utils.get(self.voice_clients, guild=guild)
             if not vc or not vc.is_connected():
                 return
 
-            if vc.is_playing() or vc.is_paused():
+            if self.has_active_voice_playback(guild.id, vc):
                 log.info("Skip idle disconnect guild=%s reason=playback_active", guild.id)
                 return
+
+            channel = vc.channel if isinstance(vc.channel, discord.VoiceChannel) else None
+            if self._whitelisted_user_in_channel(guild, channel):
+                log.info(
+                    "Cancel idle disconnect guild=%s reason=whitelisted_user_present",
+                    guild.id,
+                )
+                return
+
+            source = self.continuous_sources.pop(guild.id, None)
+            if source:
+                source.stop()
+                if vc.is_playing() or vc.is_paused():
+                    vc.stop()
 
             await vc.disconnect(force=True)
             self.suppress_auto_connect(guild.id, "idle_disconnect")
@@ -1696,7 +1758,7 @@ async def on_voice_state_update(
             (not user.bot) and bot.config_store.is_allowed(guild.id, user.id)
             for user in vc.channel.members
         )
-        if not whitelisted_present and not vc.is_playing() and not vc.is_paused():
+        if not whitelisted_present and not bot.has_active_voice_playback(guild.id, vc):
             bot.schedule_idle_disconnect(guild)
 
 
@@ -1800,6 +1862,64 @@ async def slash_tts_deny(interaction: discord.Interaction, user: discord.Member)
     assert guild is not None
     bot.config_store.remove_user(guild.id, user.id)
     await interaction.response.send_message(f"Исключен из озвучки: {user.mention}", ephemeral=True)
+
+
+@tts_group.command(name="voice-set", description="Сменить озвучку по умолчанию")
+@app_commands.describe(voice="Профиль голоса")
+@app_commands.autocomplete(voice=voice_profile_autocomplete)
+async def slash_tts_voice_set(interaction: discord.Interaction, voice: str) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    voice_name = validate_voice_profile(voice)
+    if not voice_name:
+        await interaction.response.send_message(
+            "Неизвестный профиль голоса. Используйте `/voicebot voices`.",
+            ephemeral=True,
+        )
+        return
+    guild = interaction.guild
+    assert guild is not None
+    bot.config_store.set_default_voice(guild.id, voice_name)
+    await interaction.response.send_message(f"Озвучка по умолчанию: `{voice_name}`.", ephemeral=True)
+
+
+@tts_group.command(name="voice-user", description="Назначить отдельную озвучку пользователю")
+@app_commands.describe(user="Пользователь", voice="Профиль голоса")
+@app_commands.autocomplete(voice=voice_profile_autocomplete)
+async def slash_tts_voice_user(interaction: discord.Interaction, user: discord.Member, voice: str) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    voice_name = validate_voice_profile(voice)
+    if not voice_name:
+        await interaction.response.send_message(
+            "Неизвестный профиль голоса. Используйте `/voicebot voices`.",
+            ephemeral=True,
+        )
+        return
+    guild = interaction.guild
+    assert guild is not None
+    bot.config_store.set_user_voice(guild.id, user.id, voice_name)
+    await interaction.response.send_message(f"Для {user.mention} назначено: `{voice_name}`.", ephemeral=True)
+
+
+@tts_group.command(name="voice-clear", description="Сбросить персональную озвучку пользователя")
+@app_commands.describe(user="Пользователь")
+async def slash_tts_voice_clear(interaction: discord.Interaction, user: discord.Member) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    guild = interaction.guild
+    assert guild is not None
+    bot.config_store.clear_user_voice(guild.id, user.id)
+    await interaction.response.send_message(f"Персональная озвучка сброшена: {user.mention}", ephemeral=True)
+
+
+@tts_group.command(name="voices", description="Показать доступные озвучки")
+async def slash_tts_voices(interaction: discord.Interaction) -> None:
+    lines = [
+        f"`{name}` - {profile.label}"
+        for name, profile in sorted(VOICE_PROFILES.items())
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @tts_group.command(name="status", description="Показать состояние TTS на сервере")

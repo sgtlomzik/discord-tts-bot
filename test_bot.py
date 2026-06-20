@@ -78,11 +78,24 @@ class TTSBotTests(unittest.TestCase):
             bot = load_bot_module()
         self.assertEqual(bot.TTS_MERGE_ALGORITHM, "legacy")
 
-    def test_runtime_is_piper_ruslan_only(self):
+    def test_runtime_has_ruslan_and_irina_piper_voices(self):
         bot = load_bot_module()
 
         self.assertEqual(bot.DEFAULT_VOICE_PROFILE, "piper-ruslan")
-        self.assertEqual(list(bot.VOICE_PROFILES), ["piper-ruslan"])
+        self.assertEqual(
+            list(bot.VOICE_PROFILES),
+            ["piper-ruslan", "piper-irina"],
+        )
+        for voice_name in ("ruslan", "irina"):
+            profile = bot.VOICE_PROFILES[f"piper-{voice_name}"]
+            self.assertEqual(
+                profile.piper_model_path,
+                f"/app/models/ru_RU-{voice_name}-medium.onnx",
+            )
+            self.assertEqual(
+                profile.piper_config_path,
+                f"/app/models/ru_RU-{voice_name}-medium.onnx.json",
+            )
         self.assertFalse(hasattr(bot, "RHVOICE_URL"))
         self.assertFalse(hasattr(bot, "ESPEAK_CMD"))
 
@@ -172,6 +185,12 @@ class TTSBotTests(unittest.TestCase):
         bot = load_bot_module()
 
         self.assertEqual(bot.tts_group.name, "voicebot")
+
+    def test_slash_group_exposes_voice_management_commands(self):
+        bot = load_bot_module()
+
+        command_names = {command.name for command in bot.tts_group.commands}
+        self.assertTrue({"voice-set", "voice-user", "voice-clear", "voices"} <= command_names)
 
     def test_config_store_removes_user_voice_when_user_denied(self):
         bot = load_bot_module()
@@ -491,6 +510,39 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         await tts_bot.auto_connect_for_member(member, channel)
 
         tts_bot.ensure_voice.assert_not_awaited()
+
+    async def test_voice_state_schedules_idle_disconnect_when_continuous_stream_is_idle(self):
+        bot_mod = load_bot_module()
+
+        class FakeVoiceChannel:
+            def __init__(self, members=None):
+                self.members = members or []
+
+        guild = types.SimpleNamespace(id=123)
+        member = types.SimpleNamespace(id=441612025286885397, bot=False, guild=guild)
+        vc = types.SimpleNamespace(
+            channel=FakeVoiceChannel(members=[]),
+            is_connected=MagicMock(return_value=True),
+            is_playing=MagicMock(return_value=True),
+            is_paused=MagicMock(return_value=False),
+        )
+        bot_mod.bot.config_store = temp_config_store(bot_mod, {member.id})
+        bot_mod.bot.continuous_sources[guild.id] = bot_mod.ContinuousTTSAudioSource(
+            b"\x00" * bot_mod.PCM_FRAME_BYTES
+        )
+        bot_mod.bot.schedule_idle_disconnect = MagicMock()
+
+        with (
+            patch.object(bot_mod.discord, "VoiceChannel", FakeVoiceChannel),
+            patch.object(bot_mod.discord.utils, "get", MagicMock(return_value=vc)),
+        ):
+            await bot_mod.on_voice_state_update(
+                member,
+                types.SimpleNamespace(channel=FakeVoiceChannel(members=[member])),
+                types.SimpleNamespace(channel=None),
+            )
+
+        bot_mod.bot.schedule_idle_disconnect.assert_called_once_with(guild)
 
     async def test_ensure_voice_lock_is_reused_per_guild(self):
         bot_mod = load_bot_module()
@@ -875,6 +927,31 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         vc.disconnect.assert_awaited_once_with(force=True)
         self.assertGreater(tts_bot.suppress_auto_connect_remaining(guild.id), 0.0)
+
+    async def test_idle_disconnect_runs_when_only_continuous_idle_stream_is_playing(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        guild = types.SimpleNamespace(id=123)
+        source = bot_mod.ContinuousTTSAudioSource(b"\x00" * bot_mod.PCM_FRAME_BYTES)
+        vc = types.SimpleNamespace(
+            is_connected=MagicMock(return_value=True),
+            is_playing=MagicMock(return_value=True),
+            is_paused=MagicMock(return_value=False),
+            disconnect=AsyncMock(),
+            stop=MagicMock(),
+        )
+        tts_bot.continuous_sources[guild.id] = source
+
+        with (
+            patch.object(bot_mod.asyncio, "sleep", AsyncMock()),
+            patch.object(bot_mod.discord.utils, "get", MagicMock(return_value=vc)),
+        ):
+            await tts_bot._idle_disconnect_after_timeout(guild)
+
+        self.assertTrue(source.stopped)
+        self.assertNotIn(guild.id, tts_bot.continuous_sources)
+        vc.stop.assert_called_once()
+        vc.disconnect.assert_awaited_once_with(force=True)
 
     async def test_prepare_playback_file_raises_on_ffmpeg_error(self):
         bot_mod = load_bot_module()

@@ -1,11 +1,11 @@
 # TTS Bot Current State
 
-Updated: 2026-04-26
+Updated: 2026-06-09
 
 ## Summary
 
 This repository contains the Discord TTS bot running as Docker container `discord_tts_bot`.
-The current runtime is intentionally simple: local Piper TTS with the `piper-ruslan` voice only.
+The current runtime uses local Piper TTS with two Russian voice profiles.
 RHVoice, eSpeak, Lavalink integration, and other extra voice paths are not part of the active bot.
 
 ## Current Runtime
@@ -23,10 +23,13 @@ Current model files expected on the server:
 
 - `models/ru_RU-ruslan-medium.onnx`
 - `models/ru_RU-ruslan-medium.onnx.json`
+- `models/ru_RU-irina-medium.onnx`
+- `models/ru_RU-irina-medium.onnx.json`
 
 ## Voice And Audio Decisions
 
-- Active voice profile: `piper-ruslan`
+- Default voice profile: `piper-ruslan`
+- Available profiles: `piper-ruslan`, `piper-irina`
 - Default engine: Piper ONNX
 - `PIPER_LENGTH_SCALE` is configured from `.env`; current logs showed `0.90`.
 - Preroll mode: silence, not audible hiss.
@@ -46,6 +49,10 @@ Important commands:
 
 - `/voicebot on` and `/voicebot off`: enable or disable TTS for the server.
 - `/voicebot allow` and `/voicebot deny`: manage users whose messages are voiced.
+- `/voicebot voices`: list available voice profiles.
+- `/voicebot voice-set`: change the server default voice.
+- `/voicebot voice-user`: assign a voice to one user.
+- `/voicebot voice-clear`: clear a user's voice override.
 - `/voicebot status`: show bot state.
 - `/voicebot queue-clear`: clear queued TTS jobs.
 - `/voicebot test`: play a test phrase.
