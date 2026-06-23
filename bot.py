@@ -772,8 +772,17 @@ class TTSBot(commands.Bot):
         # and 6 respectively.
         cache_cfg = load_cache_config_from_env()
         self.tts_cache = TTSPhraseCache(cache_cfg) if cache_cfg.enabled else None
+        # Wrap generate_piper_file so the dispatcher's piper callback
+        # signature (str | None profile name) matches what
+        # generate_piper_file expects (VoiceProfile object).
+        async def _piper_synthesize(text: str, filename: Path, voice_profile: str | None) -> None:
+            profile = VOICE_PROFILES.get(
+                voice_profile or DEFAULT_VOICE_PROFILE,
+                VOICE_PROFILES[DEFAULT_VOICE_PROFILE],
+            )
+            await self.generate_piper_file(text, filename, profile)
         self.tts_dispatcher = TTSDispatcher(
-            local=LocalProvider(self.generate_piper_file),
+            local=LocalProvider(_piper_synthesize),
             cloud=self._build_cloud_provider(),
             config=load_dispatcher_config_from_env(),
             circuit_breaker=load_circuit_breaker_from_env(),
