@@ -27,9 +27,11 @@ except Exception:  # pragma: no cover - optional dependency
 
 from tts_providers import (
     LocalProvider,
+    MiniMaxProvider,
     TTSDispatcher,
     load_circuit_breaker_from_env,
     load_dispatcher_config_from_env,
+    load_minimax_config_from_env,
 )
 
 
@@ -719,6 +721,7 @@ class TTSBot(commands.Bot):
         # and 6 respectively.
         self.tts_dispatcher = TTSDispatcher(
             local=LocalProvider(self.generate_piper_file),
+            cloud=self._build_cloud_provider(),
             config=load_dispatcher_config_from_env(),
             circuit_breaker=load_circuit_breaker_from_env(),
         )
@@ -750,6 +753,15 @@ class TTSBot(commands.Bot):
                 state.timer_task.cancel()
         for source in self.continuous_sources.values():
             source.stop()
+
+        # Gracefully close the cloud provider's HTTP keep-alive pool.
+        # Local Piper has no async resources to release.
+        cloud = getattr(self.tts_dispatcher, "cloud", None)
+        if cloud is not None and hasattr(cloud, "aclose"):
+            try:
+                await cloud.aclose()
+            except Exception:
+                log.exception("Failed to close cloud TTS provider cleanly")
 
         await super().close()
 
@@ -1032,6 +1044,28 @@ class TTSBot(commands.Bot):
                     filename.unlink()
                 except OSError:
                     log.exception("Failed to remove warmup file: %s", filename)
+
+    def _build_cloud_provider(self):
+        """Construct the MiniMax provider if the bot has credentials.
+
+        Returns ``None`` when MINIMAX_API_KEY or MINIMAX_VOICE_ID is
+        missing — the dispatcher then silently uses the local provider
+        regardless of TTS_PRIMARY_PROVIDER, and the bot starts cleanly.
+        """
+        cfg = load_minimax_config_from_env()
+        if not cfg.api_key or not cfg.voice_id:
+            log.info(
+                "MiniMax provider disabled (api_key=%s, voice_id=%s); "
+                "fall back to local",
+                "set" if cfg.api_key else "MISSING",
+                "set" if cfg.voice_id else "MISSING",
+            )
+            return None
+        log.info(
+            "MiniMax provider enabled model=%s voice_id=%s base_url=%s timeout=%.1fs",
+            cfg.model, cfg.voice_id, cfg.base_url, cfg.timeout_seconds,
+        )
+        return MiniMaxProvider(cfg)
 
     async def enqueue_tts(
         self,

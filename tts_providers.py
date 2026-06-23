@@ -32,7 +32,10 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Awaitable, Callable, Optional, Protocol
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional, Protocol
+
+if TYPE_CHECKING:  # pragma: no cover
+    import httpx
 
 log = logging.getLogger("tts_bot.providers")
 
@@ -177,6 +180,228 @@ class DispatcherConfig:
     request_timeout_seconds: float = 2.5
 
 
+# ---------------------------------------------------------------------------
+# MiniMax provider (added in commit 3)
+# ---------------------------------------------------------------------------
+
+
+class MiniMaxError(Exception):
+    """Base class for MiniMax failures that should trigger fallback.
+
+    Subclasses let the bot log a precise reason without parsing strings.
+    """
+
+
+class MiniMaxAuthError(MiniMaxError):
+    """Invalid API key / Group ID. Also covers missing config."""
+
+
+class MiniMaxQuotaError(MiniMaxError):
+    """HTTP 429 (rate-limited) or explicit quota status_code."""
+
+
+class MiniMaxTimeoutError(MiniMaxError):
+    """Request exceeded TTS_REQUEST_TIMEOUT."""
+
+
+@dataclass
+class MiniMaxConfig:
+    api_key: str = ""
+    group_id: str = ""
+    voice_id: str = ""
+    model: str = "speech-2.8-turbo"
+    base_url: str = "https://api.minimax.io"
+    language_boost: str = "Russian"
+    timeout_seconds: float = 2.5
+    sample_rate: int = 32000
+    bitrate: int = 128000
+
+
+def load_minimax_config_from_env() -> MiniMaxConfig:
+    """Build a ``MiniMaxConfig`` from the standard ``MINIMAX_*`` env vars.
+
+    Missing keys collapse to empty strings; the provider raises
+    ``MiniMaxAuthError`` at call time if it is invoked without an API
+    key or voice_id. This keeps the bot bootable even when only Piper
+    is configured.
+    """
+    base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io").strip()
+    if not base_url:
+        base_url = "https://api.minimax.io"
+    model = os.getenv("MINIMAX_MODEL", "speech-2.8-turbo").strip()
+    if not model:
+        model = "speech-2.8-turbo"
+    lang = os.getenv("MINIMAX_LANGUAGE_BOOST", "Russian").strip()
+    if not lang:
+        lang = "Russian"
+    return MiniMaxConfig(
+        api_key=os.getenv("MINIMAX_API_KEY", "").strip(),
+        group_id=os.getenv("MINIMAX_GROUP_ID", "").strip(),
+        voice_id=os.getenv("MINIMAX_VOICE_ID", "").strip(),
+        model=model,
+        base_url=base_url,
+        language_boost=lang,
+        timeout_seconds=float(os.getenv("TTS_REQUEST_TIMEOUT", "2.5")),
+        sample_rate=int(os.getenv("MINIMAX_SAMPLE_RATE", "32000")),
+        bitrate=int(os.getenv("MINIMAX_BITRATE", "128000")),
+    )
+
+
+def _is_valid_configured(cfg: MiniMaxConfig) -> bool:
+    return bool(cfg.api_key) and bool(cfg.voice_id)
+
+
+class MiniMaxProvider:
+    """Calls MiniMax ``POST /v1/t2a_v2`` and writes MP3 to ``filename``.
+
+    Per the rollout plan §11.1 (corrections feedback), this provider
+    holds ONE long-lived ``httpx.AsyncClient`` with keep-alive so the
+    TLS handshake is paid once per process lifetime, not once per
+    message. This trims ~0.3s off every request after the first.
+    """
+
+    name = "minimax"
+
+    def __init__(
+        self,
+        config: MiniMaxConfig,
+        *,
+        http_client: Optional["httpx.AsyncClient"] = None,
+    ) -> None:
+        # Imported lazily so the rest of the provider layer remains
+        # usable on systems where httpx is missing (e.g. local CI runs
+        # that only exercise the local provider).
+        import httpx
+
+        self._config = config
+        self._owns_client = http_client is None
+        # Keep-alive pool sized for the bot's modest concurrency
+        # (one or two in-flight requests). The bot's queue is much
+        # larger but each request is short, so 4 keep-alives is plenty.
+        self._client = http_client or httpx.AsyncClient(
+            timeout=httpx.Timeout(config.timeout_seconds),
+            limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
+        )
+
+    async def aclose(self) -> None:
+        """Gracefully close the underlying HTTP client.
+
+        Call from the bot's ``close()`` hook. No-op when the client was
+        injected (tests typically pass their own).
+        """
+        if self._owns_client:
+            await self._client.aclose()
+
+    def _build_url(self) -> str:
+        base = self._config.base_url.rstrip("/")
+        url = f"{base}/v1/t2a_v2"
+        # Per MiniMax docs: if the response indicates an invalid api
+        # key, retry with ?GroupId=<id>. We always add it when set so
+        # the auth state matches what the user copied from the console.
+        if self._config.group_id:
+            url = f"{url}?GroupId={self._config.group_id}"
+        return url
+
+    def _build_body(self, text: str) -> dict:
+        cfg = self._config
+        return {
+            "model": cfg.model,
+            "text": text,
+            "stream": False,
+            "language_boost": cfg.language_boost,
+            "output_format": "hex",
+            "voice_setting": {
+                "voice_id": cfg.voice_id,
+                "speed": 1,
+                "vol": 1,
+                "pitch": 0,
+            },
+            "audio_setting": {
+                "sample_rate": cfg.sample_rate,
+                "bitrate": cfg.bitrate,
+                "format": "mp3",
+                "channel": 1,
+            },
+        }
+
+    async def synthesize(self, text: str, filename: Path) -> None:
+        cfg = self._config
+        if not cfg.api_key:
+            raise MiniMaxAuthError("MINIMAX_API_KEY is not set")
+        if not cfg.voice_id:
+            raise MiniMaxAuthError("MINIMAX_VOICE_ID is not set")
+
+        import httpx  # lazy import, see __init__ for rationale
+
+        url = self._build_url()
+        headers = {
+            "Authorization": f"Bearer {cfg.api_key}",
+            "Content-Type": "application/json",
+        }
+        body = self._build_body(text)
+
+        log.debug("MiniMax POST %s text=%d chars", url, len(text))
+
+        try:
+            response = await self._client.post(url, headers=headers, json=body)
+        except httpx.TimeoutException as exc:
+            raise MiniMaxTimeoutError(
+                f"MiniMax request timed out after {cfg.timeout_seconds}s"
+            ) from exc
+        except httpx.HTTPError as exc:
+            # Network failures, connection resets, DNS errors, etc.
+            raise MiniMaxError(f"MiniMax network error: {exc}") from exc
+
+        if response.status_code == 429:
+            raise MiniMaxQuotaError("MiniMax rate-limited (HTTP 429)")
+
+        if response.status_code >= 400:
+            excerpt = response.text[:200] if response.text else ""
+            raise MiniMaxError(
+                f"MiniMax HTTP {response.status_code}: {excerpt}"
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise MiniMaxError(
+                f"MiniMax returned non-JSON body: {response.text[:200]}"
+            ) from exc
+
+        base_resp = payload.get("base_resp") or {}
+        status_code = int(base_resp.get("status_code", -1))
+        status_msg = base_resp.get("status_msg", "") or ""
+        if status_code != 0:
+            # 'invalid api key' is the canonical case for adding
+            # GroupId per MiniMax docs. Distinct exception type so the
+            # bot logs a clear "auth" reason, not a generic failure.
+            if "invalid api key" in status_msg.lower() or status_code in (1002, 1004):
+                raise MiniMaxAuthError(
+                    f"MiniMax auth failed (status_code={status_code}): {status_msg}"
+                )
+            raise MiniMaxError(
+                f"MiniMax status_code={status_code}: {status_msg}"
+            )
+
+        data = payload.get("data") or {}
+        audio_hex = data.get("audio")
+        if not audio_hex:
+            raise MiniMaxError("MiniMax response missing data.audio")
+
+        try:
+            audio_bytes = bytes.fromhex(audio_hex)
+        except ValueError as exc:
+            raise MiniMaxError(
+                f"MiniMax audio field is not valid hex: {exc}"
+            ) from exc
+
+        filename.write_bytes(audio_bytes)
+        log.debug(
+            "MiniMaxProvider synthesized text=%d chars audio=%d bytes file=%s",
+            len(text), len(audio_bytes), filename,
+        )
+
+
 def load_dispatcher_config_from_env() -> DispatcherConfig:
     """Build a ``DispatcherConfig`` from the standard ``TTS_*`` env vars.
 
@@ -203,11 +428,19 @@ def load_dispatcher_config_from_env() -> DispatcherConfig:
 class TTSDispatcher:
     """Facade that the bot calls to obtain synthesized audio.
 
-    Behavior in this commit: it always delegates to the configured
-    ``LocalProvider`` regardless of the ``primary`` flag. The full
-    primary/fallback/CB logic lands in commits 3 and 6 of the rollout
-    plan; introducing the indirection now means those later commits
-    touch only this file and its tests, never ``bot.py``.
+    Routing logic (post commit 3):
+
+    * ``primary=local`` → always local.
+    * ``primary=minimax`` and cloud is configured:
+      - if circuit breaker is OPEN → local (no API call attempted).
+      - try cloud. On success: ``cb.record_success()``; return cloud.
+      - on any error: ``cb.record_failure()``; fall back to local.
+    * cloud not configured (missing key/voice_id) → local.
+
+    The circuit breaker behavior is still the skeleton (always allows
+    requests) until commit 6 wires the cooldown timer. The dispatcher
+    structure, however, already consults ``allow_request()`` so commit 6
+    is a one-line change in this file.
     """
 
     def __init__(
@@ -218,7 +451,7 @@ class TTSDispatcher:
         config: Optional[DispatcherConfig] = None,
     ) -> None:
         self._local = local
-        self._cloud = cloud  # may be None until commit 3
+        self._cloud = cloud  # None when MiniMax is not configured
         self._cb = circuit_breaker or CircuitBreaker()
         self._config = config or DispatcherConfig()
 
@@ -230,20 +463,34 @@ class TTSDispatcher:
     def circuit_breaker(self) -> CircuitBreaker:
         return self._cb
 
-    async def synthesize(self, text: str, filename: Path) -> str:
-        """Produce audio at ``filename`` and return the provider used.
+    @property
+    def cloud(self) -> Optional[TTSProvider]:
+        return self._cloud
 
-        Skeleton behavior: always delegates to the local provider. Later
-        commits will route through the cloud provider when configured
-        and fall back on failure.
-        """
-        # Future: consult self._cb.allow_request(); if False → fallback.
-        # Future: if self._config.primary is PrimaryProvider.MINIMAX and
-        #         self._cloud is not None → try cloud, on exception call
-        #         self._cb.record_failure() and fall back to local.
-        provider_used = self._local.name
+    async def synthesize(self, text: str, filename: Path) -> str:
+        """Produce audio at ``filename`` and return the provider used."""
+        if (
+            self._config.primary is PrimaryProvider.MINIMAX
+            and self._cloud is not None
+        ):
+            if self._cb.allow_request():
+                try:
+                    await self._cloud.synthesize(text, filename)
+                    self._cb.record_success()
+                    return self._cloud.name
+                except Exception as exc:
+                    log.warning(
+                        "TTS provider %s failed (%s: %s); falling back to %s",
+                        self._cloud.name, type(exc).__name__, exc, self._local.name,
+                    )
+                    self._cb.record_failure()
+            else:
+                log.debug(
+                    "Circuit breaker open; skipping %s, using %s",
+                    self._cloud.name, self._local.name,
+                )
         await self._local.synthesize(text, filename)
-        return provider_used
+        return self._local.name
 
     async def warm_local(self, text: str, filename: Path) -> None:
         """Pre-load the local provider's resources (e.g. Piper ONNX model).

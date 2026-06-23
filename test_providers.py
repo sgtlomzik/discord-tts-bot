@@ -72,35 +72,106 @@ class LocalProviderTests(unittest.TestCase):
 
 
 class DispatcherSkeletonTests(unittest.TestCase):
-    """Skeleton behavior: dispatcher always delegates to local, regardless
-    of primary flag. Full primary/fallback wiring arrives in commit 3."""
+    """Tests for the dispatcher routing logic (post commit 3).
 
-    def test_dispatcher_routes_through_local_even_if_primary_is_minimax(self):
+    These tests use a fake cloud provider so they can exercise success,
+    failure, and fallback paths without any network.
+    """
+
+    def _make_dispatcher(self, *, primary, cloud=None, cb=None, local_writes=b"LOCAL"):
         async def fake_piper(text, filename, voice_profile):
-            filename.write_bytes(b"X")
+            filename.write_bytes(local_writes)
 
         local = LocalProvider(fake_piper)
-        cb = CircuitBreaker()
-        cfg = DispatcherConfig(primary=PrimaryProvider.MINIMAX, request_timeout_seconds=2.5)
-        d = TTSDispatcher(local=local, circuit_breaker=cb, config=cfg, cloud=None)
+        return TTSDispatcher(
+            local=local,
+            cloud=cloud,
+            circuit_breaker=cb or CircuitBreaker(),
+            config=DispatcherConfig(primary=primary),
+        )
 
-        target = Path("/tmp/dispatcher_test.bin")
+    def test_primary_local_routes_through_local_even_if_cloud_present(self):
+        async def fake_cloud(text, filename):
+            filename.write_bytes(b"CLOUD")
+
+        cloud = FakeProvider("cloud", fake_cloud)
+        d = self._make_dispatcher(
+            primary=PrimaryProvider.LOCAL, cloud=cloud,
+        )
+        target = Path("/tmp/disp_local.bin")
         try:
-            used = run(d.synthesize("hello", target))
+            used = run(d.synthesize("hi", target))
             self.assertEqual(used, "local")
-            self.assertTrue(target.exists())
+            self.assertEqual(target.read_bytes(), b"LOCAL")
+        finally:
+            if target.exists():
+                target.unlink()
+
+    def test_primary_minimax_with_cloud_uses_cloud_on_success(self):
+        async def fake_cloud(text, filename):
+            filename.write_bytes(b"CLOUD")
+
+        cloud = FakeProvider("cloud", fake_cloud)
+        d = self._make_dispatcher(
+            primary=PrimaryProvider.MINIMAX, cloud=cloud,
+        )
+        target = Path("/tmp/disp_cloud_ok.bin")
+        try:
+            used = run(d.synthesize("hi", target))
+            self.assertEqual(used, "cloud")
+            self.assertEqual(target.read_bytes(), b"CLOUD")
+        finally:
+            if target.exists():
+                target.unlink()
+
+    def test_primary_minimax_falls_back_to_local_when_cloud_fails(self):
+        async def fake_cloud(text, filename):
+            raise RuntimeError("cloud is down")
+
+        cloud = FakeProvider("cloud", fake_cloud)
+        d = self._make_dispatcher(
+            primary=PrimaryProvider.MINIMAX, cloud=cloud,
+        )
+        target = Path("/tmp/disp_fallback.bin")
+        try:
+            used = run(d.synthesize("hi", target))
+            self.assertEqual(used, "local")
+            self.assertEqual(target.read_bytes(), b"LOCAL")
+        finally:
+            if target.exists():
+                target.unlink()
+
+    def test_primary_minimax_records_circuit_breaker_failure_on_cloud_error(self):
+        async def fake_cloud(text, filename):
+            raise RuntimeError("boom")
+
+        cloud = FakeProvider("cloud", fake_cloud)
+        cb = CircuitBreaker()
+        d = self._make_dispatcher(
+            primary=PrimaryProvider.MINIMAX, cloud=cloud, cb=cb,
+        )
+        run(d.synthesize("hi", Path("/tmp/cb1.bin")))
+        self.assertEqual(cb.consecutive_failures, 1)
+        self.assertEqual(cb.state, CircuitState.CLOSED)
+
+    def test_primary_minimax_uses_local_when_cloud_is_none(self):
+        d = self._make_dispatcher(primary=PrimaryProvider.MINIMAX, cloud=None)
+        target = Path("/tmp/disp_no_cloud.bin")
+        try:
+            used = run(d.synthesize("hi", target))
+            self.assertEqual(used, "local")
         finally:
             if target.exists():
                 target.unlink()
 
     def test_warm_local_uses_local_provider_regardless_of_primary(self):
-        async def fake_piper(text, filename, voice_profile):
-            filename.write_bytes(b"Y")
+        async def fake_cloud(text, filename):
+            raise AssertionError("warmup must not call cloud")
 
-        local = LocalProvider(fake_piper)
-        cfg = DispatcherConfig(primary=PrimaryProvider.MINIMAX)
-        d = TTSDispatcher(local=local, config=cfg)
-
+        cloud = FakeProvider("cloud", fake_cloud)
+        d = self._make_dispatcher(
+            primary=PrimaryProvider.MINIMAX, cloud=cloud,
+        )
         target = Path("/tmp/warm_test.bin")
         try:
             run(d.warm_local("Привет", target))
@@ -111,9 +182,7 @@ class DispatcherSkeletonTests(unittest.TestCase):
 
     def test_warm_local_does_not_touch_circuit_breaker(self):
         """Critical invariant: warmup must never increment CB failure
-        counters even if the underlying provider were to fail. We
-        exercise this by giving the dispatcher a closed CB and a
-        provider that raises, then checking CB state is unchanged."""
+        counters even if the underlying provider were to fail."""
 
         async def fake_piper(text, filename, voice_profile):
             raise RuntimeError("simulated cold-start failure")
@@ -128,6 +197,22 @@ class DispatcherSkeletonTests(unittest.TestCase):
         # CB must remain untouched even though the provider raised.
         self.assertEqual(cb.state, CircuitState.CLOSED)
         self.assertEqual(cb.consecutive_failures, 0)
+
+
+class FakeProvider:
+    """Minimal stand-in for MiniMaxProvider used in dispatcher tests.
+
+    Mirrors the TTSProvider protocol exactly. Defined here (not in
+    tts_providers) so the production module stays free of test-only
+    helpers.
+    """
+
+    def __init__(self, name, synth_fn):
+        self.name = name
+        self._synth = synth_fn
+
+    async def synthesize(self, text, filename):
+        await self._synth(text, filename)
 
 
 class CircuitBreakerSkeletonTests(unittest.TestCase):
