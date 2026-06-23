@@ -26,9 +26,12 @@ provider can safely emit WAV or MP3 as long as it is a valid container.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import shutil
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -270,6 +273,110 @@ class MiniMaxConfig:
     bitrate: int = 128000
 
 
+# ---------------------------------------------------------------------------
+# Optional LRU cache for frequently-spoken phrases (commit 7)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TTSCacheConfig:
+    enabled: bool = False
+    max_entries: int = 128
+    cache_dir: Path = Path("/dev/shm/tts_cache")
+
+
+def load_cache_config_from_env() -> TTSCacheConfig:
+    enabled_raw = os.getenv("TTS_CACHE_ENABLED", "0").strip().lower()
+    enabled = enabled_raw in ("1", "true", "yes", "on")
+    max_entries = int(os.getenv("TTS_CACHE_MAX_ENTRIES", "128"))
+    cache_dir_raw = os.getenv("TTS_CACHE_DIR", "/dev/shm/tts_cache").strip()
+    cache_dir = Path(cache_dir_raw) if cache_dir_raw else Path("/dev/shm/tts_cache")
+    return TTSCacheConfig(
+        enabled=enabled,
+        max_entries=max(0, max_entries),
+        cache_dir=cache_dir,
+    )
+
+
+class TTSPhraseCache:
+    """In-memory LRU over sha256(text) -> cached audio file path.
+
+    Skips API/Piper for repeated short phrases ("бб", "пака", "давайте",
+    "gg" and similar). Cache files live in ``TTS_CACHE_DIR`` (default
+    ``/dev/shm/tts_cache``); on a normal bot restart the cache is wiped
+    which is fine because the next message rehydrates the hot entries.
+    """
+
+    def __init__(self, config: TTSCacheConfig) -> None:
+        self._config = config
+        self._entries: "OrderedDict[str, Path]" = OrderedDict()
+        # Note: cache_dir is created lazily on the first store() call
+        # so that operators can point TTS_CACHE_DIR at a path that
+        # does not yet exist.
+
+    @property
+    def config(self) -> TTSCacheConfig:
+        return self._config
+
+    @property
+    def size(self) -> int:
+        return len(self._entries)
+
+    @staticmethod
+    def hash_text(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def lookup(self, text: str) -> Optional[Path]:
+        """Return the cached audio path for ``text``, or None on miss."""
+        if not self._config.enabled:
+            return None
+        key = self.hash_text(text)
+        cached = self._entries.get(key)
+        if cached is None:
+            return None
+        if not cached.exists():
+            # Cache file vanished (manual cleanup, /dev/shm full).
+            self._entries.pop(key, None)
+            return None
+        # LRU touch: move to the back.
+        self._entries.move_to_end(key)
+        return cached
+
+    def store(self, text: str, source_path: Path) -> Path:
+        """Copy ``source_path`` into the cache and return the cache path."""
+        if not self._config.enabled:
+            return source_path
+        if not source_path.exists():
+            raise FileNotFoundError(source_path)
+        key = self.hash_text(text)
+        target = self._config.cache_dir / f"{key}.mp3"
+        # Lazily create the cache directory on first store.
+        self._config.cache_dir.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            # Already cached from a previous call — just touch the LRU.
+            self._entries[key] = target
+            self._entries.move_to_end(key)
+            return target
+        shutil.copyfile(source_path, target)
+        self._entries[key] = target
+        self._entries.move_to_end(key)
+        # Evict oldest entries past max_entries.
+        while len(self._entries) > self._config.max_entries:
+            evicted_key, evicted_path = self._entries.popitem(last=False)
+            try:
+                evicted_path.unlink()
+            except OSError:
+                log.warning(
+                    "TTS cache: failed to evict %s", evicted_path, exc_info=True,
+                )
+        return target
+
+
+# ---------------------------------------------------------------------------
+# MiniMax provider (added in commit 3)
+# ---------------------------------------------------------------------------
+
+
 def load_minimax_config_from_env() -> MiniMaxConfig:
     """Build a ``MiniMaxConfig`` from the standard ``MINIMAX_*`` env vars.
 
@@ -490,10 +597,10 @@ class TTSDispatcher:
       - on any error: ``cb.record_failure()``; fall back to local.
     * cloud not configured (missing key/voice_id) → local.
 
-    The circuit breaker behavior is still the skeleton (always allows
-    requests) until commit 6 wires the cooldown timer. The dispatcher
-    structure, however, already consults ``allow_request()`` so commit 6
-    is a one-line change in this file.
+    Cache (post commit 7): if enabled, the dispatcher checks the cache
+    BEFORE invoking any provider and short-circuits to a copy on hit.
+    Cache misses go through the normal provider chain, then the
+    resulting audio is stored in the cache for next time.
     """
 
     def __init__(
@@ -502,11 +609,13 @@ class TTSDispatcher:
         cloud: Optional[TTSProvider] = None,
         circuit_breaker: Optional[CircuitBreaker] = None,
         config: Optional[DispatcherConfig] = None,
+        cache: Optional[TTSPhraseCache] = None,
     ) -> None:
         self._local = local
         self._cloud = cloud  # None when MiniMax is not configured
         self._cb = circuit_breaker or CircuitBreaker()
         self._config = config or DispatcherConfig()
+        self._cache = cache  # None means caching disabled
 
     @property
     def config(self) -> DispatcherConfig:
@@ -520,8 +629,21 @@ class TTSDispatcher:
     def cloud(self) -> Optional[TTSProvider]:
         return self._cloud
 
+    @property
+    def cache(self) -> Optional[TTSPhraseCache]:
+        return self._cache
+
     async def synthesize(self, text: str, filename: Path) -> str:
         """Produce audio at ``filename`` and return the provider used."""
+        # 1. Cache hit short-circuits everything.
+        if self._cache is not None:
+            cached = self._cache.lookup(text)
+            if cached is not None:
+                shutil.copyfile(cached, filename)
+                log.debug("TTS cache HIT text=%d chars", len(text))
+                return "cache"
+
+        # 2. Try the primary chain.
         if (
             self._config.primary is PrimaryProvider.MINIMAX
             and self._cloud is not None
@@ -530,6 +652,7 @@ class TTSDispatcher:
                 try:
                     await self._cloud.synthesize(text, filename)
                     self._cb.record_success()
+                    self._maybe_cache(text, filename)
                     return self._cloud.name
                 except Exception as exc:
                     log.warning(
@@ -543,7 +666,21 @@ class TTSDispatcher:
                     self._cloud.name, self._local.name,
                 )
         await self._local.synthesize(text, filename)
+        # Cache regardless of provider: when TTS_CACHE_ENABLED=1 the
+        # operator has opted in, and a cache hit on a repeated short
+        # phrase is a win whether the underlying provider is Piper
+        # or MiniMax (the local file copy is faster than even Piper).
+        self._maybe_cache(text, filename)
         return self._local.name
+
+    def _maybe_cache(self, text: str, filename: Path) -> None:
+        if self._cache is None:
+            return
+        try:
+            self._cache.store(text, filename)
+        except OSError as exc:
+            # /dev/shm full or read-only mount — log and continue.
+            log.warning("TTS cache store failed: %s", exc)
 
     async def warm_local(self, text: str, filename: Path) -> None:
         """Pre-load the local provider's resources (e.g. Piper ONNX model).

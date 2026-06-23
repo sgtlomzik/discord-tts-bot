@@ -29,6 +29,8 @@ from tts_providers import (
     LocalProvider,
     MiniMaxProvider,
     TTSDispatcher,
+    TTSPhraseCache,
+    load_cache_config_from_env,
     load_circuit_breaker_from_env,
     load_dispatcher_config_from_env,
     load_minimax_config_from_env,
@@ -768,11 +770,14 @@ class TTSBot(commands.Bot):
         # behavior in this commit: dispatcher always routes to local.
         # Cloud provider (MiniMax) and full CB logic land in commits 3+
         # and 6 respectively.
+        cache_cfg = load_cache_config_from_env()
+        self.tts_cache = TTSPhraseCache(cache_cfg) if cache_cfg.enabled else None
         self.tts_dispatcher = TTSDispatcher(
             local=LocalProvider(self.generate_piper_file),
             cloud=self._build_cloud_provider(),
             config=load_dispatcher_config_from_env(),
             circuit_breaker=load_circuit_breaker_from_env(),
+            cache=self.tts_cache,
         )
         self.continuous_sources: dict[int, ContinuousTTSAudioSource] = {}
         self.merge_buffers: dict[tuple[int, int], MergeBufferState] = {}
