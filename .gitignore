@@ -21,3 +21,10 @@ data/*.json
 
 .DS_Store
 Thumbs.db
+
+# Voice samples and clone previews are operator-local files (may
+# contain personal recordings); never commit them.
+scripts/voice_samples/*.mp3
+scripts/voice_samples/*.wav
+scripts/voice_samples/*.m4a
+scripts/voice_samples/_preview_*
