@@ -215,47 +215,148 @@ class FakeProvider:
         await self._synth(text, filename)
 
 
-class CircuitBreakerSkeletonTests(unittest.TestCase):
+class CircuitBreakerStateMachineTests(unittest.TestCase):
+    """Full state-machine tests for CircuitBreaker.
+
+    Uses an injected fake clock so cooldown elapses instantly in tests
+    without sleeping the real wall clock.
+    """
+
+    def _make(self, *, threshold=3, cooldown=60.0):
+        """Helper: build a CircuitBreaker with a fake clock at t=0."""
+        clock = {"now": 0.0}
+
+        def fake():
+            return clock["now"]
+
+        cb = CircuitBreaker(
+            CircuitBreakerConfig(failure_threshold=threshold, cooldown_seconds=cooldown),
+            clock=fake,
+        )
+        return cb, clock
+
     def test_default_state_is_closed(self):
-        cb = CircuitBreaker()
+        cb, _ = self._make()
         self.assertEqual(cb.state, CircuitState.CLOSED)
         self.assertEqual(cb.consecutive_failures, 0)
         self.assertTrue(cb.allow_request())
+        self.assertEqual(cb.cooldown_remaining, 0.0)
 
     def test_record_success_resets_failures(self):
-        cb = CircuitBreaker()
+        cb, _ = self._make()
         cb.record_failure()
         cb.record_failure()
         cb.record_success()
         self.assertEqual(cb.consecutive_failures, 0)
         self.assertEqual(cb.state, CircuitState.CLOSED)
 
-    def test_record_failure_below_threshold_keeps_closed(self):
-        cb = CircuitBreaker(CircuitBreakerConfig(failure_threshold=3, cooldown_seconds=60.0))
+    def test_below_threshold_keeps_closed_and_allows(self):
+        cb, _ = self._make(threshold=3)
         cb.record_failure()
         cb.record_failure()
         self.assertEqual(cb.state, CircuitState.CLOSED)
-
-    def test_record_failure_at_threshold_opens_breaker(self):
-        cb = CircuitBreaker(CircuitBreakerConfig(failure_threshold=3, cooldown_seconds=60.0))
-        cb.record_failure()
-        cb.record_failure()
-        cb.record_failure()
-        self.assertEqual(cb.state, CircuitState.OPEN)
-
-    # NOTE: HALF_OPEN transition is intentionally NOT exercised here —
-    # the full state machine (cooldown timer, single probe) lands in
-    # commit 6 of the rollout plan. The skeleton only tracks state.
-
-    def test_skeleton_allow_request_always_true(self):
-        """Documented invariant for commit 2: allow_request() is
-        a no-op until commit 6 wires the cooldown timer."""
-        cb = CircuitBreaker(CircuitBreakerConfig(failure_threshold=1, cooldown_seconds=60.0))
-        cb.record_failure()
-        self.assertEqual(cb.state, CircuitState.OPEN)
-        # Even in OPEN state, skeleton still allows requests. Commit 6
-        # changes this so OPEN short-circuits to fallback.
         self.assertTrue(cb.allow_request())
+
+    def test_at_threshold_opens_breaker_and_blocks(self):
+        cb, clock = self._make(threshold=3, cooldown=60.0)
+        cb.record_failure()
+        cb.record_failure()
+        cb.record_failure()
+        self.assertEqual(cb.state, CircuitState.OPEN)
+        # While cooldown is in the future, no requests allowed.
+        self.assertFalse(cb.allow_request())
+        self.assertAlmostEqual(cb.cooldown_remaining, 60.0, delta=0.001)
+
+    def test_after_cooldown_one_probe_allowed_then_blocked(self):
+        cb, clock = self._make(threshold=3, cooldown=60.0)
+        for _ in range(3):
+            cb.record_failure()
+        # Move the clock past cooldown.
+        clock["now"] = 60.5
+        # First caller gets the probe.
+        self.assertTrue(cb.allow_request())
+        self.assertEqual(cb.state, CircuitState.HALF_OPEN)
+        # Second caller in HALF_OPEN is blocked — only one probe at a time.
+        self.assertFalse(cb.allow_request())
+        # And subsequent ones too.
+        self.assertFalse(cb.allow_request())
+
+    def test_probe_success_closes_breaker(self):
+        cb, clock = self._make(threshold=3, cooldown=60.0)
+        for _ in range(3):
+            cb.record_failure()
+        clock["now"] = 60.5
+        self.assertTrue(cb.allow_request())
+        cb.record_success()
+        self.assertEqual(cb.state, CircuitState.CLOSED)
+        self.assertEqual(cb.consecutive_failures, 0)
+        # Fresh requests allowed again.
+        self.assertTrue(cb.allow_request())
+
+    def test_probe_failure_reopens_with_fresh_cooldown(self):
+        cb, clock = self._make(threshold=3, cooldown=60.0)
+        for _ in range(3):
+            cb.record_failure()
+        clock["now"] = 60.5
+        self.assertTrue(cb.allow_request())
+        cb.record_failure()
+        # Back to OPEN, with a fresh opened_at anchored to current clock.
+        self.assertEqual(cb.state, CircuitState.OPEN)
+        self.assertAlmostEqual(cb.cooldown_remaining, 60.0, delta=0.001)
+        # No probes again until another cooldown elapses.
+        self.assertFalse(cb.allow_request())
+
+    def test_dispatcher_skips_cloud_when_circuit_open(self):
+        """End-to-end: dispatcher honors CB in OPEN state without
+        calling the cloud provider."""
+        async def fake_cloud(text, filename):
+            raise AssertionError("cloud should not be called when CB is open")
+            filename.write_bytes(b"X")  # unreachable
+
+        cloud = FakeProvider("cloud", fake_cloud)
+        cb, clock = self._make(threshold=2, cooldown=60.0)
+        # Two failures trip the breaker.
+        local = LocalProvider(_write_bytes_provider(b"LOCAL"))
+        d = TTSDispatcher(
+            local=local, cloud=cloud, circuit_breaker=cb,
+            config=DispatcherConfig(primary=PrimaryProvider.MINIMAX),
+        )
+        async def expect_fallback():
+            # The cloud raises — CB records failure.
+            async def boom(text, filename):
+                raise RuntimeError("boom")
+            cloud._synth = boom
+            return await d.synthesize("hi", Path("/tmp/cb_disp1.bin"))
+        run(expect_fallback())
+        async def expect_fallback2():
+            return await d.synthesize("hi", Path("/tmp/cb_disp2.bin"))
+        run(expect_fallback2())
+        # Now CB should be OPEN.
+        self.assertEqual(cb.state, CircuitState.OPEN)
+        # The fake_cloud callable would raise AssertionError if called.
+        # Reset it to a sentinel so we can detect any future call.
+        called = {"count": 0}
+        async def tracking_cloud(text, filename):
+            called["count"] += 1
+            filename.write_bytes(b"CLOUD")
+        cloud._synth = tracking_cloud
+        # Third call: CB is OPEN, must go straight to local.
+        target = Path("/tmp/cb_disp3.bin")
+        try:
+            used = run(d.synthesize("hi", target))
+            self.assertEqual(used, "local")
+            self.assertEqual(called["count"], 0)
+        finally:
+            for p in ("/tmp/cb_disp1.bin", "/tmp/cb_disp2.bin", "/tmp/cb_disp3.bin"):
+                pp = Path(p)
+                if pp.exists():
+                    pp.unlink()
+
+
+def _write_bytes_provider(payload: bytes):
+    async def fake_piper(text, filename, voice_profile):
+        filename.write_bytes(payload)
+    return fake_piper
 
 
 class EnvConfigTests(unittest.TestCase):

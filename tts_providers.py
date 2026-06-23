@@ -112,17 +112,30 @@ class CircuitBreakerConfig:
 class CircuitBreaker:
     """Tracks consecutive failures of the cloud provider.
 
-    Skeleton implementation — state tracking is in place, but the
-    dispatcher does not yet consult ``allow_request``. The full
-    open/half-open state machine is wired in commit 6 of the rollout
-    plan.
+    State machine:
+    - CLOSED: normal operation, every call hits the cloud provider.
+    - OPEN: the provider has just produced ``failure_threshold``
+      consecutive failures. All requests short-circuit to fallback.
+    - HALF_OPEN: the cooldown (``cooldown_seconds``) since ``OPEN``
+      has elapsed. The very next request is allowed through as a
+      single probe; success returns the breaker to CLOSED, failure
+      flips it back to OPEN with a fresh cooldown.
     """
 
-    def __init__(self, config: Optional[CircuitBreakerConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[CircuitBreakerConfig] = None,
+        *,
+        clock: Optional[Callable[[], float]] = None,
+    ) -> None:
         self._config = config or CircuitBreakerConfig()
         self._state: CircuitState = CircuitState.CLOSED
         self._consecutive_failures: int = 0
         self._opened_at: Optional[float] = None
+        self._probe_outstanding: bool = False
+        # Clock injection point so tests can fast-forward through the
+        # cooldown without sleeping the real wall clock.
+        self._clock = clock or time.perf_counter
 
     @property
     def state(self) -> CircuitState:
@@ -132,24 +145,64 @@ class CircuitBreaker:
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
 
+    @property
+    def cooldown_remaining(self) -> float:
+        """Seconds remaining in the current cooldown, or 0.0 if not OPEN."""
+        if self._state is not CircuitState.OPEN or self._opened_at is None:
+            return 0.0
+        elapsed = self._clock() - self._opened_at
+        return max(0.0, self._config.cooldown_seconds - elapsed)
+
     def allow_request(self) -> bool:
         """Return True if a primary call should be attempted right now.
 
-        With the skeleton behavior this is always True; the real gating
-        logic arrives in commit 6.
+        - CLOSED: always True.
+        - OPEN: False until cooldown elapses; then transitions to
+          HALF_OPEN and returns True for exactly one probe.
+        - HALF_OPEN: True for the first caller (the probe), then
+          False for every subsequent caller until ``record_success``
+          or ``record_failure`` resolves the state. The one-shot
+          guarantee prevents two concurrent callers from both
+          slipping through during the probe window.
         """
-        return True
+        if self._state is CircuitState.CLOSED:
+            return True
+        if self._state is CircuitState.HALF_OPEN:
+            if self._probe_outstanding:
+                # Consume the probe atomically so a second caller
+                # arriving in the same event-loop tick does not also
+                # see True and bypass the breaker.
+                self._probe_outstanding = False
+                return True
+            return False
+        # OPEN: maybe promote to HALF_OPEN if cooldown has elapsed.
+        # The current allow_request call IS the probe — consume it
+        # immediately so a second caller arriving in the same tick
+        # sees _probe_outstanding=False and is blocked.
+        if self.cooldown_remaining <= 0.0:
+            self._state = CircuitState.HALF_OPEN
+            self._probe_outstanding = False
+            return True
+        return False
 
     def record_success(self) -> None:
         self._consecutive_failures = 0
         self._state = CircuitState.CLOSED
         self._opened_at = None
+        self._probe_outstanding = False
 
     def record_failure(self) -> None:
         self._consecutive_failures += 1
+        if self._state is CircuitState.HALF_OPEN:
+            # The probe failed — back to OPEN with a fresh cooldown.
+            self._state = CircuitState.OPEN
+            self._opened_at = self._clock()
+            self._probe_outstanding = False
+            return
         if self._consecutive_failures >= self._config.failure_threshold:
             self._state = CircuitState.OPEN
-            self._opened_at = time.perf_counter()
+            self._opened_at = self._clock()
+            self._probe_outstanding = False
 
 
 def load_circuit_breaker_from_env() -> CircuitBreaker:
