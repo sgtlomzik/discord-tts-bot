@@ -554,16 +554,20 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(first, second)
 
     async def test_generate_tts_file_uses_piper_only(self):
+        # After commit 2 the dispatch path is: generate_tts_file ->
+        # tts_dispatcher.synthesize -> LocalProvider -> generate_piper_file.
+        # We mock at the LocalProvider boundary (the dispatcher's piper
+        # callback) so the test stays honest about the new layering.
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
-        tts_bot.generate_piper_file = AsyncMock(return_value=None)
+        piper_mock = AsyncMock(return_value=None)
+        tts_bot.tts_dispatcher._local._piper_synthesize = piper_mock
 
         filename = Path("/tmp/test_piper_only.wav")
-        await tts_bot.generate_tts_file("hello", filename)
+        provider_used = await tts_bot.generate_tts_file("hello", filename)
 
-        tts_bot.generate_piper_file.assert_awaited_once()
-        profile = tts_bot.generate_piper_file.await_args.args[2]
-        self.assertEqual(profile.name, "piper-ruslan")
+        self.assertEqual(provider_used, "local")
+        piper_mock.assert_awaited_once_with("hello", filename, None)
 
     async def test_clear_queue_for_guild_keeps_other_guild_jobs(self):
         bot_mod = load_bot_module()

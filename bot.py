@@ -25,6 +25,13 @@ except Exception:  # pragma: no cover - optional dependency
     PiperVoice = None
     SynthesisConfig = None
 
+from tts_providers import (
+    LocalProvider,
+    TTSDispatcher,
+    load_circuit_breaker_from_env,
+    load_dispatcher_config_from_env,
+)
+
 
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format=LOG_FORMAT)
@@ -706,6 +713,15 @@ class TTSBot(commands.Bot):
         self.suppress_auto_connect_until: dict[int, float] = {}
         self.config_store = BotConfigStore(BOT_CONFIG_PATH, WHITELIST_USERS)
         self.piper_voices: dict[tuple[str, str], object] = {}
+        # TTS provider abstraction (see tts_providers.py). Skeleton
+        # behavior in this commit: dispatcher always routes to local.
+        # Cloud provider (MiniMax) and full CB logic land in commits 3+
+        # and 6 respectively.
+        self.tts_dispatcher = TTSDispatcher(
+            local=LocalProvider(self.generate_piper_file),
+            config=load_dispatcher_config_from_env(),
+            circuit_breaker=load_circuit_breaker_from_env(),
+        )
         self.continuous_sources: dict[int, ContinuousTTSAudioSource] = {}
         self.merge_buffers: dict[tuple[int, int], MergeBufferState] = {}
         self.merge_locks: dict[tuple[int, int], asyncio.Lock] = {}
@@ -1000,7 +1016,13 @@ class TTSBot(commands.Bot):
     async def warmup_tts(self) -> None:
         filename = TMP_DIR / f"warmup_{uuid.uuid4().hex}.wav"
         try:
-            await self.generate_tts_file("Привет", filename)
+            # Warm Piper ONNX directly, bypassing the dispatcher. The
+            # whole point of warmup is to preload the local model so the
+            # first real request (including a fallback to local) is not
+            # cold. If TTS_PRIMARY_PROVIDER=minimax, warming the cloud
+            # provider is pointless (it is HTTP) and would burn an API
+            # call on every restart.
+            await self.tts_dispatcher.warm_local("Привет", filename)
             log.info("TTS warmup completed")
         except Exception:
             log.exception("TTS warmup failed")
@@ -1387,10 +1409,11 @@ class TTSBot(commands.Bot):
             time.perf_counter() - started,
         )
 
-    async def generate_tts_file(self, text: str, filename: Path, voice_profile: str | None = None) -> None:
+    async def generate_tts_file(self, text: str, filename: Path, voice_profile: str | None = None) -> str:
         profile = VOICE_PROFILES.get(voice_profile or DEFAULT_VOICE_PROFILE, VOICE_PROFILES[DEFAULT_VOICE_PROFILE])
-        await self.generate_piper_file(text, filename, profile)
-        log.info("TTS engine used: piper profile=%s", profile.name)
+        provider_used = await self.tts_dispatcher.synthesize(text, filename)
+        log.info("TTS engine used: %s profile=%s", provider_used, profile.name)
+        return provider_used
 
     async def tts_worker(self) -> None:
         await self.wait_until_ready()
