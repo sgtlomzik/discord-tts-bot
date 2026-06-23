@@ -414,6 +414,55 @@ def process_text(text: str) -> str:
     return text.strip()
 
 
+# Single source of truth for the cleanup applied just before handing
+# text to either TTS provider. Returns None when there is nothing
+# speakable left, so the caller can drop the message entirely
+# (matches the spec: 186/3358 messages were empty after cleanup).
+def normalize_for_tts(raw: str, *, max_chars: int | None = None) -> str | None:
+    """Strip Discord markup from a message and prepare it for synthesis.
+
+    Removes:
+      - custom emoji markup ``<:name:id>`` and ``<a:name:id>``
+      - user/role mentions ``<@id>``, ``<@!id>``, ``<@&id>``
+      - channel mentions ``<#id>``
+      - URLs ``https?://...``
+
+    Also normalizes whitespace (``\n`` -> ``". "``, multiple spaces
+    collapsed) and enforces an upper bound on the resulting length.
+    Returns ``None`` if the cleaned string is empty (caller should
+    drop the message — do not waste an API call or queue slot).
+    """
+    if not raw:
+        return None
+    text = raw
+
+    # Custom emoji: <:name:id> and <a:name:id>
+    text = re.sub(r"<a?:\w+:\d+>", " ", text)
+    # User/role mentions
+    text = re.sub(r"<@!?\d+>", " ", text)
+    text = re.sub(r"<@&\d+>", " ", text)
+    # Channel mentions
+    text = re.sub(r"<#\d+>", " ", text)
+    # URLs
+    text = re.sub(r"https?://\S+", " ", text)
+
+    # Newlines -> period for more natural speech rhythm
+    text = text.replace("\n", ". ")
+    # Collapse whitespace
+    text = " ".join(text.split())
+    text = text.strip()
+
+    if not text:
+        return None
+
+    limit = max_chars if max_chars is not None else MAX_TEXT_LENGTH
+    if limit and len(text) > limit:
+        text = text[:limit].rstrip()
+        if not text:
+            return None
+    return text
+
+
 def _is_emoji_char(ch: str) -> bool:
     if not ch:
         return False
@@ -1075,11 +1124,20 @@ class TTSBot(commands.Bot):
         text_channel_id: int,
         message_ts: float | None = None,
     ) -> bool:
+        # Normalize once at the boundary so every caller (merge buffer,
+        # /voicebot test, future commands) gets identical cleanup.
+        cleaned = normalize_for_tts(text)
+        if not cleaned:
+            log.info(
+                "Skipped TTS enqueue author=%s reason=empty_after_normalize",
+                author_id,
+            )
+            return False
         try:
             now = time.perf_counter()
             voice_profile = self.config_store.voice_for_user(voice_channel.guild.id, author_id)
             job = TTSJob(
-                text=text[:MAX_TEXT_LENGTH],
+                text=cleaned,
                 voice_channel=voice_channel,
                 queued_at=now,
                 author_id=author_id,
@@ -2043,7 +2101,7 @@ async def slash_tts_test(
             ephemeral=True,
         )
         return
-    final_text = process_text(text)
+    final_text = normalize_for_tts(text) or ""
     if not final_text:
         await interaction.response.send_message("Нет текста для озвучки.", ephemeral=True)
         return
