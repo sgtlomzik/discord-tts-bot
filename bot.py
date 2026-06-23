@@ -53,6 +53,12 @@ DEFAULT_VOICE_PROFILE = os.getenv("TTS_DEFAULT_VOICE_PROFILE", "piper-ruslan").s
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 MAX_TEXT_LENGTH = int(os.getenv("TTS_MAX_TEXT_LENGTH", "500"))
+# Per-message character cap applied at the enqueue boundary, before
+# any provider is invoked. The spec recommends ~300 to protect the
+# cloud API quota from accidental walls of text. Default 300; the
+# legacy TTS_MAX_TEXT_LENGTH cap (500) is still the hard ceiling if
+# this is unset/zero.
+TTS_MAX_CHARS = int(os.getenv("TTS_MAX_CHARS", "300"))
 QUEUE_MAXSIZE = int(os.getenv("TTS_QUEUE_MAXSIZE", "50"))
 TTS_PREROLL_MS = int(os.getenv("TTS_PREROLL_MS", os.getenv("TTS_START_PAD_MS", "250")))
 TTS_PREROLL_MODE = os.getenv("TTS_PREROLL_MODE", "silence").strip().lower()
@@ -1139,8 +1145,11 @@ class TTSBot(commands.Bot):
         message_ts: float | None = None,
     ) -> bool:
         # Normalize once at the boundary so every caller (merge buffer,
-        # /voicebot test, future commands) gets identical cleanup.
-        cleaned = normalize_for_tts(text)
+        # /voicebot test, future commands) gets identical cleanup. The
+        # TTS_MAX_CHARS cap is enforced here (300 by default, per spec
+        # §"Препроцессинг текста") — it protects the cloud API quota
+        # from accidental walls of text and keeps Piper CPU bounded.
+        cleaned = normalize_for_tts(text, max_chars=TTS_MAX_CHARS)
         if not cleaned:
             log.info(
                 "Skipped TTS enqueue author=%s reason=empty_after_normalize",
@@ -1827,6 +1836,10 @@ async def on_ready() -> None:
     log.info("Bot config path: %s", BOT_CONFIG_PATH)
     log.info("Voice profiles: %s", ",".join(sorted(VOICE_PROFILES)))
     log.info("Piper tuning: speaker=%s length_scale=%.2f", PIPER_SPEAKER, PIPER_LENGTH_SCALE)
+    log.info(
+        "Per-message cap: max_text_length=%s tts_max_chars=%s",
+        MAX_TEXT_LENGTH, TTS_MAX_CHARS,
+    )
     log.info(
         "Playback tuning: preroll_ms=%s preroll_mode=%s preroll_volume_db=%s tail_ms=%s trim_silence=%s ffmpeg_low_delay=%s",
         TTS_PREROLL_MS,

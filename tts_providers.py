@@ -84,14 +84,27 @@ class LocalProvider:
 
     name = "local"
 
-    def __init__(self, piper_synthesize: PiperSynthFn) -> None:
+    def __init__(
+        self,
+        piper_synthesize: PiperSynthFn,
+        *,
+        default_voice_profile: str = "",
+    ) -> None:
         self._piper_synthesize = piper_synthesize
+        # When the caller does not pass a voice_profile (e.g. the
+        # dispatcher during warmup), the wrapper uses this string as
+        # the profile name. Empty string means "use the pipeline's
+        # own default", which is what the underlying piper callable
+        # interprets as None.
+        self._default_voice_profile = default_voice_profile
 
     async def synthesize(self, text: str, filename: Path) -> None:
         # Voice profile is irrelevant for the wrapper itself; the bot
         # selects which Piper profile to use before calling the
-        # dispatcher. Passing None here means "use default profile".
-        await self._piper_synthesize(text, filename, None)
+        # dispatcher. Passing the default profile name lets the
+        # underlying piper callable resolve it via VOICE_PROFILES.
+        profile = self._default_voice_profile or None
+        await self._piper_synthesize(text, filename, profile)
         log.debug("LocalProvider synthesized text=%d chars to %s", len(text), filename)
 
 
@@ -324,6 +337,13 @@ class TTSPhraseCache:
 
     @staticmethod
     def hash_text(text: str) -> str:
+        # TODO(deploy-2026-06): include voice_id in the cache key as
+        # soon as a second voice is registered. Today there is exactly
+        # one cloned voice (bussshy) and MINIMAX_VOICE_ID is the only
+        # path, so text alone is a safe key. The moment a second voice
+        # is added (or per-user voice overrides go through the cache)
+        # this key will collide and the wrong audio will play for the
+        # wrong voice. Fix: hash_text(text, voice_id=...).
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def lookup(self, text: str) -> Optional[Path]:
@@ -418,6 +438,11 @@ class MiniMaxProvider:
     holds ONE long-lived ``httpx.AsyncClient`` with keep-alive so the
     TLS handshake is paid once per process lifetime, not once per
     message. This trims ~0.3s off every request after the first.
+
+    Tracks a session-level cumulative ``usage_characters`` counter so
+    operators can monitor quota burn across bot restarts (counter
+    resets only on process restart — by design, since MiniMax
+    accounting is per-account, not per-process).
     """
 
     name = "minimax"
@@ -442,6 +467,9 @@ class MiniMaxProvider:
             timeout=httpx.Timeout(config.timeout_seconds),
             limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
         )
+        # Cumulative chars billed this process lifetime. Logged on
+        # every successful synthesis for quota monitoring.
+        self._session_chars: int = 0
 
     async def aclose(self) -> None:
         """Gracefully close the underlying HTTP client.
@@ -556,6 +584,21 @@ class MiniMaxProvider:
             ) from exc
 
         filename.write_bytes(audio_bytes)
+        # Track quota usage. usage_characters is the number MiniMax
+        # actually billed for this request (may differ slightly from
+        # len(text) due to language_boost normalization).
+        usage = 0
+        extra = payload.get("extra_info") or {}
+        if isinstance(extra, dict):
+            try:
+                usage = int(extra.get("usage_characters") or 0)
+            except (TypeError, ValueError):
+                usage = 0
+        self._session_chars += usage
+        log.info(
+            "MiniMax usage chars=%d session_total=%d text_len=%d audio_bytes=%d",
+            usage, self._session_chars, len(text), len(audio_bytes),
+        )
         log.debug(
             "MiniMaxProvider synthesized text=%d chars audio=%d bytes file=%s",
             len(text), len(audio_bytes), filename,
