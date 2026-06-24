@@ -27,6 +27,7 @@ provider can safely emit WAV or MP3 as long as it is a valid container.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -35,7 +36,14 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable, Optional, Protocol
+from typing import (
+    TYPE_CHECKING,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Optional,
+    Protocol,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     import httpx
@@ -655,6 +663,131 @@ class MiniMaxProvider:
             "MiniMaxProvider synthesized text=%d chars audio=%d bytes file=%s",
             len(text), len(audio_bytes), filename,
         )
+
+    def _raise_for_status_code(self, status_code: int, status_msg: str) -> None:
+        """Map a non-zero MiniMax status_code to a precise exception."""
+        if "invalid api key" in status_msg.lower() or status_code in (1002, 1004):
+            raise MiniMaxAuthError(
+                f"MiniMax auth failed (status_code={status_code}): {status_msg}"
+            )
+        if status_code == 2054:
+            raise MiniMaxVoiceNotFoundError(
+                f"MiniMax voice id not exist (status_code=2054): {status_msg}"
+            )
+        raise MiniMaxError(f"MiniMax status_code={status_code}: {status_msg}")
+
+    async def stream_audio(
+        self,
+        text: str,
+        *,
+        voice_id: Optional[str] = None,
+        model: Optional[str] = None,
+        speed: Optional[float] = None,
+        vol: Optional[float] = None,
+        pitch: Optional[int] = None,
+        emotion: Optional[str] = None,
+        language_boost: Optional[str] = None,
+    ) -> AsyncIterator[bytes]:
+        """Yield decoded MP3 chunks from a streaming ``/v1/t2a_v2`` call.
+
+        Uses ``stream: true`` + ``stream_options.exclude_aggregated_audio``
+        so the final SSE event does NOT re-send the full clip (otherwise the
+        audio would be duplicated). Each ``data:`` event carries a hex chunk
+        in ``data.audio``; the final event (``data.status == 2``) carries
+        ``extra_info.usage_characters``.
+
+        Errors raised BEFORE the first yielded chunk let the caller fall back
+        cleanly to Piper. An error event mid-stream raises as well; the caller
+        must handle a partial stream (no clean rollback once audio is playing).
+        """
+        cfg = self._config
+        if not cfg.api_key:
+            raise MiniMaxAuthError("MINIMAX_API_KEY is not set")
+        eff_voice_id = voice_id or cfg.voice_id
+        if not eff_voice_id:
+            raise MiniMaxAuthError("MINIMAX voice_id is not set")
+
+        import httpx  # lazy import, see __init__ for rationale
+
+        url = self._build_url()
+        headers = {
+            "Authorization": f"Bearer {cfg.api_key}",
+            "Content-Type": "application/json",
+        }
+        body = self._build_body(
+            text,
+            voice_id=eff_voice_id,
+            model=model or cfg.model,
+            speed=1.0 if speed is None else speed,
+            vol=1.0 if vol is None else vol,
+            pitch=0 if pitch is None else pitch,
+            emotion=emotion or "",
+            language_boost=language_boost or cfg.language_boost,
+        )
+        body["stream"] = True
+        # Without this the final event repeats the entire clip -> doubled audio.
+        body["stream_options"] = {"exclude_aggregated_audio": True}
+
+        log.debug("MiniMax STREAM POST %s text=%d chars", url, len(text))
+
+        usage = 0
+        chunks = 0
+        try:
+            async with self._client.stream(
+                "POST", url, headers=headers, json=body
+            ) as response:
+                if response.status_code == 429:
+                    raise MiniMaxQuotaError("MiniMax rate-limited (HTTP 429)")
+                if response.status_code >= 400:
+                    excerpt = (await response.aread())[:200].decode("utf-8", "replace")
+                    raise MiniMaxError(
+                        f"MiniMax HTTP {response.status_code}: {excerpt}"
+                    )
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload_str = line[len("data:"):].strip()
+                    if not payload_str:
+                        continue
+                    try:
+                        payload = json.loads(payload_str)
+                    except ValueError:
+                        continue
+                    base_resp = payload.get("base_resp") or {}
+                    sc = int(base_resp.get("status_code", 0) or 0)
+                    if sc != 0:
+                        self._raise_for_status_code(
+                            sc, base_resp.get("status_msg", "") or ""
+                        )
+                    extra = payload.get("extra_info") or {}
+                    if isinstance(extra, dict) and extra.get("usage_characters"):
+                        try:
+                            usage = int(extra.get("usage_characters") or 0)
+                        except (TypeError, ValueError):
+                            pass
+                    data = payload.get("data") or {}
+                    audio_hex = data.get("audio")
+                    if audio_hex:
+                        try:
+                            chunk = bytes.fromhex(audio_hex)
+                        except ValueError:
+                            continue
+                        if chunk:
+                            chunks += 1
+                            yield chunk
+        except httpx.TimeoutException as exc:
+            raise MiniMaxTimeoutError(
+                f"MiniMax stream timed out after {cfg.timeout_seconds}s"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise MiniMaxError(f"MiniMax stream network error: {exc}") from exc
+        finally:
+            if usage:
+                self._session_chars += usage
+                log.info(
+                    "MiniMax usage (stream) chars=%d session_total=%d text_len=%d chunks=%d",
+                    usage, self._session_chars, len(text), chunks,
+                )
 
 
 def load_dispatcher_config_from_env() -> DispatcherConfig:
