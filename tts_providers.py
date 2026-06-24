@@ -730,11 +730,23 @@ class MiniMaxProvider:
 
         log.debug("MiniMax STREAM POST %s text=%d chars", url, len(text))
 
+        # The first-chunk (TTFA) budget is enforced by the caller. Here we
+        # only need a generous per-read (inter-chunk) timeout so a long
+        # message that legitimately streams for seconds is not truncated by
+        # the short default request timeout; gaps between chunks are tiny in
+        # practice, so this just guards against a fully stalled connection.
+        stream_timeout = httpx.Timeout(
+            connect=cfg.timeout_seconds,
+            read=max(cfg.timeout_seconds, 10.0),
+            write=cfg.timeout_seconds,
+            pool=cfg.timeout_seconds,
+        )
+
         usage = 0
         chunks = 0
         try:
             async with self._client.stream(
-                "POST", url, headers=headers, json=body
+                "POST", url, headers=headers, json=body, timeout=stream_timeout
             ) as response:
                 if response.status_code == 429:
                     raise MiniMaxQuotaError("MiniMax rate-limited (HTTP 429)")

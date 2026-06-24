@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import subprocess
 import types
@@ -97,6 +98,39 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(source.frames), frames)
         # ~0.4s of 20ms frames => ~20 frames (allow slack for codec padding)
         self.assertGreater(frames, 10)
+
+    async def test_long_stream_not_truncated_by_ttfa_timeout(self):
+        # First chunk is immediate (under TTFA budget); the rest arrive
+        # slowly, well past the budget. The TTFA timeout must apply ONLY to
+        # the first chunk, so the long tail still streams to completion.
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        mp3 = _MP3
+
+        async def _slow_tail(*a, **k):
+            third = max(1, len(mp3) // 3)
+            yield mp3[:third]                # immediate first chunk
+            await asyncio.sleep(0.25)        # gap > TTFA budget below
+            yield mp3[third:2 * third]
+            await asyncio.sleep(0.25)
+            yield mp3[2 * third:]
+
+        cloud = MagicMock()
+        cloud.stream_audio = lambda *a, **k: _slow_tail()
+        tts_bot.tts_dispatcher._cloud = cloud
+
+        original = bot_mod.TTS_STREAM_TTFA_TIMEOUT
+        bot_mod.TTS_STREAM_TTFA_TIMEOUT = 0.1  # tiny: would kill the tail if misapplied
+        try:
+            source = FakeSource(bot_mod.PCM_FRAME_BYTES)
+            status, frames = await tts_bot._stream_tts_to_source(
+                source, _minimax_voice(), _job(bot_mod)
+            )
+        finally:
+            bot_mod.TTS_STREAM_TTFA_TIMEOUT = original
+
+        self.assertEqual(status, "ok")
+        self.assertGreater(frames, 10)  # full ~0.4s clip decoded despite slow tail
 
     async def test_pre_audio_when_stream_raises_before_first_chunk(self):
         bot_mod = load_bot_module()
