@@ -371,6 +371,12 @@ class TTSPhraseCache:
         except OSError:
             log.warning("TTS cache: failed to scan %s", cache_dir, exc_info=True)
             return
+        # Remove orphan ".part" files left by an interrupted streaming write.
+        for part in cache_dir.glob("*.part"):
+            try:
+                part.unlink()
+            except OSError:
+                pass
         # Oldest first so LRU order roughly reflects last use across restarts.
         files.sort(key=lambda p: p.stat().st_mtime)
         for path in files:

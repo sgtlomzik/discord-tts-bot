@@ -5,12 +5,21 @@ from __future__ import annotations
 import asyncio
 import shutil
 import subprocess
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import voice_registry as vr
 from test_bot import load_bot_module
+from tts_providers import TTSCacheConfig, TTSPhraseCache
+
+
+async def _chunks_then_raise(data: bytes):
+    third = max(1, len(data) // 3)
+    yield data[:third]
+    raise RuntimeError("mid-stream boom")
 
 
 def _minimax_voice(name="bussshy01"):
@@ -131,6 +140,68 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, "ok")
         self.assertGreater(frames, 10)  # full ~0.4s clip decoded despite slow tail
+
+    def _enable_cache(self, bot_mod, tts_bot):
+        d = tempfile.mkdtemp()
+        cache = TTSPhraseCache(TTSCacheConfig(enabled=True, cache_dir=Path(d)))
+        tts_bot.tts_dispatcher._cache = cache
+        return cache
+
+    async def test_clean_stream_commits_to_cache(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        cache = self._enable_cache(bot_mod, tts_bot)
+        cloud = MagicMock()
+        cloud.stream_audio = lambda *a, **k: _chunks(_MP3)
+        tts_bot.tts_dispatcher._cloud = cloud
+
+        job = _job(bot_mod)
+        source = FakeSource(bot_mod.PCM_FRAME_BYTES)
+        status, frames = await tts_bot._stream_tts_to_source(source, _minimax_voice(), job)
+        self.assertEqual(status, "ok")
+        # committed: a repeat would hit the cache
+        self.assertIsNotNone(cache.lookup(job.text, "bussshy01"))
+        self.assertGreater(cache.total_bytes, 0)
+
+    async def test_partial_stream_not_cached(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        cache = self._enable_cache(bot_mod, tts_bot)
+        cloud = MagicMock()
+        cloud.stream_audio = lambda *a, **k: _chunks_then_raise(_MP3)
+        tts_bot.tts_dispatcher._cloud = cloud
+
+        job = _job(bot_mod)
+        source = FakeSource(bot_mod.PCM_FRAME_BYTES)
+        status, frames = await tts_bot._stream_tts_to_source(source, _minimax_voice(), job)
+        self.assertIn(status, ("truncated", "pre_audio"))
+        # partial output must NOT be cached
+        self.assertIsNone(cache.lookup(job.text, "bussshy01"))
+
+    async def test_cache_hit_plays_from_file_no_api(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        cache = self._enable_cache(bot_mod, tts_bot)
+        job = _job(bot_mod)
+        # Pre-store a real MP3 for this (text, voice).
+        src = Path(tempfile.mkdtemp()) / "seed.mp3"
+        src.write_bytes(_MP3)
+        cache.store(job.text, src, "bussshy01")
+
+        cloud = MagicMock()
+        cloud.stream_audio = MagicMock(side_effect=AssertionError("API hit on cache!"))
+        tts_bot.tts_dispatcher._cloud = cloud
+        tts_bot.ensure_voice = AsyncMock(return_value=MagicMock())
+        tts_bot.ensure_continuous_player = MagicMock(
+            return_value=FakeSource(bot_mod.PCM_FRAME_BYTES)
+        )
+        tts_bot.schedule_continuous_idle_stop = MagicMock()
+        tts_bot.schedule_idle_disconnect = MagicMock()
+
+        out = await tts_bot._run_streaming_job(job, _minimax_voice(), 0.0)
+        self.assertEqual(out, "done")
+        cloud.stream_audio.assert_not_called()  # served from disk, no API
+        self.assertEqual(cache.hits, 1)
 
     async def test_pre_audio_when_stream_raises_before_first_chunk(self):
         bot_mod = load_bot_module()

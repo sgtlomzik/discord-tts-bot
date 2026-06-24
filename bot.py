@@ -1690,6 +1690,31 @@ class TTSBot(commands.Bot):
                 await self.disconnect_guild_voice(job.voice_channel.guild)
             return "done"
 
+        # Cache hit: play the stored audio from disk, no API call, no breaker
+        # probe consumed. (Cache key already includes the voice.)
+        cache = self.tts_dispatcher.cache
+        if cache is not None:
+            cached = cache.lookup(job.text, voice.name)
+            if cached is not None:
+                source = self.ensure_continuous_player(vc)
+                try:
+                    frames = await self.prepare_tts_pcm_frames(cached)
+                except Exception:
+                    log.exception("Cached audio decode failed; streaming instead")
+                    frames = []
+                if frames:
+                    source.enqueue_frames(frames)
+                    log.info(
+                        "Stream cache HIT guild=%s channel=%s frames=%d "
+                        "message_to_audio_s=%.3f (no API)",
+                        job.voice_channel.guild.id, job.voice_channel.id, len(frames),
+                        time.perf_counter() - job.message_ts,
+                    )
+                    await source.wait_until_drained()
+                    self.schedule_continuous_idle_stop(job.voice_channel.guild)
+                    self.schedule_idle_disconnect(job.voice_channel.guild)
+                    return "done"
+
         # Consume the breaker probe only now that we are about to call cloud.
         if not cb.allow_request():
             log.debug(
@@ -1778,13 +1803,32 @@ class TTSBot(commands.Bot):
         )
         mid_error: list[BaseException] = []
 
+        # Tee the MP3 byte stream to a cache ".part" file so a future repeat
+        # of this (voice, text) plays from disk without hitting the API. Only
+        # committed on a clean finish — partial streams are never cached.
+        cache = self.tts_dispatcher.cache
+        cache_final: Path | None = None
+        cache_part = None
+        if cache is not None:
+            try:
+                cache_final = cache.cache_path_for(job.text, voice.name)
+                cache_final.parent.mkdir(parents=True, exist_ok=True)
+                cache_part = open(str(cache_final) + ".part", "wb")
+            except OSError:
+                cache_final = None
+                cache_part = None
+
         async def _feed() -> None:
             try:
                 proc.stdin.write(first_chunk)
                 await proc.stdin.drain()
+                if cache_part is not None:
+                    cache_part.write(first_chunk)
                 async for chunk in agen:
                     proc.stdin.write(chunk)
                     await proc.stdin.drain()
+                    if cache_part is not None:
+                        cache_part.write(chunk)
             except Exception as exc:  # mid-stream API/network failure
                 mid_error.append(exc)
             finally:
@@ -1792,6 +1836,11 @@ class TTSBot(commands.Bot):
                     proc.stdin.close()
                 except Exception:
                     pass
+                if cache_part is not None:
+                    try:
+                        cache_part.close()
+                    except Exception:
+                        pass
 
         feeder = asyncio.create_task(_feed())
 
@@ -1831,14 +1880,32 @@ class TTSBot(commands.Bot):
             except Exception:
                 pass
 
+        part_path = (str(cache_final) + ".part") if cache_final is not None else None
+
+        def _discard_cache() -> None:
+            if part_path:
+                try:
+                    os.unlink(part_path)
+                except OSError:
+                    pass
+
         if mid_error:
+            _discard_cache()  # never cache a partial stream
             log.warning(
                 "Stream failed mid-playback after %d frames (%s); truncated",
                 frames_enqueued, mid_error[0],
             )
             return ("truncated", frames_enqueued)
         if frames_enqueued == 0:
+            _discard_cache()
             return ("pre_audio", 0)
+        # Clean finish: finalize the cache file so repeats skip the API.
+        if cache is not None and cache_final is not None and part_path:
+            try:
+                os.replace(part_path, cache_final)
+                cache.commit_file(job.text, cache_final, voice.name)
+            except OSError:
+                _discard_cache()
         return ("ok", frames_enqueued)
 
     async def tts_worker(self) -> None:
