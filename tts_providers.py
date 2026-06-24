@@ -339,9 +339,34 @@ class TTSPhraseCache:
     def __init__(self, config: TTSCacheConfig) -> None:
         self._config = config
         self._entries: "OrderedDict[str, Path]" = OrderedDict()
+        # Lightweight hit/miss counters so operators can measure the real
+        # hit-rate on live traffic (logged every _LOG_EVERY lookups).
+        self._hits = 0
+        self._misses = 0
+        self._LOG_EVERY = 100
         # Note: cache_dir is created lazily on the first store() call
         # so that operators can point TTS_CACHE_DIR at a path that
         # does not yet exist.
+
+    @property
+    def hits(self) -> int:
+        return self._hits
+
+    @property
+    def misses(self) -> int:
+        return self._misses
+
+    def _record(self, hit: bool) -> None:
+        if hit:
+            self._hits += 1
+        else:
+            self._misses += 1
+        total = self._hits + self._misses
+        if total % self._LOG_EVERY == 0:
+            log.info(
+                "TTS cache stats hits=%d misses=%d hit_rate=%.1f%% entries=%d",
+                self._hits, self._misses, 100.0 * self._hits / total, len(self._entries),
+            )
 
     @property
     def config(self) -> TTSCacheConfig:
@@ -367,13 +392,16 @@ class TTSPhraseCache:
         key = self.hash_text(text, voice_name)
         cached = self._entries.get(key)
         if cached is None:
+            self._record(False)
             return None
         if not cached.exists():
             # Cache file vanished (manual cleanup, /dev/shm full).
             self._entries.pop(key, None)
+            self._record(False)
             return None
         # LRU touch: move to the back.
         self._entries.move_to_end(key)
+        self._record(True)
         return cached
 
     def store(self, text: str, source_path: Path, voice_name: str = "") -> Path:

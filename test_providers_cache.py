@@ -121,6 +121,15 @@ class TTSPhraseCacheTests(unittest.TestCase):
         # The unqualified key is a different key again -> miss.
         self.assertIsNone(self.cache.lookup("привет"))
 
+    def test_hit_miss_counters(self):
+        src = self._write_source("a.mp3", b"A")
+        self.cache.store("hi", src)
+        self.assertIsNotNone(self.cache.lookup("hi"))   # hit
+        self.assertIsNone(self.cache.lookup("nope"))    # miss
+        self.assertIsNone(self.cache.lookup("hi", "v2"))  # miss (other voice)
+        self.assertEqual(self.cache.hits, 1)
+        self.assertEqual(self.cache.misses, 2)
+
     def test_store_creates_cache_dir_on_demand(self):
         new_dir = Path(self.tmp.name) / "deeper" / "cache"
         cfg = TTSCacheConfig(enabled=True, max_entries=2, cache_dir=new_dir)
