@@ -74,6 +74,13 @@ TTS_PREROLL_MODE = os.getenv("TTS_PREROLL_MODE", "silence").strip().lower()
 TTS_PREROLL_VOLUME_DB = float(os.getenv("TTS_PREROLL_VOLUME_DB", "-90"))
 TTS_SILENCE_TAIL_MS = int(os.getenv("TTS_SILENCE_TAIL_MS", "200"))
 TTS_CONTINUOUS_STREAM = os.getenv("TTS_CONTINUOUS_STREAM", "1").strip().lower() not in {"0", "false", "no"}
+# Stream MiniMax audio chunk-by-chunk so the bot starts talking before the
+# whole clip is generated (cuts Time-To-First-Audio). Requires the
+# continuous stream. Feature-flagged for instant revert without a redeploy.
+TTS_STREAMING_ENABLED = os.getenv("TTS_STREAMING_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+# Budget for the FIRST audio chunk only. After the first chunk the stream
+# lives as long as it needs (long messages legitimately stream for seconds).
+TTS_STREAM_TTFA_TIMEOUT = float(os.getenv("TTS_STREAM_TTFA_TIMEOUT", os.getenv("TTS_REQUEST_TIMEOUT", "2.5")))
 TTS_IDLE_FRAME_MODE = os.getenv("TTS_IDLE_FRAME_MODE", "silence").strip().lower()
 TTS_IDLE_VOLUME_DB = float(os.getenv("TTS_IDLE_VOLUME_DB", "-60"))
 TTS_STREAM_TAIL_MS = int(os.getenv("TTS_STREAM_TAIL_MS", "200"))
@@ -685,6 +692,35 @@ def build_tts_pcm_command(source: Path) -> list[str]:
         "-vn",
         "-af",
         ",".join(audio_filters),
+        "-f",
+        "s16le",
+        "-ar",
+        str(PCM_SAMPLE_RATE),
+        "-ac",
+        str(PCM_CHANNELS),
+        "pipe:1",
+    ]
+
+
+def build_tts_stream_pcm_command() -> list[str]:
+    """ffmpeg: decode an MP3 byte stream on stdin to s16le 48k stereo on stdout.
+
+    Used by the streaming path: MiniMax MP3 chunks are written to stdin and
+    decoded PCM is read from stdout incrementally. No silence trimming — that
+    needs the whole clip, and the continuous player already handles idle.
+    """
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-f",
+        "mp3",
+        "-i",
+        "pipe:0",
+        "-vn",
+        "-af",
+        "aformat=sample_rates=48000:channel_layouts=stereo",
         "-f",
         "s16le",
         "-ar",
@@ -1624,6 +1660,187 @@ class TTSBot(commands.Bot):
         )
         return provider_used
 
+    def _should_attempt_stream(self, voice) -> bool:
+        """True when a job qualifies for the streaming fast path."""
+        return (
+            TTS_STREAMING_ENABLED
+            and TTS_CONTINUOUS_STREAM
+            and voice is not None
+            and getattr(voice, "is_minimax", False)
+            and self.tts_dispatcher.cloud is not None
+        )
+
+    async def _run_streaming_job(self, job: TTSJob, voice, worker_started: float) -> str:
+        """Drive a streaming MiniMax job. Returns "done" or "fallback".
+
+        "done": the job is fully handled (streamed ok, truncated mid-play, or
+        a connection error that has nothing to fall back to). "fallback": the
+        caller should run the Piper file path (pre-audio failure or open
+        circuit breaker).
+        """
+        cb = self.tts_dispatcher.circuit_breaker
+        # Connect first — enqueueing frames needs the voice client. Usually
+        # instant because the continuous stream keeps the session open.
+        try:
+            vc = await self.ensure_voice(job.voice_channel)
+        except Exception:
+            log.exception("Voice prepare failed (streaming)")
+            existing = discord.utils.get(self.voice_clients, guild=job.voice_channel.guild)
+            if existing and existing.is_connected():
+                await self.disconnect_guild_voice(job.voice_channel.guild)
+            return "done"
+
+        # Consume the breaker probe only now that we are about to call cloud.
+        if not cb.allow_request():
+            log.debug(
+                "Circuit breaker open; skipping stream guild=%s", job.voice_channel.guild.id
+            )
+            return "fallback"
+
+        log.info(
+            "Ready to stream guild=%s channel=%s queue_wait=%.3fs prep_total=%.3fs",
+            job.voice_channel.guild.id, job.voice_channel.id,
+            worker_started - job.queued_at, time.perf_counter() - worker_started,
+        )
+        source = self.ensure_continuous_player(vc)
+        try:
+            status, frames = await self._stream_tts_to_source(source, voice, job)
+        except Exception:
+            log.exception("Streaming playback crashed; falling back to Piper")
+            cb.record_failure()
+            return "fallback"
+
+        if status == "pre_audio":
+            cb.record_failure()
+            return "fallback"
+        # Audio started: ok (full) or truncated (mid-stream failure). Either
+        # way we do NOT overlay Piper on top of already-playing audio.
+        cb.record_success() if status == "ok" else cb.record_failure()
+        await source.wait_until_drained()
+        log.info(
+            "Playback finished (stream) guild=%s channel=%s frames=%d total_since_queue=%.3fs",
+            job.voice_channel.guild.id, job.voice_channel.id, frames,
+            time.perf_counter() - job.queued_at,
+        )
+        self.schedule_continuous_idle_stop(job.voice_channel.guild)
+        self.schedule_idle_disconnect(job.voice_channel.guild)
+        return "done"
+
+    async def _stream_tts_to_source(
+        self, source: "ContinuousTTSAudioSource", voice, job: TTSJob
+    ) -> tuple[str, int]:
+        """Stream a MiniMax voice into the continuous player frame-by-frame.
+
+        Returns (status, frames_enqueued) where status is "ok", "truncated"
+        (audio started then the stream failed mid-way) or "pre_audio" (failed
+        before any audio — caller falls back to Piper). Circuit-breaker
+        accounting is the caller's job.
+        """
+        cloud = self.tts_dispatcher.cloud
+        mm = voice.minimax
+        agen = cloud.stream_audio(
+            job.text,
+            voice_id=mm.voice_id, model=mm.model, speed=mm.speed,
+            vol=mm.vol, pitch=mm.pitch, emotion=mm.emotion,
+            language_boost=mm.language_boost,
+        )
+        # 1. First chunk under the TTFA budget; any failure here => clean
+        #    fallback to Piper (no audio has played yet).
+        try:
+            first_chunk = await asyncio.wait_for(
+                agen.__anext__(), timeout=TTS_STREAM_TTFA_TIMEOUT
+            )
+        except StopAsyncIteration:
+            await agen.aclose()
+            log.warning("Stream produced no audio; falling back to Piper")
+            return ("pre_audio", 0)
+        except asyncio.TimeoutError:
+            await agen.aclose()
+            log.warning(
+                "Stream TTFA exceeded %.2fs; falling back to Piper", TTS_STREAM_TTFA_TIMEOUT
+            )
+            return ("pre_audio", 0)
+        except Exception as exc:
+            await agen.aclose()
+            log.warning(
+                "Stream failed before first audio (%s: %s); Piper fallback",
+                type(exc).__name__, exc,
+            )
+            return ("pre_audio", 0)
+
+        # 2. We have audio. Decode the MP3 byte stream via ffmpeg (stdin ->
+        #    s16le stdout) while feeding chunks concurrently.
+        proc = await asyncio.create_subprocess_exec(
+            *build_tts_stream_pcm_command(),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        mid_error: list[BaseException] = []
+
+        async def _feed() -> None:
+            try:
+                proc.stdin.write(first_chunk)
+                await proc.stdin.drain()
+                async for chunk in agen:
+                    proc.stdin.write(chunk)
+                    await proc.stdin.drain()
+            except Exception as exc:  # mid-stream API/network failure
+                mid_error.append(exc)
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+        feeder = asyncio.create_task(_feed())
+
+        frames_enqueued = 0
+        first_frame_ts: float | None = None
+        leftover = b""
+        try:
+            while True:
+                data = await proc.stdout.read(PCM_FRAME_BYTES * 16)
+                if not data:
+                    break
+                buf = leftover + data
+                n = len(buf) - (len(buf) % PCM_FRAME_BYTES)
+                if n:
+                    out_frames = [buf[i:i + PCM_FRAME_BYTES] for i in range(0, n, PCM_FRAME_BYTES)]
+                    source.enqueue_frames(out_frames)
+                    if first_frame_ts is None:
+                        first_frame_ts = time.perf_counter()
+                        log.info(
+                            "Stream first audio guild=%s channel=%s "
+                            "message_to_first_audio_s=%.3f queue_to_first_audio_s=%.3f",
+                            job.voice_channel.guild.id, job.voice_channel.id,
+                            first_frame_ts - job.message_ts,
+                            first_frame_ts - job.queued_at,
+                        )
+                    frames_enqueued += len(out_frames)
+                leftover = buf[n:]
+        finally:
+            await feeder
+            if leftover:
+                source.enqueue_frames(
+                    [leftover + b"\x00" * (PCM_FRAME_BYTES - len(leftover))]
+                )
+                frames_enqueued += 1
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+
+        if mid_error:
+            log.warning(
+                "Stream failed mid-playback after %d frames (%s); truncated",
+                frames_enqueued, mid_error[0],
+            )
+            return ("truncated", frames_enqueued)
+        if frames_enqueued == 0:
+            return ("pre_audio", 0)
+        return ("ok", frames_enqueued)
+
     async def tts_worker(self) -> None:
         await self.wait_until_ready()
         await self.warmup_tts()
@@ -1635,9 +1852,25 @@ class TTSBot(commands.Bot):
 
             try:
                 worker_started = time.perf_counter()
+                voice = (
+                    self.voice_registry.get(job.voice_profile)
+                    or self.voice_registry.fallback_record()
+                )
+
+                # Streaming fast path: a MiniMax voice over the continuous
+                # stream plays chunks as they arrive (lower Time-To-First-
+                # Audio). On a pre-audio failure or an open breaker it returns
+                # "fallback" and we drop to the Piper file path below.
+                file_voice_name = job.voice_profile
+                if self._should_attempt_stream(voice):
+                    outcome = await self._run_streaming_job(job, voice, worker_started)
+                    if outcome == "done":
+                        continue
+                    # Pre-audio fallback: use Piper directly, never re-hit cloud.
+                    file_voice_name = self.voice_registry.fallback_profile
 
                 connect_task = asyncio.create_task(self.ensure_voice(job.voice_channel))
-                tts_task = asyncio.create_task(self.generate_tts_file(job.text, filename, job.voice_profile))
+                tts_task = asyncio.create_task(self.generate_tts_file(job.text, filename, file_voice_name))
 
                 try:
                     vc, _ = await asyncio.gather(connect_task, tts_task)
