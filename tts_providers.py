@@ -340,21 +340,19 @@ class TTSPhraseCache:
         return len(self._entries)
 
     @staticmethod
-    def hash_text(text: str) -> str:
-        # TODO(deploy-2026-06): include voice_id in the cache key as
-        # soon as a second voice is registered. Today there is exactly
-        # one cloned voice (bussshy) and MINIMAX_VOICE_ID is the only
-        # path, so text alone is a safe key. The moment a second voice
-        # is added (or per-user voice overrides go through the cache)
-        # this key will collide and the wrong audio will play for the
-        # wrong voice. Fix: hash_text(text, voice_id=...).
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    def hash_text(text: str, voice_name: str = "") -> str:
+        # The cache key MUST include the voice name: the same text spoken
+        # by two different voices produces different audio, so keying on
+        # text alone would return one voice's audio for the other. A NUL
+        # separator keeps (voice, text) pairs unambiguous.
+        payload = f"{voice_name}\x00{text}".encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
-    def lookup(self, text: str) -> Optional[Path]:
-        """Return the cached audio path for ``text``, or None on miss."""
+    def lookup(self, text: str, voice_name: str = "") -> Optional[Path]:
+        """Return the cached audio path for ``(voice, text)``, or None."""
         if not self._config.enabled:
             return None
-        key = self.hash_text(text)
+        key = self.hash_text(text, voice_name)
         cached = self._entries.get(key)
         if cached is None:
             return None
@@ -366,13 +364,13 @@ class TTSPhraseCache:
         self._entries.move_to_end(key)
         return cached
 
-    def store(self, text: str, source_path: Path) -> Path:
+    def store(self, text: str, source_path: Path, voice_name: str = "") -> Path:
         """Copy ``source_path`` into the cache and return the cache path."""
         if not self._config.enabled:
             return source_path
         if not source_path.exists():
             raise FileNotFoundError(source_path)
-        key = self.hash_text(text)
+        key = self.hash_text(text, voice_name)
         target = self._config.cache_dir / f"{key}.mp3"
         # Lazily create the cache directory on first store.
         self._config.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -735,12 +733,15 @@ class TTSDispatcher:
         with the record's profile name. A cloud failure falls back to the
         registry ``fallback_profile`` (Piper).
         """
+        # Cache key must include the voice so two voices never collide.
+        voice_key = getattr(voice, "name", "") if voice is not None else ""
+
         # 1. Cache hit short-circuits everything.
         if self._cache is not None:
-            cached = self._cache.lookup(text)
+            cached = self._cache.lookup(text, voice_key)
             if cached is not None:
                 shutil.copyfile(cached, filename)
-                log.debug("TTS cache HIT text=%d chars", len(text))
+                log.debug("TTS cache HIT text=%d chars voice=%s", len(text), voice_key)
                 return "cache"
 
         provider = getattr(voice, "provider", None) if voice is not None else None
@@ -767,7 +768,7 @@ class TTSDispatcher:
                     else:
                         await self._cloud.synthesize(text, filename)
                     self._cb.record_success()
-                    self._maybe_cache(text, filename)
+                    self._maybe_cache(text, filename, voice_key)
                     return self._cloud.name
                 except Exception as exc:
                     log.warning(
@@ -794,14 +795,14 @@ class TTSDispatcher:
         # operator has opted in, and a cache hit on a repeated short
         # phrase is a win whether the underlying provider is Piper
         # or MiniMax (the local file copy is faster than even Piper).
-        self._maybe_cache(text, filename)
+        self._maybe_cache(text, filename, voice_key)
         return self._local.name
 
-    def _maybe_cache(self, text: str, filename: Path) -> None:
+    def _maybe_cache(self, text: str, filename: Path, voice_key: str = "") -> None:
         if self._cache is None:
             return
         try:
-            self._cache.store(text, filename)
+            self._cache.store(text, filename, voice_key)
         except OSError as exc:
             # /dev/shm full or read-only mount — log and continue.
             log.warning("TTS cache store failed: %s", exc)

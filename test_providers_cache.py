@@ -92,6 +92,35 @@ class TTSPhraseCacheTests(unittest.TestCase):
         # Different text -> different hash.
         self.assertNotEqual(a, TTSPhraseCache.hash_text("пока"))
 
+    def test_hash_differs_by_voice(self):
+        # Same text, different voice => different key (no collision).
+        t = "привет"
+        self.assertNotEqual(
+            TTSPhraseCache.hash_text(t, "piper-ruslan"),
+            TTSPhraseCache.hash_text(t, "bussshy01"),
+        )
+        self.assertEqual(
+            TTSPhraseCache.hash_text(t, "v1"), TTSPhraseCache.hash_text(t, "v1")
+        )
+
+    def test_cache_key_includes_voice_no_collision(self):
+        # Storing the same text under two voices must yield two distinct
+        # cache files; each voice looks up its own audio.
+        src_a = self._write_source("a.mp3", b"VOICE_A_AUDIO")
+        src_b = self._write_source("b.mp3", b"VOICE_B_AUDIO")
+        self.cache.store("привет", src_a, "piper-ruslan")
+        self.cache.store("привет", src_b, "bussshy01")
+
+        hit_a = self.cache.lookup("привет", "piper-ruslan")
+        hit_b = self.cache.lookup("привет", "bussshy01")
+        self.assertIsNotNone(hit_a)
+        self.assertIsNotNone(hit_b)
+        self.assertNotEqual(hit_a, hit_b)
+        self.assertEqual(hit_a.read_bytes(), b"VOICE_A_AUDIO")
+        self.assertEqual(hit_b.read_bytes(), b"VOICE_B_AUDIO")
+        # The unqualified key is a different key again -> miss.
+        self.assertIsNone(self.cache.lookup("привет"))
+
     def test_store_creates_cache_dir_on_demand(self):
         new_dir = Path(self.tmp.name) / "deeper" / "cache"
         cfg = TTSCacheConfig(enabled=True, max_entries=2, cache_dir=new_dir)
