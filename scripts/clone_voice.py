@@ -193,11 +193,54 @@ def main(argv: list[str] | None = None) -> int:
         preview_path = args.sample.parent / f"_preview_{args.voice_id}.mp3"
         sanity_check(client, api_key, args.voice_id, preview_path)
 
+    register_in_catalog(args.voice_id)
+
     print("")
     print("All three steps passed.")
-    print(f"Add to your .env:")
+    print("The voice was registered in data/voices.json (if the bot has run")
+    print("at least once). Assign it in Discord with:")
+    print(f"  /voicebot voice-user @user {args.voice_id}")
+    print("Or seed it as the env default:")
     print(f"  MINIMAX_VOICE_ID={args.voice_id}")
     return 0
+
+
+def register_in_catalog(voice_id: str, description: str = "") -> None:
+    """Best-effort: append the freshly cloned voice to data/voices.json.
+
+    Only appends to an EXISTING catalog (created on the bot's first start);
+    never creates a fresh, piper-less catalog that would shadow the seed.
+    Failures are non-fatal — the operator can always use /voicebot voice-add.
+    """
+    try:
+        repo_root = Path(__file__).resolve().parent.parent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        import voice_registry as vr
+
+        path = repo_root / "data" / "voices.json"
+        reg = vr.load_registry(path)
+        if reg is None:
+            print(
+                "[catalog] data/voices.json not found yet — start the bot once, "
+                "then run /voicebot voice-add, or set MINIMAX_VOICE_ID."
+            )
+            return
+        name = voice_id if vr.valid_voice_name(voice_id) else f"mm-{voice_id}".lower()
+        reg.add(
+            vr.VoiceRecord(
+                name=name,
+                label=f"{voice_id} (клон)",
+                description=description or "Клон, создан clone_voice.py. # TODO: clone keepalive (7-day TTL)",
+                provider=vr.PROVIDER_MINIMAX,
+                minimax=vr.MiniMaxParams(voice_id=voice_id),
+            )
+        )
+        vr.save_registry(path, reg)
+        print(f"[catalog] registered voice '{name}' in {path}")
+    except Exception as exc:  # never block a successful clone on bookkeeping
+        print(f"[catalog] auto-register skipped ({type(exc).__name__}: {exc}); "
+              "use /voicebot voice-add.")
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from tts_providers import (
     MiniMaxProvider,
     MiniMaxQuotaError,
     MiniMaxTimeoutError,
+    MiniMaxVoiceNotFoundError,
 )
 
 
@@ -164,6 +165,61 @@ class MiniMaxProviderErrorTests(unittest.TestCase):
         with self.assertRaises(MiniMaxError) as ctx:
             _run(provider.synthesize("x", Path("/tmp/x.mp3")))
         self.assertNotIsInstance(ctx.exception, MiniMaxAuthError)
+
+    def test_status_2054_raises_voice_not_found(self):
+        # voice-add validation relies on this classification.
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = {"base_resp": {"status_code": 2054, "status_msg": "voice id not exist"}}
+            return httpx.Response(200, json=body)
+
+        provider = _make_provider(handler)
+        with self.assertRaises(MiniMaxVoiceNotFoundError):
+            _run(provider.synthesize("x", Path("/tmp/x.mp3"), voice_id="ghost"))
+
+
+class MiniMaxPerCallVoiceTests(unittest.TestCase):
+    def test_per_call_voice_id_and_params_override_config(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content.decode("utf-8"))
+            return _mp3_hex_response()
+
+        provider = _make_provider(handler)  # config voice_id="test-voice"
+        target = Path("/tmp/minimax_percall.mp3")
+        try:
+            _run(provider.synthesize(
+                "hi", target,
+                voice_id="bussshy01", model="speech-2.8-turbo",
+                speed=1.2, vol=0.8, pitch=3, emotion="happy",
+                language_boost="English",
+            ))
+            vs = captured["body"]["voice_setting"]
+            self.assertEqual(vs["voice_id"], "bussshy01")  # per-call wins over config
+            self.assertEqual(vs["speed"], 1.2)
+            self.assertEqual(vs["vol"], 0.8)
+            self.assertEqual(vs["pitch"], 3)
+            self.assertEqual(vs["emotion"], "happy")
+            self.assertEqual(captured["body"]["language_boost"], "English")
+        finally:
+            if target.exists():
+                target.unlink()
+
+    def test_empty_emotion_is_omitted(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content.decode("utf-8"))
+            return _mp3_hex_response()
+
+        provider = _make_provider(handler)
+        target = Path("/tmp/minimax_noemotion.mp3")
+        try:
+            _run(provider.synthesize("hi", target, voice_id="v1"))
+            self.assertNotIn("emotion", captured["body"]["voice_setting"])
+        finally:
+            if target.exists():
+                target.unlink()
 
     def test_missing_audio_field_raises_error(self):
         def handler(request: httpx.Request) -> httpx.Response:

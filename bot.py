@@ -12,7 +12,7 @@ import time
 import unicodedata
 import uuid
 import wave
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import discord
@@ -27,7 +27,9 @@ except Exception:  # pragma: no cover - optional dependency
 
 from tts_providers import (
     LocalProvider,
+    MiniMaxError,
     MiniMaxProvider,
+    MiniMaxVoiceNotFoundError,
     TTSDispatcher,
     TTSPhraseCache,
     load_cache_config_from_env,
@@ -1189,6 +1191,36 @@ class TTSBot(commands.Bot):
             )
         return VOICE_PROFILES.get(name, VOICE_PROFILES[DEFAULT_VOICE_PROFILE])
 
+    def persist_voice_registry(self) -> None:
+        """Atomically write the current catalog to data/voices.json."""
+        voice_registry.save_registry(VOICES_REGISTRY_PATH, self.voice_registry)
+
+    async def validate_minimax_voice(self, voice_id: str) -> tuple[bool, str]:
+        """Probe a MiniMax voice_id with a short phrase.
+
+        Returns (ok, error_message). ok=True means status_code 0; a 2054
+        (voice id not exist) yields a clear rejection. Used by voice-add
+        before persisting a new voice.
+        """
+        cloud = getattr(self.tts_dispatcher, "cloud", None)
+        if cloud is None:
+            return False, "MiniMax не настроен (нет MINIMAX_API_KEY)."
+        tmp = TMP_DIR / f"voiceadd_{uuid.uuid4().hex}.mp3"
+        try:
+            await cloud.synthesize("проверка голоса", tmp, voice_id=voice_id)
+            return True, ""
+        except MiniMaxVoiceNotFoundError:
+            return False, f"voice_id `{voice_id}` не существует (MiniMax 2054)."
+        except MiniMaxError as exc:
+            return False, f"Ошибка MiniMax: {exc}"
+        except Exception as exc:  # network/timeout/etc
+            return False, f"Не удалось проверить голос: {type(exc).__name__}: {exc}"
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     async def enqueue_tts(
         self,
         text: str,
@@ -2138,11 +2170,108 @@ async def slash_tts_voice_clear(interaction: discord.Interaction, user: discord.
 
 @tts_group.command(name="voices", description="Показать доступные озвучки")
 async def slash_tts_voices(interaction: discord.Interaction) -> None:
-    lines = [
-        f"`{name}` - {profile.label}"
-        for name, profile in sorted(VOICE_PROFILES.items())
-    ]
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    reg = bot.voice_registry
+    lines: list[str] = []
+    for name in reg.names():
+        rec = reg.get(name)
+        if rec is None:
+            continue
+        tag = "MiniMax" if rec.is_minimax else "Piper"
+        fb = " (fallback)" if name == reg.fallback_profile else ""
+        desc = f" — {rec.description}" if rec.description else ""
+        lines.append(f"`{name}` [{tag}]{fb} - {rec.label}{desc}")
+    await interaction.response.send_message(
+        "\n".join(lines) or "Каталог пуст.", ephemeral=True
+    )
+
+
+@tts_group.command(name="voice-add", description="Зарегистрировать MiniMax-голос (системный или клон)")
+@app_commands.describe(
+    name="Имя профиля (kebab-case: a-z, 0-9, дефис)",
+    voice_id="MiniMax voice_id (системный или клон)",
+    description="Описание (необязательно)",
+)
+async def slash_tts_voice_add(
+    interaction: discord.Interaction,
+    name: str,
+    voice_id: str,
+    description: str = "",
+) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    name = name.strip().lower()
+    voice_id = voice_id.strip()
+    if not voice_registry.valid_voice_name(name):
+        await interaction.response.send_message(
+            "Имя должно быть в kebab-case: строчные буквы, цифры и дефис, "
+            "начинаться с буквы или цифры (например `mm-qingse`).",
+            ephemeral=True,
+        )
+        return
+    if name in bot.voice_registry:
+        await interaction.response.send_message(
+            f"Голос `{name}` уже существует. Выберите другое имя.", ephemeral=True
+        )
+        return
+    if not voice_id:
+        await interaction.response.send_message("Укажите voice_id.", ephemeral=True)
+        return
+    # Validation hits the network; defer so the interaction does not expire.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    ok, err = await bot.validate_minimax_voice(voice_id)
+    if not ok:
+        await interaction.followup.send(f"Не добавлено: {err}", ephemeral=True)
+        return
+    record = voice_registry.VoiceRecord(
+        name=name,
+        label=f"{name} (MiniMax)",
+        description=description.strip(),
+        provider=voice_registry.PROVIDER_MINIMAX,
+        minimax=voice_registry.MiniMaxParams(voice_id=voice_id),
+    )
+    bot.voice_registry.add(record)
+    try:
+        bot.persist_voice_registry()
+    except OSError as exc:
+        log.exception("Failed to persist voices.json after voice-add")
+        await interaction.followup.send(
+            f"Голос проверен, но не сохранён на диск: {exc}", ephemeral=True
+        )
+        return
+    await interaction.followup.send(
+        f"Добавлен голос `{name}` (voice_id=`{voice_id}`). "
+        f"Назначьте его через `/voicebot voice-user` или `/voicebot voice-set`.",
+        ephemeral=True,
+    )
+
+
+@tts_group.command(name="voice-describe", description="Изменить описание голоса")
+@app_commands.describe(name="Имя профиля", text="Новое описание")
+@app_commands.autocomplete(name=voice_profile_autocomplete)
+async def slash_tts_voice_describe(
+    interaction: discord.Interaction, name: str, text: str
+) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    name = name.strip().lower()
+    rec = bot.voice_registry.get(name)
+    if rec is None:
+        await interaction.response.send_message(
+            f"Голос `{name}` не найден. Список: `/voicebot voices`.", ephemeral=True
+        )
+        return
+    bot.voice_registry.add(replace(rec, description=text.strip()))
+    try:
+        bot.persist_voice_registry()
+    except OSError as exc:
+        log.exception("Failed to persist voices.json after voice-describe")
+        await interaction.response.send_message(
+            f"Не удалось сохранить: {exc}", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(
+        f"Описание `{name}` обновлено.", ephemeral=True
+    )
 
 
 @tts_group.command(name="status", description="Показать состояние TTS на сервере")

@@ -277,6 +277,10 @@ class MiniMaxTimeoutError(MiniMaxError):
     """Request exceeded TTS_REQUEST_TIMEOUT."""
 
 
+class MiniMaxVoiceNotFoundError(MiniMaxError):
+    """status_code 2054 — the requested voice_id does not exist."""
+
+
 @dataclass
 class MiniMaxConfig:
     api_key: str = ""
@@ -610,6 +614,10 @@ class MiniMaxProvider:
             if "invalid api key" in status_msg.lower() or status_code in (1002, 1004):
                 raise MiniMaxAuthError(
                     f"MiniMax auth failed (status_code={status_code}): {status_msg}"
+                )
+            if status_code == 2054:
+                raise MiniMaxVoiceNotFoundError(
+                    f"MiniMax voice id not exist (status_code=2054): {status_msg}"
                 )
             raise MiniMaxError(
                 f"MiniMax status_code={status_code}: {status_msg}"
