@@ -282,11 +282,21 @@ if TTS_IDLE_FRAME_MODE not in {"comfort_noise", "silence"}:
 
 
 class BotConfigStore:
-    def __init__(self, path: Path, fallback_users: set[int]) -> None:
+    def __init__(self, path: Path, fallback_users: set[int], voice_registry=None) -> None:
         self.path = path
         self.fallback_users = set(fallback_users)
+        # Validate stored voice names against the unified registry when
+        # available (so MiniMax assignments survive reload); otherwise fall
+        # back to the hardcoded Piper profiles (keeps tests that construct
+        # the store without a registry working unchanged).
+        self.voice_registry = voice_registry
         self.guilds: dict[int, GuildConfig] = {}
         self.load()
+
+    def _is_valid_voice(self, name: str) -> bool:
+        if self.voice_registry is not None:
+            return name in self.voice_registry
+        return name in VOICE_PROFILES
 
     def load(self) -> None:
         if not self.path.exists():
@@ -314,10 +324,10 @@ class BotConfigStore:
             user_voices = {
                 int(user_id): voice
                 for user_id, voice in raw_config.get("user_voices", {}).items()
-                if str(user_id).isdigit() and voice in VOICE_PROFILES
+                if str(user_id).isdigit() and self._is_valid_voice(voice)
             }
             default_voice = raw_config.get("default_voice", DEFAULT_VOICE_PROFILE)
-            if default_voice not in VOICE_PROFILES:
+            if not self._is_valid_voice(default_voice):
                 default_voice = DEFAULT_VOICE_PROFILE
             self.guilds[guild_id] = GuildConfig(
                 enabled=bool(raw_config.get("enabled", True)),
@@ -790,7 +800,9 @@ class TTSBot(commands.Bot):
             minimax_model=_mm_seed.model,
             minimax_language_boost=_mm_seed.language_boost,
         )
-        self.config_store = BotConfigStore(BOT_CONFIG_PATH, WHITELIST_USERS)
+        self.config_store = BotConfigStore(
+            BOT_CONFIG_PATH, WHITELIST_USERS, voice_registry=self.voice_registry
+        )
         self.piper_voices: dict[tuple[str, str], object] = {}
         # TTS provider abstraction (see tts_providers.py). Skeleton
         # behavior in this commit: dispatcher always routes to local.
@@ -802,17 +814,16 @@ class TTSBot(commands.Bot):
         # signature (str | None profile name) matches what
         # generate_piper_file expects (VoiceProfile object).
         async def _piper_synthesize(text: str, filename: Path, voice_profile: str | None) -> None:
-            profile = VOICE_PROFILES.get(
-                voice_profile or DEFAULT_VOICE_PROFILE,
-                VOICE_PROFILES[DEFAULT_VOICE_PROFILE],
+            await self.generate_piper_file(
+                text, filename, self._resolve_piper_profile(voice_profile)
             )
-            await self.generate_piper_file(text, filename, profile)
         self.tts_dispatcher = TTSDispatcher(
             local=LocalProvider(_piper_synthesize),
             cloud=self._build_cloud_provider(),
             config=load_dispatcher_config_from_env(),
             circuit_breaker=load_circuit_breaker_from_env(),
             cache=self.tts_cache,
+            fallback_profile=self.voice_registry.fallback_profile,
         )
         self.continuous_sources: dict[int, ContinuousTTSAudioSource] = {}
         self.merge_buffers: dict[tuple[int, int], MergeBufferState] = {}
@@ -1142,19 +1153,41 @@ class TTSBot(commands.Bot):
         regardless of TTS_PRIMARY_PROVIDER, and the bot starts cleanly.
         """
         cfg = load_minimax_config_from_env()
-        if not cfg.api_key or not cfg.voice_id:
-            log.info(
-                "MiniMax provider disabled (api_key=%s, voice_id=%s); "
-                "fall back to local",
-                "set" if cfg.api_key else "MISSING",
-                "set" if cfg.voice_id else "MISSING",
-            )
+        # Only the API key is required now: the per-message voice_id comes
+        # from the registry record, so the cloud provider is usable even
+        # when MINIMAX_VOICE_ID is empty (as long as a minimax voice is in
+        # the catalog). MINIMAX_VOICE_ID remains the first-start seed.
+        if not cfg.api_key:
+            log.info("MiniMax provider disabled (api_key MISSING); fall back to local")
             return None
         log.info(
-            "MiniMax provider enabled model=%s voice_id=%s base_url=%s timeout=%.1fs",
-            cfg.model, cfg.voice_id, cfg.base_url, cfg.timeout_seconds,
+            "MiniMax provider enabled model=%s default_voice_id=%s base_url=%s timeout=%.1fs",
+            cfg.model, cfg.voice_id or "(per-record)", cfg.base_url, cfg.timeout_seconds,
         )
         return MiniMaxProvider(cfg)
+
+    def _resolve_piper_profile(self, voice_profile: str | None) -> VoiceProfile:
+        """Resolve a voice name to a Piper ``VoiceProfile`` via the registry.
+
+        Falls back to the registry ``fallback_profile`` then ``VOICE_PROFILES``
+        so a missing or non-Piper name still yields a usable Piper voice.
+        """
+        name = (
+            voice_profile
+            or self.voice_registry.fallback_profile
+            or DEFAULT_VOICE_PROFILE
+        )
+        rec = self.voice_registry.get(name)
+        if rec is not None and rec.is_piper and rec.piper is not None:
+            return VoiceProfile(
+                name=rec.name,
+                label=rec.label,
+                piper_model_path=rec.piper.model_path,
+                piper_config_path=rec.piper.config_path,
+                piper_speaker=rec.piper.speaker,
+                piper_length_scale=rec.piper.length_scale,
+            )
+        return VOICE_PROFILES.get(name, VOICE_PROFILES[DEFAULT_VOICE_PROFILE])
 
     async def enqueue_tts(
         self,
@@ -1545,9 +1578,18 @@ class TTSBot(commands.Bot):
         )
 
     async def generate_tts_file(self, text: str, filename: Path, voice_profile: str | None = None) -> str:
-        profile = VOICE_PROFILES.get(voice_profile or DEFAULT_VOICE_PROFILE, VOICE_PROFILES[DEFAULT_VOICE_PROFILE])
-        provider_used = await self.tts_dispatcher.synthesize(text, filename)
-        log.info("TTS engine used: %s profile=%s", provider_used, profile.name)
+        # Resolve the stored voice name to a registry record; the dispatcher
+        # routes by record.provider (piper -> local, minimax -> cloud) and
+        # falls back to the registry fallback_profile on cloud failure.
+        record = self.voice_registry.get(voice_profile)
+        if record is None:
+            record = self.voice_registry.fallback_record()
+        provider_used = await self.tts_dispatcher.synthesize(text, filename, voice=record)
+        log.info(
+            "TTS engine used: %s voice=%s",
+            provider_used,
+            record.name if record is not None else (voice_profile or "default"),
+        )
         return provider_used
 
     async def tts_worker(self) -> None:
@@ -1961,7 +2003,7 @@ async def require_guild_manager(interaction: discord.Interaction) -> bool:
 
 def validate_voice_profile(voice: str) -> str | None:
     voice_name = voice.strip().lower()
-    return voice_name if voice_name in VOICE_PROFILES else None
+    return voice_name if voice_name in bot.voice_registry else None
 
 
 async def voice_profile_autocomplete(
@@ -1969,11 +2011,13 @@ async def voice_profile_autocomplete(
     current: str,
 ) -> list[app_commands.Choice[str]]:
     current = current.lower()
-    return [
-        app_commands.Choice(name=f"{name} - {profile.label}", value=name)
-        for name, profile in sorted(VOICE_PROFILES.items())
-        if current in name.lower() or current in profile.label.lower()
-    ][:25]
+    choices: list[app_commands.Choice[str]] = []
+    for name in bot.voice_registry.names():
+        rec = bot.voice_registry.get(name)
+        label = rec.label if rec is not None else name
+        if current in name.lower() or current in label.lower():
+            choices.append(app_commands.Choice(name=f"{name} - {label}", value=name))
+    return choices[:25]
 
 
 def resolve_tts_command_voice_channel(

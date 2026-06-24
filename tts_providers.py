@@ -98,12 +98,16 @@ class LocalProvider:
         # interprets as None.
         self._default_voice_profile = default_voice_profile
 
-    async def synthesize(self, text: str, filename: Path) -> None:
-        # Voice profile is irrelevant for the wrapper itself; the bot
-        # selects which Piper profile to use before calling the
-        # dispatcher. Passing the default profile name lets the
-        # underlying piper callable resolve it via VOICE_PROFILES.
-        profile = self._default_voice_profile or None
+    async def synthesize(
+        self, text: str, filename: Path, voice_profile: Optional[str] = None
+    ) -> None:
+        # The bot resolves which Piper profile to use (per-user/default,
+        # or the registry fallback when a cloud voice fails) and passes
+        # its name here. When omitted (warmup), fall back to this
+        # wrapper's configured default; empty string => pipeline default.
+        profile = voice_profile if voice_profile is not None else (
+            self._default_voice_profile or None
+        )
         await self._piper_synthesize(text, filename, profile)
         log.debug("LocalProvider synthesized text=%d chars to %s", len(text), filename)
 
@@ -490,20 +494,35 @@ class MiniMaxProvider:
             url = f"{url}?GroupId={self._config.group_id}"
         return url
 
-    def _build_body(self, text: str) -> dict:
+    def _build_body(
+        self,
+        text: str,
+        *,
+        voice_id: str,
+        model: str,
+        speed: float,
+        vol: float,
+        pitch: int,
+        emotion: str,
+        language_boost: str,
+    ) -> dict:
         cfg = self._config
+        voice_setting: dict = {
+            "voice_id": voice_id,
+            "speed": speed,
+            "vol": vol,
+            "pitch": pitch,
+        }
+        # MiniMax rejects an empty emotion; only include it when set.
+        if emotion:
+            voice_setting["emotion"] = emotion
         return {
-            "model": cfg.model,
+            "model": model,
             "text": text,
             "stream": False,
-            "language_boost": cfg.language_boost,
+            "language_boost": language_boost,
             "output_format": "hex",
-            "voice_setting": {
-                "voice_id": cfg.voice_id,
-                "speed": 1,
-                "vol": 1,
-                "pitch": 0,
-            },
+            "voice_setting": voice_setting,
             "audio_setting": {
                 "sample_rate": cfg.sample_rate,
                 "bitrate": cfg.bitrate,
@@ -512,12 +531,30 @@ class MiniMaxProvider:
             },
         }
 
-    async def synthesize(self, text: str, filename: Path) -> None:
+    async def synthesize(
+        self,
+        text: str,
+        filename: Path,
+        *,
+        voice_id: Optional[str] = None,
+        model: Optional[str] = None,
+        speed: Optional[float] = None,
+        vol: Optional[float] = None,
+        pitch: Optional[int] = None,
+        emotion: Optional[str] = None,
+        language_boost: Optional[str] = None,
+    ) -> None:
+        """Synthesize ``text`` to ``filename``.
+
+        Voice parameters default to the env-seeded config when not passed;
+        the dispatcher supplies them per-call from the registry record.
+        """
         cfg = self._config
         if not cfg.api_key:
             raise MiniMaxAuthError("MINIMAX_API_KEY is not set")
-        if not cfg.voice_id:
-            raise MiniMaxAuthError("MINIMAX_VOICE_ID is not set")
+        eff_voice_id = voice_id or cfg.voice_id
+        if not eff_voice_id:
+            raise MiniMaxAuthError("MINIMAX voice_id is not set")
 
         import httpx  # lazy import, see __init__ for rationale
 
@@ -526,7 +563,16 @@ class MiniMaxProvider:
             "Authorization": f"Bearer {cfg.api_key}",
             "Content-Type": "application/json",
         }
-        body = self._build_body(text)
+        body = self._build_body(
+            text,
+            voice_id=eff_voice_id,
+            model=model or cfg.model,
+            speed=1.0 if speed is None else speed,
+            vol=1.0 if vol is None else vol,
+            pitch=0 if pitch is None else pitch,
+            emotion=emotion or "",
+            language_boost=language_boost or cfg.language_boost,
+        )
 
         log.debug("MiniMax POST %s text=%d chars", url, len(text))
 
@@ -653,12 +699,16 @@ class TTSDispatcher:
         circuit_breaker: Optional[CircuitBreaker] = None,
         config: Optional[DispatcherConfig] = None,
         cache: Optional[TTSPhraseCache] = None,
+        fallback_profile: str = "",
     ) -> None:
         self._local = local
         self._cloud = cloud  # None when MiniMax is not configured
         self._cb = circuit_breaker or CircuitBreaker()
         self._config = config or DispatcherConfig()
         self._cache = cache  # None means caching disabled
+        # Piper profile name to fall back to when a cloud (MiniMax) voice
+        # fails. Sourced from the registry's fallback_profile.
+        self._fallback_profile = fallback_profile
 
     @property
     def config(self) -> DispatcherConfig:
@@ -676,8 +726,15 @@ class TTSDispatcher:
     def cache(self) -> Optional[TTSPhraseCache]:
         return self._cache
 
-    async def synthesize(self, text: str, filename: Path) -> str:
-        """Produce audio at ``filename`` and return the provider used."""
+    async def synthesize(self, text: str, filename: Path, voice=None) -> str:
+        """Produce audio at ``filename`` and return the provider used.
+
+        ``voice`` is a registry ``VoiceRecord`` (or None). Its ``provider``
+        decides routing: a ``minimax`` record goes to the cloud with the
+        record's voice_id/params; a ``piper`` record goes to local Piper
+        with the record's profile name. A cloud failure falls back to the
+        registry ``fallback_profile`` (Piper).
+        """
         # 1. Cache hit short-circuits everything.
         if self._cache is not None:
             cached = self._cache.lookup(text)
@@ -686,14 +743,29 @@ class TTSDispatcher:
                 log.debug("TTS cache HIT text=%d chars", len(text))
                 return "cache"
 
-        # 2. Try the primary chain.
-        if (
-            self._config.primary is PrimaryProvider.MINIMAX
-            and self._cloud is not None
-        ):
+        provider = getattr(voice, "provider", None) if voice is not None else None
+
+        # 2. Cloud (MiniMax) path: when the record is a minimax voice, or
+        #    (no record) the env default is minimax. Requires a configured
+        #    cloud provider.
+        want_minimax = (
+            provider == "minimax"
+            or (voice is None and self._config.primary is PrimaryProvider.MINIMAX)
+        ) and self._cloud is not None
+
+        if want_minimax:
             if self._cb.allow_request():
                 try:
-                    await self._cloud.synthesize(text, filename)
+                    mm = getattr(voice, "minimax", None) if voice is not None else None
+                    if mm is not None:
+                        await self._cloud.synthesize(
+                            text, filename,
+                            voice_id=mm.voice_id, model=mm.model,
+                            speed=mm.speed, vol=mm.vol, pitch=mm.pitch,
+                            emotion=mm.emotion, language_boost=mm.language_boost,
+                        )
+                    else:
+                        await self._cloud.synthesize(text, filename)
                     self._cb.record_success()
                     self._maybe_cache(text, filename)
                     return self._cloud.name
@@ -705,10 +777,19 @@ class TTSDispatcher:
                     self._cb.record_failure()
             else:
                 log.debug(
-                    "Circuit breaker open; skipping %s, using %s",
-                    self._cloud.name, self._local.name,
+                    "Circuit breaker open; skipping %s, using fallback Piper",
+                    self._cloud.name,
                 )
-        await self._local.synthesize(text, filename)
+
+        # 3. Local (Piper) path. Pick the profile name: the requested piper
+        #    voice, or the registry fallback when a cloud voice was wanted.
+        if provider == "piper":
+            fallback_name = getattr(voice, "name", None)
+        elif provider == "minimax" or want_minimax:
+            fallback_name = self._fallback_profile or None
+        else:
+            fallback_name = None
+        await self._local.synthesize(text, filename, fallback_name)
         # Cache regardless of provider: when TTS_CACHE_ENABLED=1 the
         # operator has opted in, and a cache hit on a repeated short
         # phrase is a win whether the underlying provider is Piper
