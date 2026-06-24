@@ -2023,6 +2023,10 @@ class TTSBot(commands.Bot):
             return "cancelled"
         if not cb.allow_request():
             return "pre_audio"  # breaker open -> caller does Piper fallback
+        # Set the label before streaming so the playback worker logs the
+        # provider on the first frame (a pre-audio fallback overwrites it
+        # with the Piper provider in _generate_file_into).
+        prepared.provider = "minimax"
         status, _ = await self._stream_to_channel(prepared, voice)
         if status == "pre_audio":
             cb.record_failure()
@@ -2030,7 +2034,6 @@ class TTSBot(commands.Bot):
         if status == "cancelled":
             return "cancelled"
         cb.record_success() if status == "ok" else cb.record_failure()
-        prepared.provider = "minimax"
         return status
 
     async def _generate_file_into(self, prepared: PreparedAudio, voice) -> None:
