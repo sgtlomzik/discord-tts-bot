@@ -35,6 +35,7 @@ from tts_providers import (
     load_dispatcher_config_from_env,
     load_minimax_config_from_env,
 )
+import voice_registry
 
 
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -48,6 +49,12 @@ PCM_SAMPLE_WIDTH = 2
 PCM_FRAME_MS = 20
 PCM_FRAME_BYTES = int(PCM_SAMPLE_RATE * PCM_FRAME_MS / 1000) * PCM_CHANNELS * PCM_SAMPLE_WIDTH
 BOT_CONFIG_PATH = Path(os.getenv("BOT_CONFIG_PATH", "/app/data/config.json"))
+# Catalog of available voices (Piper + MiniMax). Lives in the mounted
+# ./data volume next to config.json; seeded on first start. This is the
+# CATALOG only — selection state stays in BotConfigStore/config.json.
+VOICES_REGISTRY_PATH = Path(
+    os.getenv("VOICES_REGISTRY_PATH", str(BOT_CONFIG_PATH.parent / "voices.json"))
+)
 DEFAULT_WHITELIST = "441612025286885397"
 DEFAULT_VOICE_PROFILE = os.getenv("TTS_DEFAULT_VOICE_PROFILE", "piper-ruslan").strip()
 
@@ -770,6 +777,19 @@ class TTSBot(commands.Bot):
         self.voice_connect_locks: dict[int, asyncio.Lock] = {}
         self.voice_connect_cooldown_until: dict[int, float] = {}
         self.suppress_auto_connect_until: dict[int, float] = {}
+        # Unified voice catalog (Piper + MiniMax). Seeded on first start
+        # from the hardcoded VOICE_PROFILES + MINIMAX_VOICE_ID; thereafter
+        # loaded from data/voices.json. Selection state stays separate in
+        # BotConfigStore.
+        _mm_seed = load_minimax_config_from_env()
+        self.voice_registry = voice_registry.load_or_seed(
+            VOICES_REGISTRY_PATH,
+            VOICE_PROFILES,
+            fallback_profile=DEFAULT_VOICE_PROFILE,
+            minimax_voice_id=_mm_seed.voice_id,
+            minimax_model=_mm_seed.model,
+            minimax_language_boost=_mm_seed.language_boost,
+        )
         self.config_store = BotConfigStore(BOT_CONFIG_PATH, WHITELIST_USERS)
         self.piper_voices: dict[tuple[str, str], object] = {}
         # TTS provider abstraction (see tts_providers.py). Skeleton
