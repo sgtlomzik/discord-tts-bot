@@ -91,7 +91,7 @@ def upload_sample(client: httpx.Client, api_key: str, sample: Path) -> str:
 def clone_voice(client: httpx.Client, api_key: str, file_id: str, voice_id: str) -> dict:
     """Trigger the clone and return the raw response payload."""
     body = {
-        "file_id": file_id,
+        "file_id": int(file_id),  # MiniMax voice_clone rejects a string file_id (2013 invalid params)
         "voice_id": voice_id,
         "model": "speech-2.8-hd",  # preview-quality clone
     }
