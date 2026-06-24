@@ -307,46 +307,88 @@ class MiniMaxConfig:
 # ---------------------------------------------------------------------------
 
 
+_DEFAULT_CACHE_DIR = "/app/data/tts_cache"
+_DEFAULT_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+
+
 @dataclass
 class TTSCacheConfig:
     enabled: bool = False
-    max_entries: int = 128
-    cache_dir: Path = Path("/dev/shm/tts_cache")
+    # Primary eviction policy is by total bytes on disk (hard cap). A
+    # non-zero ``max_entries`` adds an optional secondary count cap (0 =
+    # unlimited count, rely on bytes).
+    max_bytes: int = _DEFAULT_CACHE_MAX_BYTES
+    max_entries: int = 0
+    cache_dir: Path = Path(_DEFAULT_CACHE_DIR)
 
 
 def load_cache_config_from_env() -> TTSCacheConfig:
     enabled_raw = os.getenv("TTS_CACHE_ENABLED", "0").strip().lower()
     enabled = enabled_raw in ("1", "true", "yes", "on")
-    max_entries = int(os.getenv("TTS_CACHE_MAX_ENTRIES", "128"))
-    cache_dir_raw = os.getenv("TTS_CACHE_DIR", "/dev/shm/tts_cache").strip()
-    cache_dir = Path(cache_dir_raw) if cache_dir_raw else Path("/dev/shm/tts_cache")
+    max_bytes = int(os.getenv("TTS_CACHE_MAX_BYTES", str(_DEFAULT_CACHE_MAX_BYTES)))
+    max_entries = int(os.getenv("TTS_CACHE_MAX_ENTRIES", "0"))
+    cache_dir_raw = os.getenv("TTS_CACHE_DIR", _DEFAULT_CACHE_DIR).strip()
+    cache_dir = Path(cache_dir_raw) if cache_dir_raw else Path(_DEFAULT_CACHE_DIR)
     return TTSCacheConfig(
         enabled=enabled,
+        max_bytes=max(0, max_bytes),
         max_entries=max(0, max_entries),
         cache_dir=cache_dir,
     )
 
 
 class TTSPhraseCache:
-    """In-memory LRU over sha256(text) -> cached audio file path.
+    """LRU cache over sha256(voice + text) -> cached audio file path.
 
     Skips API/Piper for repeated short phrases ("бб", "пака", "давайте",
     "gg" and similar). Cache files live in ``TTS_CACHE_DIR`` (default
-    ``/dev/shm/tts_cache``); on a normal bot restart the cache is wiped
-    which is fine because the next message rehydrates the hot entries.
+    ``/app/data/tts_cache`` — disk, in the mounted volume) so hot phrases
+    survive a restart: the index is rehydrated from the existing files at
+    startup. Eviction is by total bytes (hard cap ``TTS_CACHE_MAX_BYTES``,
+    default 2 GiB), LRU order, with an optional secondary count cap.
     """
 
     def __init__(self, config: TTSCacheConfig) -> None:
         self._config = config
         self._entries: "OrderedDict[str, Path]" = OrderedDict()
+        self._sizes: dict[str, int] = {}
+        self._total_bytes = 0
         # Lightweight hit/miss counters so operators can measure the real
         # hit-rate on live traffic (logged every _LOG_EVERY lookups).
         self._hits = 0
         self._misses = 0
         self._LOG_EVERY = 100
-        # Note: cache_dir is created lazily on the first store() call
-        # so that operators can point TTS_CACHE_DIR at a path that
-        # does not yet exist.
+        if self._config.enabled:
+            self._load_existing()
+
+    def _load_existing(self) -> None:
+        """Rehydrate the index from cache files left by a previous run."""
+        cache_dir = self._config.cache_dir
+        if not cache_dir.exists():
+            return
+        try:
+            files = [p for p in cache_dir.glob("*.mp3") if p.is_file()]
+        except OSError:
+            log.warning("TTS cache: failed to scan %s", cache_dir, exc_info=True)
+            return
+        # Oldest first so LRU order roughly reflects last use across restarts.
+        files.sort(key=lambda p: p.stat().st_mtime)
+        for path in files:
+            key = path.stem
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            self._entries[key] = path
+            self._sizes[key] = size
+            self._total_bytes += size
+        # Enforce the byte cap immediately in case the limit shrank.
+        self._evict_to_fit()
+        if self._entries:
+            log.info(
+                "TTS cache rehydrated entries=%d bytes=%d from %s",
+                len(self._entries), self._total_bytes, cache_dir,
+            )
 
     @property
     def hits(self) -> int:
@@ -376,6 +418,29 @@ class TTSPhraseCache:
     def size(self) -> int:
         return len(self._entries)
 
+    @property
+    def total_bytes(self) -> int:
+        return self._total_bytes
+
+    def _drop(self, key: str) -> None:
+        """Remove a key from the index + size accounting (no unlink)."""
+        self._entries.pop(key, None)
+        self._total_bytes -= self._sizes.pop(key, 0)
+
+    def _evict_to_fit(self) -> None:
+        """Evict LRU entries until within the byte (and optional count) caps."""
+        cfg = self._config
+        while self._entries and (
+            self._total_bytes > cfg.max_bytes
+            or (cfg.max_entries > 0 and len(self._entries) > cfg.max_entries)
+        ):
+            evicted_key, evicted_path = self._entries.popitem(last=False)
+            self._total_bytes -= self._sizes.pop(evicted_key, 0)
+            try:
+                evicted_path.unlink()
+            except OSError:
+                log.warning("TTS cache: failed to evict %s", evicted_path, exc_info=True)
+
     @staticmethod
     def hash_text(text: str, voice_name: str = "") -> str:
         # The cache key MUST include the voice name: the same text spoken
@@ -395,8 +460,8 @@ class TTSPhraseCache:
             self._record(False)
             return None
         if not cached.exists():
-            # Cache file vanished (manual cleanup, /dev/shm full).
-            self._entries.pop(key, None)
+            # Cache file vanished (manual cleanup, disk full).
+            self._drop(key)
             self._record(False)
             return None
         # LRU touch: move to the back.
@@ -410,27 +475,51 @@ class TTSPhraseCache:
             return source_path
         if not source_path.exists():
             raise FileNotFoundError(source_path)
+        return self._store_key(self.hash_text(text, voice_name), source_path)
+
+    def cache_path_for(self, text: str, voice_name: str = "") -> Path:
+        """Return the on-disk path a (voice, text) pair would cache to.
+
+        Used by the streaming path to write chunks directly to the final
+        cache file (then ``commit_file`` registers it).
+        """
+        return self._config.cache_dir / f"{self.hash_text(text, voice_name)}.mp3"
+
+    def commit_file(self, text: str, cache_file: Path, voice_name: str = "") -> Optional[Path]:
+        """Register an already-written cache file (e.g. from streaming).
+
+        Returns the registered path, or None if caching is disabled / the
+        file is missing. The file must already live under ``cache_dir`` with
+        the canonical name from ``cache_path_for``.
+        """
+        if not self._config.enabled:
+            return None
+        if not cache_file.exists():
+            return None
         key = self.hash_text(text, voice_name)
+        return self._register(key, cache_file)
+
+    def _store_key(self, key: str, source_path: Path) -> Path:
         target = self._config.cache_dir / f"{key}.mp3"
-        # Lazily create the cache directory on first store.
         self._config.cache_dir.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            # Already cached from a previous call — just touch the LRU.
-            self._entries[key] = target
-            self._entries.move_to_end(key)
+        if target != source_path:
+            shutil.copyfile(source_path, target)
+        return self._register(key, target)
+
+    def _register(self, key: str, target: Path) -> Path:
+        try:
+            size = target.stat().st_size
+        except OSError:
             return target
-        shutil.copyfile(source_path, target)
+        # Skip files larger than the whole cap (would churn-evict everything).
+        if self._config.max_bytes and size > self._config.max_bytes:
+            return target
+        # Update accounting (replace if the key already existed).
+        self._total_bytes += size - self._sizes.get(key, 0)
+        self._sizes[key] = size
         self._entries[key] = target
         self._entries.move_to_end(key)
-        # Evict oldest entries past max_entries.
-        while len(self._entries) > self._config.max_entries:
-            evicted_key, evicted_path = self._entries.popitem(last=False)
-            try:
-                evicted_path.unlink()
-            except OSError:
-                log.warning(
-                    "TTS cache: failed to evict %s", evicted_path, exc_info=True,
-                )
+        self._evict_to_fit()
         return target
 
 

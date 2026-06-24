@@ -140,6 +140,75 @@ class TTSPhraseCacheTests(unittest.TestCase):
         self.assertTrue(new_dir.exists())
 
 
+class TTSCacheByteEvictionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache_dir = Path(self.tmp.name) / "cache"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _cache(self, max_bytes):
+        return TTSPhraseCache(
+            TTSCacheConfig(enabled=True, max_bytes=max_bytes, max_entries=0,
+                           cache_dir=self.cache_dir)
+        )
+
+    def _src(self, name, payload):
+        p = Path(self.tmp.name) / name
+        p.write_bytes(payload)
+        return p
+
+    def test_evicts_by_total_bytes(self):
+        cache = self._cache(max_bytes=250)  # ~2.5 x 100-byte files
+        for i in range(4):
+            cache.store(f"t{i}", self._src(f"s{i}.mp3", b"x" * 100))
+        self.assertLessEqual(cache.total_bytes, 250)
+        self.assertEqual(cache.size, 2)            # only 2 of 100B fit under 250
+        self.assertIsNone(cache.lookup("t0"))      # oldest evicted
+        self.assertIsNone(cache.lookup("t1"))
+        self.assertIsNotNone(cache.lookup("t3"))   # newest kept
+
+    def test_total_bytes_tracks_store_and_evict(self):
+        cache = self._cache(max_bytes=10_000)
+        cache.store("a", self._src("a.mp3", b"x" * 300))
+        cache.store("b", self._src("b.mp3", b"x" * 200))
+        self.assertEqual(cache.total_bytes, 500)
+        self.assertEqual(cache.size, 2)
+
+    def test_skip_file_larger_than_cap(self):
+        cache = self._cache(max_bytes=100)
+        cache.store("big", self._src("big.mp3", b"x" * 500))  # > cap
+        self.assertEqual(cache.size, 0)
+        self.assertEqual(cache.total_bytes, 0)
+
+    def test_rehydrate_from_disk_survives_restart(self):
+        c1 = self._cache(max_bytes=10_000)
+        c1.store("привет", self._src("p.mp3", b"HELLO_AUDIO"), "bussshy01")
+        # New instance on the same dir = simulated restart.
+        c2 = self._cache(max_bytes=10_000)
+        self.assertEqual(c2.size, 1)
+        hit = c2.lookup("привет", "bussshy01")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit.read_bytes(), b"HELLO_AUDIO")
+        self.assertEqual(c2.total_bytes, len(b"HELLO_AUDIO"))
+
+    def test_commit_file_registers_streaming_output(self):
+        cache = self._cache(max_bytes=10_000)
+        target = cache.cache_path_for("да", "bussshy01")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"STREAMED_MP3")  # simulate streaming writing chunks
+        registered = cache.commit_file("да", target, "bussshy01")
+        self.assertEqual(registered, target)
+        hit = cache.lookup("да", "bussshy01")
+        self.assertEqual(hit, target)
+        self.assertEqual(cache.total_bytes, len(b"STREAMED_MP3"))
+
+    def test_commit_file_missing_returns_none(self):
+        cache = self._cache(max_bytes=10_000)
+        self.assertIsNone(cache.commit_file("x", self.cache_dir / "nope.mp3", "v"))
+
+
 class DispatcherCacheIntegrationTests(unittest.TestCase):
     """End-to-end: dispatcher consults cache before invoking providers."""
 
