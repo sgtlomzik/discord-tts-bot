@@ -81,6 +81,13 @@ TTS_STREAMING_ENABLED = os.getenv("TTS_STREAMING_ENABLED", "1").strip().lower() 
 # Budget for the FIRST audio chunk only. After the first chunk the stream
 # lives as long as it needs (long messages legitimately stream for seconds).
 TTS_STREAM_TTFA_TIMEOUT = float(os.getenv("TTS_STREAM_TTFA_TIMEOUT", os.getenv("TTS_REQUEST_TIMEOUT", "2.5")))
+# Prefetch: decouple generation from playback so message N+1 is synthesized
+# while N is still playing (cuts queue_wait under bursts). Playback stays
+# strictly sequential FIFO. TTS_PREFETCH_ENABLED=0 reverts to the proven
+# single-worker path (runtime kill-switch). Lookahead = messages generated
+# ahead (1 is plenty; playback serializes anyway).
+TTS_PREFETCH_ENABLED = os.getenv("TTS_PREFETCH_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+TTS_PREFETCH_LOOKAHEAD = max(1, int(os.getenv("TTS_PREFETCH_LOOKAHEAD", "1")))
 TTS_IDLE_FRAME_MODE = os.getenv("TTS_IDLE_FRAME_MODE", "silence").strip().lower()
 TTS_IDLE_VOLUME_DB = float(os.getenv("TTS_IDLE_VOLUME_DB", "-60"))
 TTS_STREAM_TAIL_MS = int(os.getenv("TTS_STREAM_TAIL_MS", "200"))
@@ -203,6 +210,21 @@ class TTSJob:
     text_channel_id: int
     voice_profile: str
     message_ts: float = field(default_factory=time.perf_counter)
+
+
+@dataclass(eq=False)  # identity-based: each prepared item is unique (set member)
+class PreparedAudio:
+    """A job whose audio is being (or has been) generated ahead of playback.
+
+    The generation worker fills ``channel`` with batches of 20ms PCM frames
+    (``list[bytes]``) and ends it with a ``None`` sentinel. The playback
+    worker drains ``channel`` into the continuous player in order. ``cancelled``
+    is set by ``queue-clear`` to stop generation/playback of this item.
+    """
+    job: TTSJob
+    channel: asyncio.Queue
+    cancelled: bool = False
+    provider: str = ""
 
 
 @dataclass
@@ -820,6 +842,15 @@ class TTSBot(commands.Bot):
         super().__init__(command_prefix=("!tts ", "!tts"), intents=intents)
         self.message_queue: asyncio.Queue[TTSJob] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
         self.worker_task: asyncio.Task[None] | None = None
+        # Prefetch pipeline: generation worker fills ready_queue (bounded by
+        # lookahead) with PreparedAudio; playback worker drains it in order.
+        self.ready_queue: asyncio.Queue[PreparedAudio] = asyncio.Queue(
+            maxsize=TTS_PREFETCH_LOOKAHEAD
+        )
+        self.generation_task: asyncio.Task[None] | None = None
+        self.playback_task: asyncio.Task[None] | None = None
+        # In-flight + buffered prepared items, so queue-clear can cancel them.
+        self.active_prepared: set[PreparedAudio] = set()
         self.idle_disconnect_tasks: dict[int, asyncio.Task[None]] = {}
         self.continuous_idle_stop_tasks: dict[int, asyncio.Task[None]] = {}
         self.voice_connect_locks: dict[int, asyncio.Lock] = {}
@@ -876,11 +907,18 @@ class TTSBot(commands.Bot):
             log.info("Slash commands synced count=%s group=/%s", len(synced), tts_group.name)
         except Exception:
             log.exception("Failed to sync slash commands")
-        self.worker_task = asyncio.create_task(self.tts_worker(), name="tts-worker")
+        if TTS_PREFETCH_ENABLED:
+            self.generation_task = asyncio.create_task(
+                self._generation_worker(), name="tts-generation")
+            self.playback_task = asyncio.create_task(
+                self._playback_worker(), name="tts-playback")
+        else:
+            self.worker_task = asyncio.create_task(self.tts_worker(), name="tts-worker")
 
     async def close(self) -> None:
-        if self.worker_task:
-            self.worker_task.cancel()
+        for task in (self.worker_task, self.generation_task, self.playback_task):
+            if task:
+                task.cancel()
 
         for task in self.idle_disconnect_tasks.values():
             task.cancel()
@@ -1592,6 +1630,13 @@ class TTSBot(commands.Bot):
 
         for job in kept:
             self.message_queue.put_nowait(job)
+
+        # Cancel prefetched/in-flight prepared audio for this guild so it is
+        # neither played nor finishes burning quota on generation.
+        for prepared in self.active_prepared:
+            if prepared.job.guild_id == guild_id and not prepared.cancelled:
+                prepared.cancelled = True
+                removed += 1
         return removed
 
     async def generate_piper_file(self, text: str, filename: Path, profile: VoiceProfile) -> None:
@@ -1907,6 +1952,314 @@ class TTSBot(commands.Bot):
             except OSError:
                 _discard_cache()
         return ("ok", frames_enqueued)
+
+    # ------------------------------------------------------------------
+    # Prefetch pipeline (TTS_PREFETCH_ENABLED): generation_worker produces
+    # PreparedAudio ahead of playback_worker, which plays strictly FIFO.
+    # ------------------------------------------------------------------
+
+    async def _generation_worker(self) -> None:
+        await self.wait_until_ready()
+        await self.warmup_tts()
+        log.info("TTS generation worker started (lookahead=%d)", TTS_PREFETCH_LOOKAHEAD)
+        while not self.is_closed():
+            job = await self.message_queue.get()
+            prepared = PreparedAudio(job=job, channel=asyncio.Queue())
+            self.active_prepared.add(prepared)
+            try:
+                # Backpressure: blocks here when we are already `lookahead`
+                # messages ahead of playback.
+                await self.ready_queue.put(prepared)
+                await self._prepare_into(prepared)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("TTS generation pipeline error")
+                await prepared.channel.put(None)
+            finally:
+                self.message_queue.task_done()
+
+    async def _prepare_into(self, prepared: PreparedAudio) -> None:
+        """Generate a job's audio into ``prepared.channel`` (frame batches)."""
+        job = prepared.job
+        voice = self.voice_registry.get(job.voice_profile) or self.voice_registry.fallback_record()
+        try:
+            if prepared.cancelled:
+                return
+            if self._should_attempt_stream(voice):
+                status = await self._generate_stream_into(prepared, voice)
+                if status != "pre_audio":
+                    return  # ok / truncated / cache / cancelled
+                voice = self.voice_registry.fallback_record()  # pre-audio -> Piper
+            await self._generate_file_into(prepared, voice)
+        finally:
+            # Always terminate the channel so the consumer never hangs.
+            await prepared.channel.put(None)
+
+    async def _safe_pcm_frames(self, path: Path) -> list[bytes]:
+        try:
+            return await self.prepare_tts_pcm_frames(path)
+        except Exception:
+            log.exception("PCM decode failed for %s", path)
+            return []
+
+    async def _generate_stream_into(self, prepared: PreparedAudio, voice) -> str:
+        job = prepared.job
+        cb = self.tts_dispatcher.circuit_breaker
+        cache = self.tts_dispatcher.cache
+        if cache is not None:
+            cached = cache.lookup(job.text, voice.name)
+            if cached is not None:
+                frames = await self._safe_pcm_frames(cached)
+                if frames and not prepared.cancelled:
+                    await prepared.channel.put(frames)
+                    prepared.provider = "cache"
+                    log.info(
+                        "Cache HIT (prefetch) guild=%s voice=%s frames=%d (no API)",
+                        job.guild_id, voice.name, len(frames),
+                    )
+                    return "cache"
+        if prepared.cancelled:
+            return "cancelled"
+        if not cb.allow_request():
+            return "pre_audio"  # breaker open -> caller does Piper fallback
+        status, _ = await self._stream_to_channel(prepared, voice)
+        if status == "pre_audio":
+            cb.record_failure()
+            return "pre_audio"
+        if status == "cancelled":
+            return "cancelled"
+        cb.record_success() if status == "ok" else cb.record_failure()
+        prepared.provider = "minimax"
+        return status
+
+    async def _generate_file_into(self, prepared: PreparedAudio, voice) -> None:
+        if prepared.cancelled:
+            return
+        job = prepared.job
+        filename = TMP_DIR / f"tts_{uuid.uuid4().hex}.wav"
+        try:
+            prepared.provider = await self.tts_dispatcher.synthesize(
+                job.text, filename, voice=voice
+            )
+            if prepared.cancelled:
+                return
+            frames = await self._safe_pcm_frames(filename)
+            if frames:
+                await prepared.channel.put(frames)
+        finally:
+            if filename.exists():
+                try:
+                    filename.unlink()
+                except OSError:
+                    log.exception("Failed to remove temp file: %s", filename)
+
+    async def _stream_to_channel(self, prepared: PreparedAudio, voice) -> tuple[str, int]:
+        """Stream MiniMax -> ffmpeg -> frame batches into ``prepared.channel``.
+
+        Like _stream_tts_to_source but writes to the prefetch channel (not the
+        live player) and honors cancellation. Returns (status, frames) with
+        status in ok/truncated/pre_audio/cancelled.
+        """
+        job = prepared.job
+        cloud = self.tts_dispatcher.cloud
+        mm = voice.minimax
+        agen = cloud.stream_audio(
+            job.text, voice_id=mm.voice_id, model=mm.model, speed=mm.speed,
+            vol=mm.vol, pitch=mm.pitch, emotion=mm.emotion, language_boost=mm.language_boost,
+        )
+        try:
+            first_chunk = await asyncio.wait_for(
+                agen.__anext__(), timeout=TTS_STREAM_TTFA_TIMEOUT
+            )
+        except StopAsyncIteration:
+            await agen.aclose()
+            log.warning("Stream produced no audio; Piper fallback")
+            return ("pre_audio", 0)
+        except asyncio.TimeoutError:
+            await agen.aclose()
+            log.warning("Stream TTFA exceeded %.2fs; Piper fallback", TTS_STREAM_TTFA_TIMEOUT)
+            return ("pre_audio", 0)
+        except Exception as exc:
+            await agen.aclose()
+            log.warning("Stream failed before first audio (%s: %s); Piper fallback",
+                        type(exc).__name__, exc)
+            return ("pre_audio", 0)
+        if prepared.cancelled:
+            await agen.aclose()
+            return ("cancelled", 0)
+
+        proc = await asyncio.create_subprocess_exec(
+            *build_tts_stream_pcm_command(),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        mid_error: list[BaseException] = []
+        cache = self.tts_dispatcher.cache
+        cache_final: Path | None = None
+        cache_part = None
+        if cache is not None:
+            try:
+                cache_final = cache.cache_path_for(job.text, voice.name)
+                cache_final.parent.mkdir(parents=True, exist_ok=True)
+                cache_part = open(str(cache_final) + ".part", "wb")
+            except OSError:
+                cache_final = None
+                cache_part = None
+
+        async def _feed() -> None:
+            try:
+                proc.stdin.write(first_chunk)
+                await proc.stdin.drain()
+                if cache_part is not None:
+                    cache_part.write(first_chunk)
+                async for chunk in agen:
+                    if prepared.cancelled:
+                        break
+                    proc.stdin.write(chunk)
+                    await proc.stdin.drain()
+                    if cache_part is not None:
+                        cache_part.write(chunk)
+            except Exception as exc:
+                mid_error.append(exc)
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                if cache_part is not None:
+                    try:
+                        cache_part.close()
+                    except Exception:
+                        pass
+
+        feeder = asyncio.create_task(_feed())
+        frames_count = 0
+        leftover = b""
+        try:
+            while True:
+                data = await proc.stdout.read(PCM_FRAME_BYTES * 16)
+                if not data:
+                    break
+                buf = leftover + data
+                n = len(buf) - (len(buf) % PCM_FRAME_BYTES)
+                if n and not prepared.cancelled:
+                    out_frames = [buf[i:i + PCM_FRAME_BYTES] for i in range(0, n, PCM_FRAME_BYTES)]
+                    await prepared.channel.put(out_frames)
+                    frames_count += len(out_frames)
+                leftover = buf[n:]
+        finally:
+            await feeder
+            if leftover and not prepared.cancelled:
+                await prepared.channel.put(
+                    [leftover + b"\x00" * (PCM_FRAME_BYTES - len(leftover))]
+                )
+                frames_count += 1
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+
+        part_path = (str(cache_final) + ".part") if cache_final is not None else None
+
+        def _discard() -> None:
+            if part_path:
+                try:
+                    os.unlink(part_path)
+                except OSError:
+                    pass
+
+        if prepared.cancelled:
+            _discard()
+            return ("cancelled", frames_count)
+        if mid_error:
+            _discard()
+            log.warning("Stream failed mid-stream after %d frames (%s); truncated",
+                        frames_count, mid_error[0])
+            return ("truncated", frames_count)
+        if frames_count == 0:
+            _discard()
+            return ("pre_audio", 0)
+        if cache is not None and cache_final is not None and part_path:
+            try:
+                os.replace(part_path, cache_final)
+                cache.commit_file(job.text, cache_final, voice.name)
+            except OSError:
+                _discard()
+        return ("ok", frames_count)
+
+    async def _playback_worker(self) -> None:
+        await self.wait_until_ready()
+        log.info("TTS playback worker started")
+        while not self.is_closed():
+            prepared = await self.ready_queue.get()
+            try:
+                await self._play_prepared(prepared)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("TTS playback failed; disconnecting voice")
+                await self.disconnect_guild_voice(prepared.job.voice_channel.guild)
+            finally:
+                self.active_prepared.discard(prepared)
+                self.ready_queue.task_done()
+
+    async def _drain_channel(self, prepared: PreparedAudio) -> None:
+        """Consume a prepared channel to its sentinel without playing."""
+        while True:
+            batch = await prepared.channel.get()
+            if batch is None:
+                return
+
+    async def _play_prepared(self, prepared: PreparedAudio) -> None:
+        job = prepared.job
+        pickup_ts = time.perf_counter()
+        if prepared.cancelled:
+            await self._drain_channel(prepared)
+            log.info("Skipped cancelled job guild=%s channel=%s",
+                     job.voice_channel.guild.id, job.voice_channel.id)
+            return
+        try:
+            vc = await self.ensure_voice(job.voice_channel)
+        except Exception:
+            log.exception("Voice prepare failed (playback)")
+            existing = discord.utils.get(self.voice_clients, guild=job.voice_channel.guild)
+            if existing and existing.is_connected():
+                await self.disconnect_guild_voice(job.voice_channel.guild)
+            await self._drain_channel(prepared)
+            return
+
+        source = self.ensure_continuous_player(vc)
+        first_ts: float | None = None
+        total = 0
+        while True:
+            batch = await prepared.channel.get()
+            if batch is None:
+                break
+            if prepared.cancelled:
+                continue  # stop feeding but drain to the sentinel
+            source.enqueue_frames(batch)
+            total += len(batch)
+            if first_ts is None:
+                first_ts = time.perf_counter()
+                log.info(
+                    "Audio start guild=%s channel=%s provider=%s queue_wait=%.3fs "
+                    "message_to_audio_s=%.3f queue_to_audio_s=%.3f",
+                    job.voice_channel.guild.id, job.voice_channel.id,
+                    prepared.provider or "?", pickup_ts - job.queued_at,
+                    first_ts - job.message_ts, first_ts - job.queued_at,
+                )
+        if total == 0:
+            return
+        await source.wait_until_drained()
+        log.info(
+            "Playback finished guild=%s channel=%s frames=%d total_since_queue=%.3fs",
+            job.voice_channel.guild.id, job.voice_channel.id, total,
+            time.perf_counter() - job.queued_at,
+        )
+        self.schedule_continuous_idle_stop(job.voice_channel.guild)
+        self.schedule_idle_disconnect(job.voice_channel.guild)
 
     async def tts_worker(self) -> None:
         await self.wait_until_ready()
