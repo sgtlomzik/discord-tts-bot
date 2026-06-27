@@ -231,7 +231,7 @@ def register_in_catalog(voice_id: str, description: str = "") -> None:
             vr.VoiceRecord(
                 name=name,
                 label=f"{voice_id} (клон)",
-                description=description or "Клон, создан clone_voice.py. # TODO: clone keepalive (7-day TTL)",
+                description=description or "Клон, создан clone_voice.py",
                 provider=vr.PROVIDER_MINIMAX,
                 minimax=vr.MiniMaxParams(voice_id=voice_id),
             )

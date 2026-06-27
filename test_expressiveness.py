@@ -8,7 +8,6 @@ stale audio, and the /voicebot voice-tune command surface.
 from __future__ import annotations
 
 import importlib.util
-import tempfile
 import types
 import unittest
 from pathlib import Path

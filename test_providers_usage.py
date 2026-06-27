@@ -5,7 +5,6 @@ counter that survives across calls (resets only on process restart).
 
 from __future__ import annotations
 
-import json
 import unittest
 from pathlib import Path
 

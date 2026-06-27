@@ -10,14 +10,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-import voice_registry as vr
 from test_bot import load_bot_module
 from test_bot_streaming import (
     FakeSource,
     _MP3,
     _chunks,
     _minimax_voice,
-    _piper_voice,
 )
 from tts_providers import TTSCacheConfig, TTSPhraseCache
 

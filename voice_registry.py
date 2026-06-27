@@ -24,7 +24,7 @@ import logging
 import os
 import re
 import tempfile
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -321,7 +321,8 @@ def seed_registry(
         voices[seed_name] = VoiceRecord(
             name=seed_name,
             label=f"{minimax_voice_id} (MiniMax)",
-            description="Сид из MINIMAX_VOICE_ID. # TODO: clone keepalive (7-day TTL)",
+            # TODO: clone keepalive (7-day TTL) — re-validate cloned voices periodically.
+            description="Сид из MINIMAX_VOICE_ID",
             provider=PROVIDER_MINIMAX,
             minimax=MiniMaxParams(
                 voice_id=minimax_voice_id,

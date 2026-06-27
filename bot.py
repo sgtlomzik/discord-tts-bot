@@ -191,13 +191,13 @@ def parse_custom_emoji_arg(value: str, guild) -> tuple[str, str] | None:
     if short and guild is not None:
         name = short.group(1)
         emojis = getattr(guild, "emojis", ()) or ()
-        for emoji in emojis:  # exact match first
-            if emoji.name == name:
-                return str(emoji.id), emoji.name
+        for guild_emoji in emojis:  # exact match first
+            if guild_emoji.name == name:
+                return str(guild_emoji.id), guild_emoji.name
         lowered = name.lower()
-        for emoji in emojis:  # then case-insensitive
-            if emoji.name.lower() == lowered:
-                return str(emoji.id), emoji.name
+        for guild_emoji in emojis:  # then case-insensitive
+            if guild_emoji.name.lower() == lowered:
+                return str(guild_emoji.id), guild_emoji.name
     return None
 
 
@@ -654,18 +654,6 @@ def load_opus() -> bool:
     discord.opus.load_opus(opus_path)
     log.info("Opus loaded: %s", opus_path)
     return discord.opus.is_loaded()
-
-
-def process_text(text: str) -> str:
-    text = re.sub(r"http[s]?://\S+", "", text)
-
-    def replace_emoji(match: re.Match[str]) -> str:
-        return EMOJI_MAP.get(match.group(1), "")
-
-    text = re.sub(r"<a?:([a-zA-Z0-9_]+):[0-9]+>", replace_emoji, text)
-    text = text.replace("\n", ". ")
-    text = " ".join(text.split())
-    return text.strip()
 
 
 # Single source of truth for the cleanup applied just before handing

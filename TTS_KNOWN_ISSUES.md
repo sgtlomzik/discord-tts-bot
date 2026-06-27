@@ -1,28 +1,32 @@
 # TTS Known Issues
 
-Current problems observed in logs and manual checks:
+Problem tracker — observations from logs and manual checks. This file holds
+no code; it just records what to look at next. Last reviewed: 2026-06-27.
 
-1. Voice connect sometimes races with itself.
-   - `Already connected to a voice channel`
-   - Seen when a new TTS request arrives while the bot is still in the middle of connecting.
+## Open / to re-verify
 
-2. Startup and playback latency are still high.
-   - Short messages usually start in about 4.8s to 7.5s after queueing.
-   - Longer messages can take 18s to 24s end-to-end.
-   - The biggest cost is still TTS generation plus voice connect / handshake.
+1. Voice connect can race with itself.
+   - `Already connected to a voice channel`, seen when a new TTS request
+     arrives while the bot is still connecting to a channel.
 
-3. Auto-connect can time out.
-   - `Auto-connect failed ... TimeoutError`
-   - This appears after repeated voice handshake retries.
+2. Auto-connect can time out.
+   - `Auto-connect failed ... TimeoutError`, after repeated voice handshake
+     retries.
 
-4. Long messages are expensive.
-   - In logs, a 75kB temp audio file took noticeably longer to generate and play.
-   - This makes the latency problem much worse for longer inputs.
+Both were observed historically; re-confirm against current logs before
+spending time on them.
 
-5. Need a clean post-beta comparison.
-   - Stable `master` works, but the beta branch has different voice behavior.
-   - Future fixes should be tested against both branches before merging.
+## Latency (context, largely addressed)
 
-Notes:
-- This file is only a problem tracker.
-- No code changes are included here.
+Earlier measurements showed short messages starting ~4.8–7.5s after queueing
+and long messages 18–24s end-to-end, dominated by MiniMax generation plus the
+voice connect/handshake. Those numbers predate the streaming, on-disk repeat
+cache and prefetch pipeline now in `master`, which cut time-to-first-audio
+and let generation run ahead of playback. Re-measure on a live burst before
+treating the old figures as current.
+
+## Notes
+
+- All work is consolidated on `master` (the former `beta` and feature
+  branches were merged in and deleted) — the old "compare against beta" item
+  no longer applies.
