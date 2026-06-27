@@ -164,6 +164,76 @@ CUSTOM_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]+):(\d+)>")
 MENTION_RE = re.compile(r"<@!?\d+>|<@&\d+>|<#\d+>")
 URL_RE = re.compile(r"https?://\S+|www\.\S+")
 DISCORD_TOKEN_RE = re.compile(r"(<a?:[A-Za-z0-9_]+:\d+>|<@!?\d+>|<@&\d+>|<#\d+>|https?://\S+|www\.\S+)")
+# A bare shortcode the way a user might type it into a slash-command arg.
+SHORTCODE_RE = re.compile(r"^:([A-Za-z0-9_]+):$")
+# Upper bound on an emoji pronunciation; long enough for a phrase, short
+# enough that a single emoji can't smuggle a wall of text into synthesis.
+EMOJI_PRONUNCIATION_MAX = 100
+
+
+def parse_custom_emoji_arg(value: str, guild) -> tuple[str, str] | None:
+    """Resolve a custom emoji given in a slash-command string arg.
+
+    Accepts a ready token ``<:name:id>`` / ``<a:name:id>`` (animated and
+    static share one id-space) or a bare ``:name:`` that is resolved against
+    the guild's emojis. Returns ``(emoji_id, name)`` keyed by the globally
+    unique, stable **id**. Returns ``None`` for a unicode emoji or plain
+    text — the caller rejects those with a clear message.
+    """
+    if not value:
+        return None
+    value = value.strip()
+    token = CUSTOM_EMOJI_RE.search(value)
+    if token:
+        return token.group(2), token.group(1)
+    short = SHORTCODE_RE.match(value)
+    if short and guild is not None:
+        name = short.group(1)
+        emojis = getattr(guild, "emojis", ()) or ()
+        for emoji in emojis:  # exact match first
+            if emoji.name == name:
+                return str(emoji.id), emoji.name
+        lowered = name.lower()
+        for emoji in emojis:  # then case-insensitive
+            if emoji.name.lower() == lowered:
+                return str(emoji.id), emoji.name
+    return None
+
+
+def sanitize_pronunciation(text: str, *, max_chars: int = EMOJI_PRONUNCIATION_MAX) -> str | None:
+    """Clean a user-supplied pronunciation before storing it.
+
+    Strips nested Discord tokens (so an alias can't smuggle more emoji or
+    mentions), removes control characters, collapses whitespace and caps the
+    length. Returns ``None`` when nothing speakable is left.
+    """
+    if not text:
+        return None
+    text = DISCORD_TOKEN_RE.sub(" ", text)
+    text = "".join(ch for ch in text if ch == " " or unicodedata.category(ch)[0] != "C")
+    text = " ".join(text.split()).strip()
+    if not text:
+        return None
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip()
+    return text or None
+
+
+def substitute_emoji_aliases(text: str, aliases: dict[str, str]) -> str:
+    """Replace custom-emoji tokens whose id has an alias with its spoken word.
+
+    The word is padded with spaces so neighbours don't fuse (``да<:Kekis:1>``
+    -> ``да кекис``). Tokens without an alias are left untouched for the
+    normal stripping step to remove (default = silence).
+    """
+    if not text or not aliases:
+        return text
+
+    def _repl(match: re.Match[str]) -> str:
+        say = aliases.get(match.group(2))
+        return f" {say} " if say else match.group(0)
+
+    return CUSTOM_EMOJI_RE.sub(_repl, text)
 
 
 def parse_user_ids(value: str) -> set[int]:
@@ -322,6 +392,11 @@ class BotConfigStore:
         # the store without a registry working unchanged).
         self.voice_registry = voice_registry
         self.guilds: dict[int, GuildConfig] = {}
+        # Custom-emoji pronunciation aliases, keyed by emoji id (globally
+        # unique, stable). Value: {"name": <display name>, "say": <spoken>}.
+        # TODO(per-guild): aliases are global for now (like voice clones);
+        # key by guild_id when per-guild pronunciations are needed.
+        self.emoji_aliases: dict[str, dict[str, str]] = {}
         self.load()
 
     def _is_valid_voice(self, name: str) -> bool:
@@ -367,6 +442,22 @@ class BotConfigStore:
                 user_voices=user_voices,
             )
 
+        raw_aliases = data.get("emoji_aliases", {}) if isinstance(data, dict) else {}
+        emoji_aliases: dict[str, dict[str, str]] = {}
+        if isinstance(raw_aliases, dict):
+            for emoji_id, entry in raw_aliases.items():
+                if not str(emoji_id).isdigit() or not isinstance(entry, dict):
+                    continue
+                say = entry.get("say")
+                if not isinstance(say, str) or not say.strip():
+                    continue
+                name = entry.get("name")
+                emoji_aliases[str(emoji_id)] = {
+                    "name": name if isinstance(name, str) else "",
+                    "say": say,
+                }
+        self.emoji_aliases = emoji_aliases
+
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
@@ -382,6 +473,10 @@ class BotConfigStore:
                     },
                 }
                 for guild_id, config in sorted(self.guilds.items())
+            },
+            "emoji_aliases": {
+                emoji_id: {"name": entry.get("name", ""), "say": entry.get("say", "")}
+                for emoji_id, entry in sorted(self.emoji_aliases.items())
             },
         }
         with tempfile.NamedTemporaryFile(
@@ -437,6 +532,21 @@ class BotConfigStore:
     def voice_for_user(self, guild_id: int, user_id: int) -> str:
         config = self.get_guild(guild_id)
         return config.user_voices.get(user_id, config.default_voice)
+
+    def emoji_say_map(self) -> dict[str, str]:
+        """id -> spoken word, for substitution during normalization."""
+        return {emoji_id: entry["say"] for emoji_id, entry in self.emoji_aliases.items()}
+
+    def set_emoji_alias(self, emoji_id: str, name: str, say: str) -> None:
+        self.emoji_aliases[str(emoji_id)] = {"name": name, "say": say}
+        self.save()
+
+    def remove_emoji_alias(self, emoji_id: str) -> bool:
+        existed = str(emoji_id) in self.emoji_aliases
+        self.emoji_aliases.pop(str(emoji_id), None)
+        if existed:
+            self.save()
+        return existed
 
 intents = discord.Intents.default()
 intents.message_content = True
