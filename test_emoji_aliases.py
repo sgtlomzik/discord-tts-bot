@@ -240,6 +240,44 @@ class MergeAnalysisTests(unittest.TestCase):
         self.assertTrue(parsed.is_custom_emoji_only)
 
 
+class UnicodeEmojiTests(unittest.TestCase):
+    def _clean(self, s):
+        return " ".join(bot.speak_unicode_emoji(s).split())
+
+    def test_named_in_russian(self):
+        self.assertEqual(self._clean("😂"), "смеется до слез")
+        self.assertEqual(self._clean("🔥"), "огонь")
+
+    def test_sequence_emoji(self):
+        # multi-codepoint emoji resolve as one unit
+        self.assertEqual(self._clean("❤️"), "алое сердце")
+        self.assertEqual(self._clean("🇷🇺"), "флаг Россия")
+
+    def test_plain_text_untouched(self):
+        self.assertEqual(self._clean("обычный текст"), "обычный текст")
+
+    def test_user_underscores_preserved(self):
+        # only emoji names get underscores->spaces, never user text
+        self.assertEqual(self._clean("люблю_тебя 👍"), "люблю_тебя большой палец вверх")
+
+    def test_normalize_speaks_unicode_emoji(self):
+        self.assertEqual(bot.normalize_for_tts("да😂"), "да смеется до слез")
+
+    def test_normalize_mixes_custom_alias_and_unicode(self):
+        out = bot.normalize_for_tts("<:K:1>🔥", emoji_aliases={"1": "кек"})
+        self.assertEqual(out, "кек огонь")
+
+    def test_strip_for_speech_speaks_unicode(self):
+        self.assertEqual(
+            bot._strip_discord_tokens_for_speech("привет🎉", {}), "привет хлопушка"
+        )
+
+    def test_unicode_emoji_only_message_is_spoken(self):
+        parsed = bot.analyze_message_for_merge("😎")
+        self.assertEqual(parsed.spoken_text, "лицо в темных очках")
+        self.assertTrue(parsed.is_unicode_emoji_only)
+
+
 class CacheKeyTests(unittest.TestCase):
     def test_changing_alias_changes_cache_key(self):
         from tts_providers import TTSPhraseCache

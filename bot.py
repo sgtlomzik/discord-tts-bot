@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import discord
+import emoji
 from discord import app_commands
 from discord.ext import commands
 
@@ -234,6 +235,36 @@ def substitute_emoji_aliases(text: str, aliases: dict[str, str]) -> str:
         return f" {say} " if say else match.group(0)
 
     return CUSTOM_EMOJI_RE.sub(_repl, text)
+
+
+def speak_unicode_emoji(text: str) -> str:
+    """Replace standard Unicode emoji with their Russian names so the bot
+    reads them aloud (😂 -> "смеется до слез", 🇷🇺 -> "флаг Россия").
+
+    Each emoji is named individually via its position, so underscores in the
+    surrounding user text (``люблю_тебя``) are never touched. Skin-tone
+    modifiers, flags and ZWJ sequences (families) resolve as one unit. Falls
+    back to the English name for the rare emoji without a Russian translation;
+    leaves the emoji as-is only if it has no name at all.
+    """
+    if not text:
+        return text
+    matches = emoji.emoji_list(text)
+    if not matches:
+        return text
+    out: list[str] = []
+    last = 0
+    for match in matches:
+        out.append(text[last : match["match_start"]])
+        char = match["emoji"]
+        name = emoji.demojize(char, language="ru", delimiters=("", ""))
+        if name == char:  # no Russian name; try English
+            name = emoji.demojize(char, language="en", delimiters=("", ""))
+        name = name.replace("_", " ").strip()
+        out.append(f" {name} " if name and name != char else " ")
+        last = match["match_end"]
+    out.append(text[last:])
+    return "".join(out)
 
 
 def parse_user_ids(value: str) -> set[int]:
@@ -613,6 +644,8 @@ def normalize_for_tts(
         text = substitute_emoji_aliases(text, emoji_aliases)
     # Custom emoji: <:name:id> and <a:name:id>
     text = re.sub(r"<a?:\w+:\d+>", " ", text)
+    # Standard Unicode emoji -> spoken Russian names
+    text = speak_unicode_emoji(text)
     # User/role mentions
     text = re.sub(r"<@!?\d+>", " ", text)
     text = re.sub(r"<@&\d+>", " ", text)
@@ -670,6 +703,7 @@ def _strip_discord_tokens_for_speech(
         return f" {EMOJI_MAP.get(m.group(1), '')} "
 
     text = CUSTOM_EMOJI_RE.sub(_emoji_repl, raw_text)
+    text = speak_unicode_emoji(text)
     text = MENTION_RE.sub(" ", text)
     text = URL_RE.sub(" ", text)
     text = text.replace("\n", ". ")
