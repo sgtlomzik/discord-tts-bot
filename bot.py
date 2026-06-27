@@ -237,6 +237,63 @@ def substitute_emoji_aliases(text: str, aliases: dict[str, str]) -> str:
     return CUSTOM_EMOJI_RE.sub(_repl, text)
 
 
+# Mention tokens with a capturing id group, for resolving to a spoken name.
+MENTION_ID_RE = re.compile(r"<@!?(\d+)>|<@&(\d+)>|<#(\d+)>")
+
+
+def build_mention_say_map(message: discord.Message) -> dict[str, str]:
+    """Map mentioned ids -> spoken name from a live message's resolved
+    mention lists: users by display name (nickname), roles by name, channels
+    as "канал <name>". Keyed by id so it survives later renames.
+    """
+    say: dict[str, str] = {}
+    for user in getattr(message, "mentions", ()) or ():
+        say[str(user.id)] = getattr(user, "display_name", None) or user.name
+    for role in getattr(message, "role_mentions", ()) or ():
+        say[str(role.id)] = role.name
+    for channel in getattr(message, "channel_mentions", ()) or ():
+        say[str(channel.id)] = f"канал {channel.name}"
+    return say
+
+
+def build_mention_say_map_from_guild(text: str, guild) -> dict[str, str]:
+    """Resolve only the mention tokens present in ``text`` against a guild —
+    used on the /voicebot test path, where there is no message object."""
+    if not text or guild is None:
+        return {}
+    say: dict[str, str] = {}
+    for match in MENTION_ID_RE.finditer(text):
+        if match.group(1):
+            member = guild.get_member(int(match.group(1)))
+            if member is not None:
+                say[match.group(1)] = getattr(member, "display_name", None) or member.name
+        elif match.group(2):
+            role = guild.get_role(int(match.group(2)))
+            if role is not None:
+                say[match.group(2)] = role.name
+        elif match.group(3):
+            channel = guild.get_channel(int(match.group(3)))
+            if channel is not None:
+                say[match.group(3)] = f"канал {channel.name}"
+    return say
+
+
+def resolve_mentions(text: str, mention_names: dict[str, str]) -> str:
+    """Replace mention tokens with their spoken name (space-padded). Tokens
+    without a resolved name are left untouched for the normal stripping step
+    to remove — so unresolved mentions stay silent, as before.
+    """
+    if not text or not mention_names:
+        return text
+
+    def _repl(match: re.Match[str]) -> str:
+        mention_id = match.group(1) or match.group(2) or match.group(3)
+        name = mention_names.get(mention_id)
+        return f" {name} " if name else match.group(0)
+
+    return MENTION_ID_RE.sub(_repl, text)
+
+
 def speak_unicode_emoji(text: str) -> str:
     """Replace standard Unicode emoji with their Russian names so the bot
     reads them aloud (😂 -> "смеется до слез", 🇷🇺 -> "флаг Россия").
@@ -620,6 +677,7 @@ def normalize_for_tts(
     *,
     max_chars: int | None = None,
     emoji_aliases: dict[str, str] | None = None,
+    mentions: dict[str, str] | None = None,
 ) -> str | None:
     """Strip Discord markup from a message and prepare it for synthesis.
 
@@ -646,6 +704,9 @@ def normalize_for_tts(
     text = re.sub(r"<a?:\w+:\d+>", " ", text)
     # Standard Unicode emoji -> spoken Russian names
     text = speak_unicode_emoji(text)
+    # Mentions -> spoken name; unresolved tokens fall through to stripping
+    if mentions:
+        text = resolve_mentions(text, mentions)
     # User/role mentions
     text = re.sub(r"<@!?\d+>", " ", text)
     text = re.sub(r"<@&\d+>", " ", text)
@@ -690,7 +751,9 @@ def _is_keyboard_smash_word(word: str) -> bool:
 
 
 def _strip_discord_tokens_for_speech(
-    raw_text: str, aliases: dict[str, str] | None = None
+    raw_text: str,
+    aliases: dict[str, str] | None = None,
+    mentions: dict[str, str] | None = None,
 ) -> str:
     aliases = aliases or {}
 
@@ -704,6 +767,8 @@ def _strip_discord_tokens_for_speech(
 
     text = CUSTOM_EMOJI_RE.sub(_emoji_repl, raw_text)
     text = speak_unicode_emoji(text)
+    if mentions:
+        text = resolve_mentions(text, mentions)
     text = MENTION_RE.sub(" ", text)
     text = URL_RE.sub(" ", text)
     text = text.replace("\n", ". ")
@@ -712,11 +777,13 @@ def _strip_discord_tokens_for_speech(
 
 
 def analyze_message_for_merge(
-    raw_text: str, aliases: dict[str, str] | None = None
+    raw_text: str,
+    aliases: dict[str, str] | None = None,
+    mentions: dict[str, str] | None = None,
 ) -> ParsedMessage:
     raw_text = raw_text or ""
     raw_length = len(raw_text)
-    spoken_text = _strip_discord_tokens_for_speech(raw_text, aliases)
+    spoken_text = _strip_discord_tokens_for_speech(raw_text, aliases, mentions)
     custom_tokens = list(CUSTOM_EMOJI_RE.finditer(raw_text))
     mention_tokens = list(MENTION_RE.finditer(raw_text))
     url_tokens = list(URL_RE.finditer(raw_text))
@@ -750,7 +817,9 @@ def analyze_message_for_merge(
     if is_url_only and TTS_SELECTIVE_HOLD_DROP_URL_ONLY:
         spoken_text = ""
         effective_length = 0
-    if is_mention_only and TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY:
+    # A bare mention now resolves to a name (feature: read mentions aloud), so
+    # only drop a mention-only message when nothing resolved (e.g. unknown id).
+    if is_mention_only and TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY and not spoken_text:
         spoken_text = ""
         effective_length = 0
     return ParsedMessage(
@@ -1663,10 +1732,13 @@ class TTSBot(commands.Bot):
         voice_channel: discord.VoiceChannel,
         author_id: int,
         text_channel_id: int,
+        mentions: dict[str, str] | None = None,
     ) -> None:
         key = (author_id, voice_channel.id)
         now = time.perf_counter()
-        parsed = analyze_message_for_merge(text, self.config_store.emoji_say_map())
+        parsed = analyze_message_for_merge(
+            text, self.config_store.emoji_say_map(), mentions
+        )
         previous_ts = self.last_user_message_ts.get(key)
         gap_prev_ms = None if previous_ts is None else round((now - previous_ts) * 1000)
         self.last_user_message_ts[key] = now
@@ -2856,6 +2928,7 @@ async def on_message(message: discord.Message) -> None:
             message.author.voice.channel,
             message.author.id,
             message.channel.id,
+            mentions=build_mention_say_map(message),
         )
 
     await bot.process_commands(message)
@@ -3405,7 +3478,11 @@ async def slash_tts_test(
             ephemeral=True,
         )
         return
-    final_text = normalize_for_tts(text, emoji_aliases=bot.config_store.emoji_say_map()) or ""
+    final_text = normalize_for_tts(
+        text,
+        emoji_aliases=bot.config_store.emoji_say_map(),
+        mentions=build_mention_say_map_from_guild(text, interaction.guild),
+    ) or ""
     if not final_text:
         await interaction.response.send_message("Нет текста для озвучки.", ephemeral=True)
         return
