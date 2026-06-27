@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import discord
+import emoji
 from discord import app_commands
 from discord.ext import commands
 
@@ -164,6 +165,163 @@ CUSTOM_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]+):(\d+)>")
 MENTION_RE = re.compile(r"<@!?\d+>|<@&\d+>|<#\d+>")
 URL_RE = re.compile(r"https?://\S+|www\.\S+")
 DISCORD_TOKEN_RE = re.compile(r"(<a?:[A-Za-z0-9_]+:\d+>|<@!?\d+>|<@&\d+>|<#\d+>|https?://\S+|www\.\S+)")
+# A bare shortcode the way a user might type it into a slash-command arg.
+SHORTCODE_RE = re.compile(r"^:([A-Za-z0-9_]+):$")
+# Upper bound on an emoji pronunciation; long enough for a phrase, short
+# enough that a single emoji can't smuggle a wall of text into synthesis.
+EMOJI_PRONUNCIATION_MAX = 100
+
+
+def parse_custom_emoji_arg(value: str, guild) -> tuple[str, str] | None:
+    """Resolve a custom emoji given in a slash-command string arg.
+
+    Accepts a ready token ``<:name:id>`` / ``<a:name:id>`` (animated and
+    static share one id-space) or a bare ``:name:`` that is resolved against
+    the guild's emojis. Returns ``(emoji_id, name)`` keyed by the globally
+    unique, stable **id**. Returns ``None`` for a unicode emoji or plain
+    text — the caller rejects those with a clear message.
+    """
+    if not value:
+        return None
+    value = value.strip()
+    token = CUSTOM_EMOJI_RE.search(value)
+    if token:
+        return token.group(2), token.group(1)
+    short = SHORTCODE_RE.match(value)
+    if short and guild is not None:
+        name = short.group(1)
+        emojis = getattr(guild, "emojis", ()) or ()
+        for emoji in emojis:  # exact match first
+            if emoji.name == name:
+                return str(emoji.id), emoji.name
+        lowered = name.lower()
+        for emoji in emojis:  # then case-insensitive
+            if emoji.name.lower() == lowered:
+                return str(emoji.id), emoji.name
+    return None
+
+
+def sanitize_pronunciation(text: str, *, max_chars: int = EMOJI_PRONUNCIATION_MAX) -> str | None:
+    """Clean a user-supplied pronunciation before storing it.
+
+    Strips nested Discord tokens (so an alias can't smuggle more emoji or
+    mentions), removes control characters, collapses whitespace and caps the
+    length. Returns ``None`` when nothing speakable is left.
+    """
+    if not text:
+        return None
+    text = DISCORD_TOKEN_RE.sub(" ", text)
+    text = "".join(ch for ch in text if ch == " " or unicodedata.category(ch)[0] != "C")
+    text = " ".join(text.split()).strip()
+    if not text:
+        return None
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip()
+    return text or None
+
+
+def substitute_emoji_aliases(text: str, aliases: dict[str, str]) -> str:
+    """Replace custom-emoji tokens whose id has an alias with its spoken word.
+
+    The word is padded with spaces so neighbours don't fuse (``да<:Kekis:1>``
+    -> ``да кекис``). Tokens without an alias are left untouched for the
+    normal stripping step to remove (default = silence).
+    """
+    if not text or not aliases:
+        return text
+
+    def _repl(match: re.Match[str]) -> str:
+        say = aliases.get(match.group(2))
+        return f" {say} " if say else match.group(0)
+
+    return CUSTOM_EMOJI_RE.sub(_repl, text)
+
+
+# Mention tokens with a capturing id group, for resolving to a spoken name.
+MENTION_ID_RE = re.compile(r"<@!?(\d+)>|<@&(\d+)>|<#(\d+)>")
+
+
+def build_mention_say_map(message: discord.Message) -> dict[str, str]:
+    """Map mentioned ids -> spoken name from a live message's resolved
+    mention lists: users by display name (nickname), roles by name, channels
+    as "канал <name>". Keyed by id so it survives later renames.
+    """
+    say: dict[str, str] = {}
+    for user in getattr(message, "mentions", ()) or ():
+        say[str(user.id)] = getattr(user, "display_name", None) or user.name
+    for role in getattr(message, "role_mentions", ()) or ():
+        say[str(role.id)] = role.name
+    for channel in getattr(message, "channel_mentions", ()) or ():
+        say[str(channel.id)] = f"канал {channel.name}"
+    return say
+
+
+def build_mention_say_map_from_guild(text: str, guild) -> dict[str, str]:
+    """Resolve only the mention tokens present in ``text`` against a guild —
+    used on the /voicebot test path, where there is no message object."""
+    if not text or guild is None:
+        return {}
+    say: dict[str, str] = {}
+    for match in MENTION_ID_RE.finditer(text):
+        if match.group(1):
+            member = guild.get_member(int(match.group(1)))
+            if member is not None:
+                say[match.group(1)] = getattr(member, "display_name", None) or member.name
+        elif match.group(2):
+            role = guild.get_role(int(match.group(2)))
+            if role is not None:
+                say[match.group(2)] = role.name
+        elif match.group(3):
+            channel = guild.get_channel(int(match.group(3)))
+            if channel is not None:
+                say[match.group(3)] = f"канал {channel.name}"
+    return say
+
+
+def resolve_mentions(text: str, mention_names: dict[str, str]) -> str:
+    """Replace mention tokens with their spoken name (space-padded). Tokens
+    without a resolved name are left untouched for the normal stripping step
+    to remove — so unresolved mentions stay silent, as before.
+    """
+    if not text or not mention_names:
+        return text
+
+    def _repl(match: re.Match[str]) -> str:
+        mention_id = match.group(1) or match.group(2) or match.group(3)
+        name = mention_names.get(mention_id)
+        return f" {name} " if name else match.group(0)
+
+    return MENTION_ID_RE.sub(_repl, text)
+
+
+def speak_unicode_emoji(text: str) -> str:
+    """Replace standard Unicode emoji with their Russian names so the bot
+    reads them aloud (😂 -> "смеется до слез", 🇷🇺 -> "флаг Россия").
+
+    Each emoji is named individually via its position, so underscores in the
+    surrounding user text (``люблю_тебя``) are never touched. Skin-tone
+    modifiers, flags and ZWJ sequences (families) resolve as one unit. Falls
+    back to the English name for the rare emoji without a Russian translation;
+    leaves the emoji as-is only if it has no name at all.
+    """
+    if not text:
+        return text
+    matches = emoji.emoji_list(text)
+    if not matches:
+        return text
+    out: list[str] = []
+    last = 0
+    for match in matches:
+        out.append(text[last : match["match_start"]])
+        char = match["emoji"]
+        name = emoji.demojize(char, language="ru", delimiters=("", ""))
+        if name == char:  # no Russian name; try English
+            name = emoji.demojize(char, language="en", delimiters=("", ""))
+        name = name.replace("_", " ").strip()
+        out.append(f" {name} " if name and name != char else " ")
+        last = match["match_end"]
+    out.append(text[last:])
+    return "".join(out)
 
 
 def parse_user_ids(value: str) -> set[int]:
@@ -322,6 +480,11 @@ class BotConfigStore:
         # the store without a registry working unchanged).
         self.voice_registry = voice_registry
         self.guilds: dict[int, GuildConfig] = {}
+        # Custom-emoji pronunciation aliases, keyed by emoji id (globally
+        # unique, stable). Value: {"name": <display name>, "say": <spoken>}.
+        # TODO(per-guild): aliases are global for now (like voice clones);
+        # key by guild_id when per-guild pronunciations are needed.
+        self.emoji_aliases: dict[str, dict[str, str]] = {}
         self.load()
 
     def _is_valid_voice(self, name: str) -> bool:
@@ -367,6 +530,22 @@ class BotConfigStore:
                 user_voices=user_voices,
             )
 
+        raw_aliases = data.get("emoji_aliases", {}) if isinstance(data, dict) else {}
+        emoji_aliases: dict[str, dict[str, str]] = {}
+        if isinstance(raw_aliases, dict):
+            for emoji_id, entry in raw_aliases.items():
+                if not str(emoji_id).isdigit() or not isinstance(entry, dict):
+                    continue
+                say = entry.get("say")
+                if not isinstance(say, str) or not say.strip():
+                    continue
+                name = entry.get("name")
+                emoji_aliases[str(emoji_id)] = {
+                    "name": name if isinstance(name, str) else "",
+                    "say": say,
+                }
+        self.emoji_aliases = emoji_aliases
+
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
@@ -382,6 +561,10 @@ class BotConfigStore:
                     },
                 }
                 for guild_id, config in sorted(self.guilds.items())
+            },
+            "emoji_aliases": {
+                emoji_id: {"name": entry.get("name", ""), "say": entry.get("say", "")}
+                for emoji_id, entry in sorted(self.emoji_aliases.items())
             },
         }
         with tempfile.NamedTemporaryFile(
@@ -438,6 +621,21 @@ class BotConfigStore:
         config = self.get_guild(guild_id)
         return config.user_voices.get(user_id, config.default_voice)
 
+    def emoji_say_map(self) -> dict[str, str]:
+        """id -> spoken word, for substitution during normalization."""
+        return {emoji_id: entry["say"] for emoji_id, entry in self.emoji_aliases.items()}
+
+    def set_emoji_alias(self, emoji_id: str, name: str, say: str) -> None:
+        self.emoji_aliases[str(emoji_id)] = {"name": name, "say": say}
+        self.save()
+
+    def remove_emoji_alias(self, emoji_id: str) -> bool:
+        existed = str(emoji_id) in self.emoji_aliases
+        self.emoji_aliases.pop(str(emoji_id), None)
+        if existed:
+            self.save()
+        return existed
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -474,7 +672,13 @@ def process_text(text: str) -> str:
 # text to either TTS provider. Returns None when there is nothing
 # speakable left, so the caller can drop the message entirely
 # (matches the spec: 186/3358 messages were empty after cleanup).
-def normalize_for_tts(raw: str, *, max_chars: int | None = None) -> str | None:
+def normalize_for_tts(
+    raw: str,
+    *,
+    max_chars: int | None = None,
+    emoji_aliases: dict[str, str] | None = None,
+    mentions: dict[str, str] | None = None,
+) -> str | None:
     """Strip Discord markup from a message and prepare it for synthesis.
 
     Removes:
@@ -492,8 +696,17 @@ def normalize_for_tts(raw: str, *, max_chars: int | None = None) -> str | None:
         return None
     text = raw
 
+    # Emoji aliases first: turn aliased custom emoji into their spoken word
+    # *before* the strip regex removes the rest. Unaliased emoji stay silent.
+    if emoji_aliases:
+        text = substitute_emoji_aliases(text, emoji_aliases)
     # Custom emoji: <:name:id> and <a:name:id>
     text = re.sub(r"<a?:\w+:\d+>", " ", text)
+    # Standard Unicode emoji -> spoken Russian names
+    text = speak_unicode_emoji(text)
+    # Mentions -> spoken name; unresolved tokens fall through to stripping
+    if mentions:
+        text = resolve_mentions(text, mentions)
     # User/role mentions
     text = re.sub(r"<@!?\d+>", " ", text)
     text = re.sub(r"<@&\d+>", " ", text)
@@ -537,8 +750,25 @@ def _is_keyboard_smash_word(word: str) -> bool:
     return unique_chars <= 3 and len(cleaned) >= 5
 
 
-def _strip_discord_tokens_for_speech(raw_text: str) -> str:
-    text = CUSTOM_EMOJI_RE.sub(lambda m: f" {EMOJI_MAP.get(m.group(1), '')} ", raw_text)
+def _strip_discord_tokens_for_speech(
+    raw_text: str,
+    aliases: dict[str, str] | None = None,
+    mentions: dict[str, str] | None = None,
+) -> str:
+    aliases = aliases or {}
+
+    def _emoji_repl(m: re.Match[str]) -> str:
+        # id-keyed alias wins over the legacy name-keyed EMOJI_MAP fallback;
+        # an emoji with neither becomes silence, as before.
+        say = aliases.get(m.group(2))
+        if say:
+            return f" {say} "
+        return f" {EMOJI_MAP.get(m.group(1), '')} "
+
+    text = CUSTOM_EMOJI_RE.sub(_emoji_repl, raw_text)
+    text = speak_unicode_emoji(text)
+    if mentions:
+        text = resolve_mentions(text, mentions)
     text = MENTION_RE.sub(" ", text)
     text = URL_RE.sub(" ", text)
     text = text.replace("\n", ". ")
@@ -546,10 +776,14 @@ def _strip_discord_tokens_for_speech(raw_text: str) -> str:
     return text.strip()
 
 
-def analyze_message_for_merge(raw_text: str) -> ParsedMessage:
+def analyze_message_for_merge(
+    raw_text: str,
+    aliases: dict[str, str] | None = None,
+    mentions: dict[str, str] | None = None,
+) -> ParsedMessage:
     raw_text = raw_text or ""
     raw_length = len(raw_text)
-    spoken_text = _strip_discord_tokens_for_speech(raw_text)
+    spoken_text = _strip_discord_tokens_for_speech(raw_text, aliases, mentions)
     custom_tokens = list(CUSTOM_EMOJI_RE.finditer(raw_text))
     mention_tokens = list(MENTION_RE.finditer(raw_text))
     url_tokens = list(URL_RE.finditer(raw_text))
@@ -583,7 +817,9 @@ def analyze_message_for_merge(raw_text: str) -> ParsedMessage:
     if is_url_only and TTS_SELECTIVE_HOLD_DROP_URL_ONLY:
         spoken_text = ""
         effective_length = 0
-    if is_mention_only and TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY:
+    # A bare mention now resolves to a name (feature: read mentions aloud), so
+    # only drop a mention-only message when nothing resolved (e.g. unknown id).
+    if is_mention_only and TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY and not spoken_text:
         spoken_text = ""
         effective_length = 0
     return ParsedMessage(
@@ -840,6 +1076,7 @@ class ContinuousTTSAudioSource(discord.AudioSource):
 class TTSBot(commands.Bot):
     def __init__(self) -> None:
         super().__init__(command_prefix=("!tts ", "!tts"), intents=intents)
+        self.started_at = time.time()  # process start, for the stats uptime
         self.message_queue: asyncio.Queue[TTSJob] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
         self.worker_task: asyncio.Task[None] | None = None
         # Prefetch pipeline: generation worker fills ready_queue (bounded by
@@ -1295,6 +1532,55 @@ class TTSBot(commands.Bot):
             except OSError:
                 pass
 
+    async def clone_minimax_voice(
+        self,
+        *,
+        name: str,
+        voice_id: str,
+        sample: bytes,
+        filename: str,
+        description: str,
+    ) -> tuple[bool, str]:
+        """Clone ``sample`` on MiniMax, then register + persist the voice.
+
+        Wraps the provider's upload+clone, confirms the fresh clone actually
+        synthesizes (a clone that 'succeeds' but won't speak is useless), then
+        adds the record to the registry and saves data/voices.json. Returns
+        (ok, error_message); on ok the voice ``name`` is ready for
+        voice-set/voice-user. Used by /voicebot voice-clone.
+        """
+        cloud = getattr(self.tts_dispatcher, "cloud", None)
+        if cloud is None:
+            return False, "MiniMax не настроен (нет MINIMAX_API_KEY)."
+        clone = getattr(cloud, "clone_voice", None)
+        if clone is None:
+            return False, "Провайдер не поддерживает клонирование."
+        try:
+            await clone(sample, voice_id=voice_id, filename=filename)
+        except MiniMaxError as exc:
+            return False, f"Ошибка клонирования: {exc}"
+        except Exception as exc:  # network/timeout/decode/etc
+            return False, f"Не удалось клонировать: {type(exc).__name__}: {exc}"
+        # A clone can report success but not yet be usable; confirm it speaks
+        # before we register it so we never persist a dead voice.
+        ok, err = await self.validate_minimax_voice(voice_id)
+        if not ok:
+            return False, f"Клон создан, но не воспроизводится: {err}"
+        record = voice_registry.VoiceRecord(
+            name=name,
+            label=f"{name} (клон)",
+            description=description,
+            provider=voice_registry.PROVIDER_MINIMAX,
+            minimax=voice_registry.MiniMaxParams(voice_id=voice_id),
+        )
+        self.voice_registry.add(record)
+        try:
+            self.persist_voice_registry()
+        except OSError as exc:
+            log.exception("Failed to persist voices.json after voice-clone")
+            return False, f"Голос создан, но не сохранён на диск: {exc}"
+        return True, ""
+
     async def enqueue_tts(
         self,
         text: str,
@@ -1308,7 +1594,11 @@ class TTSBot(commands.Bot):
         # TTS_MAX_CHARS cap is enforced here (300 by default, per spec
         # §"Препроцессинг текста") — it protects the cloud API quota
         # from accidental walls of text and keeps Piper CPU bounded.
-        cleaned = normalize_for_tts(text, max_chars=TTS_MAX_CHARS)
+        cleaned = normalize_for_tts(
+            text,
+            max_chars=TTS_MAX_CHARS,
+            emoji_aliases=self.config_store.emoji_say_map(),
+        )
         if not cleaned:
             log.info(
                 "Skipped TTS enqueue author=%s reason=empty_after_normalize",
@@ -1443,10 +1733,13 @@ class TTSBot(commands.Bot):
         voice_channel: discord.VoiceChannel,
         author_id: int,
         text_channel_id: int,
+        mentions: dict[str, str] | None = None,
     ) -> None:
         key = (author_id, voice_channel.id)
         now = time.perf_counter()
-        parsed = analyze_message_for_merge(text)
+        parsed = analyze_message_for_merge(
+            text, self.config_store.emoji_say_map(), mentions
+        )
         previous_ts = self.last_user_message_ts.get(key)
         gap_prev_ms = None if previous_ts is None else round((now - previous_ts) * 1000)
         self.last_user_message_ts[key] = now
@@ -2636,6 +2929,7 @@ async def on_message(message: discord.Message) -> None:
             message.author.voice.channel,
             message.author.id,
             message.channel.id,
+            mentions=build_mention_say_map(message),
         )
 
     await bot.process_commands(message)
@@ -2901,6 +3195,101 @@ async def slash_tts_voice_add(
     )
 
 
+def _derive_minimax_voice_id(name: str) -> str:
+    """Build a MiniMax-valid voice_id from a kebab-case profile name.
+
+    MiniMax requires a voice_id of >=8 chars containing at least one letter
+    AND one digit, and rejects dashes (2013 invalid params). We strip the
+    name to alphanumerics (no dashes), make sure it starts with a letter,
+    then append digits derived from a uuid — guaranteeing both a digit and
+    uniqueness so a re-clone never silently overwrites a previous voice.
+    """
+    base = re.sub(r"[^a-z0-9]", "", name.lower())
+    if not base or not base[0].isalpha():
+        base = "voice" + base
+    base = base[:16]
+    suffix = str(uuid.uuid4().int)[:4]  # always digits
+    vid = base + suffix
+    if len(vid) < 8:
+        vid = (vid + "00000000")[:8]
+    return vid
+
+
+@tts_group.command(name="voice-clone", description="Клонировать голос из аудиофайла")
+@app_commands.describe(
+    name="Имя профиля (kebab-case: a-z, 0-9, дефис)",
+    sample="Аудиосэмпл (mp3/m4a/wav, 10 сек–5 мин, до 20 МБ)",
+    description="Описание (необязательно)",
+)
+async def slash_tts_voice_clone(
+    interaction: discord.Interaction,
+    name: str,
+    sample: discord.Attachment,
+    description: str = "",
+) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    name = name.strip().lower()
+    if not voice_registry.valid_voice_name(name):
+        await interaction.response.send_message(
+            "Имя должно быть в kebab-case: строчные буквы, цифры и дефис, "
+            "начинаться с буквы или цифры (например `serega-pirat`).",
+            ephemeral=True,
+        )
+        return
+    if name in bot.voice_registry:
+        await interaction.response.send_message(
+            f"Голос `{name}` уже существует. Выберите другое имя.", ephemeral=True
+        )
+        return
+    if sample.size > 20 * 1024 * 1024:
+        await interaction.response.send_message(
+            f"Файл {sample.size / 1024 / 1024:.1f} МБ — лимит MiniMax 20 МБ.",
+            ephemeral=True,
+        )
+        return
+    ctype = (sample.content_type or "").lower()
+    fname = sample.filename.lower()
+    if not (ctype.startswith("audio") or fname.endswith((".mp3", ".m4a", ".wav", ".ogg"))):
+        await interaction.response.send_message(
+            "Нужен аудиофайл (mp3/m4a/wav/ogg).", ephemeral=True
+        )
+        return
+    if bot.tts_dispatcher.cloud is None:
+        await interaction.response.send_message(
+            "MiniMax не настроен (нет MINIMAX_API_KEY) — клонирование недоступно.",
+            ephemeral=True,
+        )
+        return
+    # Download + upload + clone + probe all hit the network; defer so the
+    # interaction token does not expire (3s limit) before we finish.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        data = await sample.read()
+    except discord.HTTPException as exc:
+        await interaction.followup.send(
+            f"Не удалось скачать файл: {exc}", ephemeral=True
+        )
+        return
+    voice_id = _derive_minimax_voice_id(name)
+    ok, err = await bot.clone_minimax_voice(
+        name=name,
+        voice_id=voice_id,
+        sample=data,
+        filename=sample.filename,
+        description=description.strip(),
+    )
+    if not ok:
+        await interaction.followup.send(f"Не удалось: {err}", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"Готово! Голос `{name}` создан (voice_id=`{voice_id}`).\n"
+        f"Назначьте его: `/voicebot voice-user @user {name}` "
+        f"или `/voicebot voice-set {name}`.",
+        ephemeral=True,
+    )
+
+
 @tts_group.command(name="voice-describe", description="Изменить описание голоса")
 @app_commands.describe(name="Имя профиля", text="Новое описание")
 @app_commands.autocomplete(name=voice_profile_autocomplete)
@@ -2928,6 +3317,350 @@ async def slash_tts_voice_describe(
     await interaction.response.send_message(
         f"Описание `{name}` обновлено.", ephemeral=True
     )
+
+
+_EMOTION_CHOICES = [
+    app_commands.Choice(name="auto (по тексту)", value="auto"),
+    app_commands.Choice(name="без эмоции", value="none"),
+    app_commands.Choice(name="нейтрально", value="neutral"),
+    app_commands.Choice(name="радость", value="happy"),
+    app_commands.Choice(name="грусть", value="sad"),
+    app_commands.Choice(name="злость", value="angry"),
+    app_commands.Choice(name="страх", value="fearful"),
+    app_commands.Choice(name="отвращение", value="disgusted"),
+    app_commands.Choice(name="удивление", value="surprised"),
+]
+
+
+@tts_group.command(
+    name="voice-tune", description="Настроить выразительность голоса (MiniMax)"
+)
+@app_commands.describe(
+    name="Имя голоса",
+    emotion="Эмоция (auto = подбор по тексту сообщения)",
+    speed="Скорость речи 0.5–2.0 (норма 1.0)",
+    pitch="Высота тона -12..12 (норма 0)",
+    vol="Громкость 0.1–10 (норма 1.0)",
+)
+@app_commands.autocomplete(name=voice_profile_autocomplete)
+@app_commands.choices(emotion=_EMOTION_CHOICES)
+async def slash_tts_voice_tune(
+    interaction: discord.Interaction,
+    name: str,
+    emotion: app_commands.Choice[str] | None = None,
+    speed: app_commands.Range[float, 0.5, 2.0] | None = None,
+    pitch: app_commands.Range[int, -12, 12] | None = None,
+    vol: app_commands.Range[float, 0.1, 10.0] | None = None,
+) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    name = name.strip().lower()
+    rec = bot.voice_registry.get(name)
+    if rec is None:
+        await interaction.response.send_message(
+            f"Голос `{name}` не найден. Список: `/voicebot voices`.", ephemeral=True
+        )
+        return
+    if not rec.is_minimax or rec.minimax is None:
+        await interaction.response.send_message(
+            "Выразительность доступна только для MiniMax-голосов.", ephemeral=True
+        )
+        return
+    if emotion is None and speed is None and pitch is None and vol is None:
+        await interaction.response.send_message(
+            "Укажите хотя бы один параметр: emotion / speed / pitch / vol.",
+            ephemeral=True,
+        )
+        return
+    mm = rec.minimax
+    new_emotion = mm.emotion
+    if emotion is not None:
+        new_emotion = "" if emotion.value == "none" else emotion.value
+    new_speed = mm.speed if speed is None else max(0.5, min(2.0, float(speed)))
+    new_pitch = mm.pitch if pitch is None else max(-12, min(12, int(pitch)))
+    new_vol = mm.vol if vol is None else max(0.1, min(10.0, float(vol)))
+    bot.voice_registry.add(
+        replace(
+            rec,
+            minimax=replace(
+                mm, emotion=new_emotion, speed=new_speed, pitch=new_pitch, vol=new_vol
+            ),
+        )
+    )
+    try:
+        bot.persist_voice_registry()
+    except OSError as exc:
+        log.exception("Failed to persist voices.json after voice-tune")
+        await interaction.response.send_message(
+            f"Не удалось сохранить: {exc}", ephemeral=True
+        )
+        return
+    emotion_label = new_emotion or "—"
+    await interaction.response.send_message(
+        f"Голос `{name}` настроен: эмоция `{emotion_label}`, "
+        f"скорость `{new_speed}`, тон `{new_pitch}`, громкость `{new_vol}`.",
+        ephemeral=True,
+    )
+
+
+def _render_emoji(guild: discord.Guild | None, emoji_id: str, name: str) -> str:
+    """Render a stored alias's emoji: prefer the live guild emoji object (so
+    animated emoji and exact image render correctly); fall back to a shortcode
+    if the emoji was deleted."""
+    if guild is not None:
+        try:
+            live = discord.utils.get(guild.emojis, id=int(emoji_id))
+        except (TypeError, ValueError):
+            live = None
+        if live is not None:
+            return str(live)
+    return f"`:{name or emoji_id}:`"
+
+
+async def emoji_alias_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    current = current.lower()
+    choices: list[app_commands.Choice[str]] = []
+    for emoji_id, entry in bot.config_store.emoji_aliases.items():
+        name = entry.get("name") or emoji_id
+        say = entry.get("say", "")
+        if current in name.lower() or current in say.lower() or current in emoji_id:
+            label = f":{name}: → {say}"[:100]
+            choices.append(app_commands.Choice(name=label, value=emoji_id))
+    return choices[:25]
+
+
+@tts_group.command(
+    name="emoji-alias", description="Задать, как бот произносит кастомный эмодзи"
+)
+@app_commands.describe(
+    emoji="Кастомный эмодзи сервера (или :имя:)",
+    pronunciation="Чем его озвучивать",
+)
+async def slash_emoji_alias(
+    interaction: discord.Interaction, emoji: str, pronunciation: str
+) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    parsed = parse_custom_emoji_arg(emoji, interaction.guild)
+    if parsed is None:
+        await interaction.response.send_message(
+            "Нужен кастомный эмодзи этого сервера — пришлите сам эмодзи, "
+            "токен `<:Имя:123…>` или `:Имя:`. Обычные Unicode-эмодзи и текст "
+            "не поддерживаются.",
+            ephemeral=True,
+        )
+        return
+    emoji_id, name = parsed
+    say = sanitize_pronunciation(pronunciation)
+    if not say:
+        await interaction.response.send_message(
+            "Произношение пустое или состоит только из недопустимых символов.",
+            ephemeral=True,
+        )
+        return
+    bot.config_store.set_emoji_alias(emoji_id, name, say)
+    rendered = _render_emoji(interaction.guild, emoji_id, name)
+    await interaction.response.send_message(
+        f"Готово: {rendered} будет озвучиваться как «{say}».", ephemeral=True
+    )
+
+
+@tts_group.command(name="emoji-alias-remove", description="Удалить алиас эмодзи")
+@app_commands.describe(emoji="Эмодзи или его текущий алиас")
+@app_commands.autocomplete(emoji=emoji_alias_autocomplete)
+async def slash_emoji_alias_remove(
+    interaction: discord.Interaction, emoji: str
+) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    parsed = parse_custom_emoji_arg(emoji, interaction.guild)
+    if parsed is not None:
+        emoji_id = parsed[0]
+    elif emoji.strip().isdigit():  # raw id, e.g. picked from autocomplete
+        emoji_id = emoji.strip()
+    else:
+        await interaction.response.send_message(
+            "Не распознан эмодзи. Выберите из списка автодополнения "
+            "или пришлите сам эмодзи.",
+            ephemeral=True,
+        )
+        return
+    if bot.config_store.remove_emoji_alias(emoji_id):
+        await interaction.response.send_message(
+            f"Алиас удалён (id `{emoji_id}`).", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"Алиаса для id `{emoji_id}` нет.", ephemeral=True
+        )
+
+
+@tts_group.command(name="emoji-aliases", description="Показать заданные алиасы эмодзи")
+async def slash_emoji_aliases(interaction: discord.Interaction) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    aliases = bot.config_store.emoji_aliases
+    if not aliases:
+        await interaction.response.send_message(
+            "Алиасы эмодзи не заданы. Добавьте: `/voicebot emoji-alias`.",
+            ephemeral=True,
+        )
+        return
+    lines: list[str] = []
+    for emoji_id, entry in aliases.items():
+        rendered = _render_emoji(interaction.guild, emoji_id, entry.get("name", ""))
+        lines.append(f"{rendered} → «{entry.get('say', '')}»")
+    await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+
+def _fmt_uptime(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}д")
+    if hours:
+        parts.append(f"{hours}ч")
+    parts.append(f"{minutes}м")
+    return " ".join(parts)
+
+
+def _fmt_int(value: int) -> str:
+    return f"{value:,}".replace(",", " ")
+
+
+def _build_stats_embed() -> discord.Embed:
+    disp = bot.tts_dispatcher
+    cache = getattr(disp, "cache", None)
+    cb = getattr(disp, "circuit_breaker", None)
+    cloud = getattr(disp, "cloud", None)
+    embed = discord.Embed(title="📊 TTS • Статистика", color=0x5865F2)
+    if cache is not None:
+        hits, misses = cache.hits, cache.misses
+        total = hits + misses
+        rate = f"{100.0 * hits / total:.0f}%" if total else "—"
+        mb = cache.total_bytes / (1024 * 1024)
+        embed.add_field(
+            name="Кэш",
+            value=f"{rate} попаданий ({hits}/{total}) · {cache.size} фраз · {mb:.1f} МБ",
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Кэш", value="выключен", inline=False)
+    embed.add_field(name="Очередь", value=str(bot.message_queue.qsize()), inline=True)
+    state = cb.state.value if cb is not None else "—"
+    embed.add_field(name="Circuit breaker", value=f"`{state}`", inline=True)
+    chars = getattr(cloud, "session_chars", None)
+    embed.add_field(
+        name="MiniMax символы (сессия)",
+        value=_fmt_int(chars) if chars is not None else "—",
+        inline=True,
+    )
+    embed.add_field(
+        name="Аптайм", value=_fmt_uptime(time.time() - bot.started_at), inline=True
+    )
+    return embed
+
+
+def _build_settings_embed() -> discord.Embed:
+    cache_on = getattr(bot.tts_dispatcher, "cache", None) is not None
+    embed = discord.Embed(title="⚙️ TTS • Настройки", color=0x57F287)
+    embed.add_field(name="Склейка сообщений", value=f"`{TTS_MERGE_ALGORITHM}`", inline=True)
+    embed.add_field(name="Кэш", value="вкл" if cache_on else "выкл", inline=True)
+    embed.add_field(name="Стриминг", value="вкл" if TTS_STREAMING_ENABLED else "выкл", inline=True)
+    embed.add_field(name="Префетч", value="вкл" if TTS_PREFETCH_ENABLED else "выкл", inline=True)
+    embed.add_field(
+        name="Непрерывный поток",
+        value="вкл" if TTS_CONTINUOUS_STREAM else "выкл",
+        inline=True,
+    )
+    embed.add_field(name="Лимит символов", value=str(TTS_MAX_CHARS), inline=True)
+    embed.add_field(name="Авто-отключение", value=f"{IDLE_DISCONNECT_SECONDS}с", inline=True)
+    return embed
+
+
+def _build_voices_embed(guild: discord.Guild | None) -> discord.Embed:
+    reg = bot.voice_registry
+    embed = discord.Embed(title="🎙️ TTS • Голоса", color=0xEB459E)
+    if guild is not None:
+        cfg = bot.config_store.get_guild(guild.id)
+        embed.add_field(name="По умолчанию", value=f"`{cfg.default_voice}`", inline=True)
+        embed.add_field(name="Персональных", value=str(len(cfg.user_voices)), inline=True)
+        embed.add_field(name="В озвучке", value=str(len(cfg.allowed_users)), inline=True)
+    embed.add_field(name="Всего голосов", value=str(len(reg.names())), inline=True)
+    embed.add_field(name="Fallback", value=f"`{reg.fallback_profile}`", inline=True)
+    embed.add_field(
+        name="Алиасов эмодзи", value=str(len(bot.config_store.emoji_aliases)), inline=True
+    )
+    lines: list[str] = []
+    for name in reg.names():
+        rec = reg.get(name)
+        if rec is None:
+            continue
+        tag = "MiniMax" if rec.is_minimax else "Piper"
+        extra = ""
+        if rec.is_minimax and rec.minimax is not None and rec.minimax.emotion:
+            extra = f" · {rec.minimax.emotion}"
+        lines.append(f"`{name}` [{tag}]{extra}")
+    if lines:
+        embed.add_field(name="Список", value="\n".join(lines)[:1000], inline=False)
+    return embed
+
+
+class StatsView(discord.ui.View):
+    """Tabbed stats menu: buttons swap the embed in place (ephemeral)."""
+
+    def __init__(self, guild: discord.Guild | None, *, author_id: int) -> None:
+        super().__init__(timeout=120)
+        self.guild = guild
+        self.author_id = author_id
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Это не ваше меню.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Статистика", emoji="📊", style=discord.ButtonStyle.primary)
+    async def stats_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(embed=_build_stats_embed(), view=self)
+
+    @discord.ui.button(label="Настройки", emoji="⚙️", style=discord.ButtonStyle.secondary)
+    async def settings_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(embed=_build_settings_embed(), view=self)
+
+    @discord.ui.button(label="Голоса", emoji="🎙️", style=discord.ButtonStyle.secondary)
+    async def voices_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(embed=_build_voices_embed(self.guild), view=self)
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+@tts_group.command(name="stats", description="Статистика и настройки TTS")
+async def slash_tts_stats(interaction: discord.Interaction) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    view = StatsView(interaction.guild, author_id=interaction.user.id)
+    await interaction.response.send_message(
+        embed=_build_stats_embed(), view=view, ephemeral=True
+    )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException:
+        pass
 
 
 @tts_group.command(name="status", description="Показать состояние TTS на сервере")
@@ -2977,7 +3710,11 @@ async def slash_tts_test(
             ephemeral=True,
         )
         return
-    final_text = normalize_for_tts(text) or ""
+    final_text = normalize_for_tts(
+        text,
+        emoji_aliases=bot.config_store.emoji_say_map(),
+        mentions=build_mention_say_map_from_guild(text, interaction.guild),
+    ) or ""
     if not final_text:
         await interaction.response.send_message("Нет текста для озвучки.", ephemeral=True)
         return

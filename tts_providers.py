@@ -568,6 +568,59 @@ def _is_valid_configured(cfg: MiniMaxConfig) -> bool:
     return bool(cfg.api_key) and bool(cfg.voice_id)
 
 
+# MiniMax t2a emotion values (besides "" = omit / provider default).
+MINIMAX_EMOTIONS = (
+    "neutral", "happy", "sad", "angry", "fearful", "disgusted", "surprised",
+)
+
+
+def derive_auto_emotion(text: str) -> str:
+    """Heuristic per-message emotion from punctuation/case.
+
+    Used when a voice's emotion is set to ``"auto"``. It is a pure function of
+    the (already normalized) text, which is part of the cache key — so the
+    same text always maps to the same emotion and the cache stays consistent.
+    Returns one of MINIMAX_EMOTIONS, or "" for neutral/no emotion.
+    """
+    if not text:
+        return ""
+    stripped = text.strip()
+    letters = [c for c in stripped if c.isalpha()]
+    if len(letters) >= 4 and all(c.isupper() for c in letters):
+        return "angry"  # SHOUTING
+    if "?!" in stripped or "!?" in stripped:
+        return "surprised"
+    if stripped.endswith("!"):
+        return "happy"
+    return ""
+
+
+def resolve_emotion(emotion: str, text: str) -> str:
+    """Translate the ``"auto"`` sentinel into a concrete emotion for the given
+    text; pass any other value through unchanged."""
+    return derive_auto_emotion(text) if emotion == "auto" else emotion
+
+
+def voice_cache_key(voice) -> str:
+    """Cache key fragment for a voice record.
+
+    A piper voice is keyed by name. A MiniMax voice also folds in the params
+    that change the audio (speed/vol/pitch/emotion/model) so that re-tuning a
+    voice produces a fresh key — the old entry is no longer served and evicts
+    by LRU. ``emotion="auto"`` is a constant here; the concrete emotion is
+    derived from the text, which is already part of the full cache key.
+    """
+    if voice is None:
+        return ""
+    name = getattr(voice, "name", "")
+    mm = getattr(voice, "minimax", None)
+    if getattr(voice, "provider", None) == "minimax" and mm is not None:
+        return "|".join(
+            str(x) for x in (name, mm.speed, mm.vol, mm.pitch, mm.emotion, mm.model)
+        )
+    return name
+
+
 class MiniMaxProvider:
     """Calls MiniMax ``POST /v1/t2a_v2`` and writes MP3 to ``filename``.
 
@@ -608,6 +661,11 @@ class MiniMaxProvider:
         # every successful synthesis for quota monitoring.
         self._session_chars: int = 0
 
+    @property
+    def session_chars(self) -> int:
+        """Cumulative MiniMax characters billed since process start."""
+        return self._session_chars
+
     async def aclose(self) -> None:
         """Gracefully close the underlying HTTP client.
 
@@ -640,6 +698,8 @@ class MiniMaxProvider:
         language_boost: str,
     ) -> dict:
         cfg = self._config
+        # "auto" -> a concrete emotion derived from this text (cache-safe).
+        emotion = resolve_emotion(emotion, text)
         voice_setting: dict = {
             "voice_id": voice_id,
             "speed": speed,
@@ -785,6 +845,125 @@ class MiniMaxProvider:
         log.debug(
             "MiniMaxProvider synthesized text=%d chars audio=%d bytes file=%s",
             len(text), len(audio_bytes), filename,
+        )
+
+    def _build_clone_url(self, path: str) -> str:
+        base = self._config.base_url.rstrip("/")
+        url = f"{base}{path}"
+        if self._config.group_id:
+            url = f"{url}?GroupId={self._config.group_id}"
+        return url
+
+    async def clone_voice(
+        self,
+        sample: bytes,
+        *,
+        voice_id: str,
+        filename: str = "sample.mp3",
+        model: str = "speech-2.8-hd",
+    ) -> None:
+        """Upload ``sample`` audio and trigger a MiniMax voice clone.
+
+        Two calls, mirroring ``scripts/clone_voice.py`` but reusing this
+        provider's keep-alive client: ``POST /v1/files/upload`` (multipart,
+        ``purpose=voice_clone``) to obtain an integer ``file_id``, then
+        ``POST /v1/voice_clone`` to register ``voice_id``. Both override the
+        short realtime-synth timeout with a generous 60s budget — upload and
+        the server-side clone are far slower than a t2a request. Raises a
+        ``MiniMaxError`` subclass on any failure so the caller can surface a
+        precise reason; on success ``voice_id`` is immediately usable via
+        :meth:`synthesize`.
+        """
+        cfg = self._config
+        if not cfg.api_key:
+            raise MiniMaxAuthError("MINIMAX_API_KEY is not set")
+        if not sample:
+            raise MiniMaxError("empty audio sample")
+        size_mb = len(sample) / (1024 * 1024)
+        if size_mb > 20:
+            raise MiniMaxError(
+                f"sample is {size_mb:.1f} MB; MiniMax limit is 20 MB"
+            )
+
+        import httpx  # lazy import, see __init__ for rationale
+
+        # Upload + server-side clone are slow relative to a realtime synth;
+        # override the short keep-alive timeout for these two calls only.
+        timeout = httpx.Timeout(60.0, connect=10.0)
+        auth = {"Authorization": f"Bearer {cfg.api_key}"}
+
+        # --- 1) upload the sample, get an integer file_id --------------
+        upload_url = self._build_clone_url("/v1/files/upload")
+        files = {"file": (filename, sample, "application/octet-stream")}
+        try:
+            resp = await self._client.post(
+                upload_url,
+                headers=auth,
+                files=files,
+                data={"purpose": "voice_clone"},
+                timeout=timeout,
+            )
+        except httpx.TimeoutException as exc:
+            raise MiniMaxTimeoutError("MiniMax upload timed out") from exc
+        except httpx.HTTPError as exc:
+            raise MiniMaxError(f"MiniMax upload network error: {exc}") from exc
+        if resp.status_code >= 400:
+            raise MiniMaxError(
+                f"MiniMax upload HTTP {resp.status_code}: {resp.text[:200]}"
+            )
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise MiniMaxError(
+                f"MiniMax upload returned non-JSON: {resp.text[:200]}"
+            ) from exc
+        base_resp = payload.get("base_resp") or {}
+        status_code = int(base_resp.get("status_code", 0) or 0)
+        if status_code != 0:
+            self._raise_for_status_code(
+                status_code, base_resp.get("status_msg", "") or ""
+            )
+        file_id = (payload.get("file") or {}).get("file_id") or payload.get("file_id")
+        if not file_id:
+            raise MiniMaxError(f"MiniMax upload missing file_id: {payload}")
+
+        # --- 2) trigger the clone --------------------------------------
+        clone_url = self._build_clone_url("/v1/voice_clone")
+        body = {
+            "file_id": int(file_id),  # string file_id -> 2013 invalid params
+            "voice_id": voice_id,
+            "model": model,
+        }
+        headers = {**auth, "Content-Type": "application/json"}
+        try:
+            resp = await self._client.post(
+                clone_url, headers=headers, json=body, timeout=timeout
+            )
+        except httpx.TimeoutException as exc:
+            raise MiniMaxTimeoutError("MiniMax voice_clone timed out") from exc
+        except httpx.HTTPError as exc:
+            raise MiniMaxError(
+                f"MiniMax voice_clone network error: {exc}"
+            ) from exc
+        if resp.status_code >= 400:
+            raise MiniMaxError(
+                f"MiniMax voice_clone HTTP {resp.status_code}: {resp.text[:200]}"
+            )
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise MiniMaxError(
+                f"MiniMax voice_clone returned non-JSON: {resp.text[:200]}"
+            ) from exc
+        base_resp = payload.get("base_resp") or {}
+        status_code = int(base_resp.get("status_code", -1))
+        if status_code != 0:
+            self._raise_for_status_code(
+                status_code, base_resp.get("status_msg", "") or ""
+            )
+        log.info(
+            "MiniMax voice cloned voice_id=%s model=%s file_id=%s sample_bytes=%d",
+            voice_id, model, file_id, len(sample),
         )
 
     def _raise_for_status_code(self, status_code: int, status_msg: str) -> None:
@@ -1009,8 +1188,10 @@ class TTSDispatcher:
         with the record's profile name. A cloud failure falls back to the
         registry ``fallback_profile`` (Piper).
         """
-        # Cache key must include the voice so two voices never collide.
-        voice_key = getattr(voice, "name", "") if voice is not None else ""
+        # Cache key must include the voice so two voices never collide, plus
+        # the MiniMax params so re-tuning a voice (speed/pitch/emotion/vol)
+        # yields a fresh key instead of serving stale audio.
+        voice_key = voice_cache_key(voice)
 
         # 1. Cache hit short-circuits everything.
         if self._cache is not None:

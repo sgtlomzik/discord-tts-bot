@@ -947,6 +947,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
             is_paused=MagicMock(return_value=False),
             disconnect=AsyncMock(),
             stop=MagicMock(),
+            channel=None,  # _idle_disconnect_after_timeout reads vc.channel
         )
         tts_bot.continuous_sources[guild.id] = source
 
