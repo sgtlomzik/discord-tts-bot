@@ -787,6 +787,125 @@ class MiniMaxProvider:
             len(text), len(audio_bytes), filename,
         )
 
+    def _build_clone_url(self, path: str) -> str:
+        base = self._config.base_url.rstrip("/")
+        url = f"{base}{path}"
+        if self._config.group_id:
+            url = f"{url}?GroupId={self._config.group_id}"
+        return url
+
+    async def clone_voice(
+        self,
+        sample: bytes,
+        *,
+        voice_id: str,
+        filename: str = "sample.mp3",
+        model: str = "speech-2.8-hd",
+    ) -> None:
+        """Upload ``sample`` audio and trigger a MiniMax voice clone.
+
+        Two calls, mirroring ``scripts/clone_voice.py`` but reusing this
+        provider's keep-alive client: ``POST /v1/files/upload`` (multipart,
+        ``purpose=voice_clone``) to obtain an integer ``file_id``, then
+        ``POST /v1/voice_clone`` to register ``voice_id``. Both override the
+        short realtime-synth timeout with a generous 60s budget — upload and
+        the server-side clone are far slower than a t2a request. Raises a
+        ``MiniMaxError`` subclass on any failure so the caller can surface a
+        precise reason; on success ``voice_id`` is immediately usable via
+        :meth:`synthesize`.
+        """
+        cfg = self._config
+        if not cfg.api_key:
+            raise MiniMaxAuthError("MINIMAX_API_KEY is not set")
+        if not sample:
+            raise MiniMaxError("empty audio sample")
+        size_mb = len(sample) / (1024 * 1024)
+        if size_mb > 20:
+            raise MiniMaxError(
+                f"sample is {size_mb:.1f} MB; MiniMax limit is 20 MB"
+            )
+
+        import httpx  # lazy import, see __init__ for rationale
+
+        # Upload + server-side clone are slow relative to a realtime synth;
+        # override the short keep-alive timeout for these two calls only.
+        timeout = httpx.Timeout(60.0, connect=10.0)
+        auth = {"Authorization": f"Bearer {cfg.api_key}"}
+
+        # --- 1) upload the sample, get an integer file_id --------------
+        upload_url = self._build_clone_url("/v1/files/upload")
+        files = {"file": (filename, sample, "application/octet-stream")}
+        try:
+            resp = await self._client.post(
+                upload_url,
+                headers=auth,
+                files=files,
+                data={"purpose": "voice_clone"},
+                timeout=timeout,
+            )
+        except httpx.TimeoutException as exc:
+            raise MiniMaxTimeoutError("MiniMax upload timed out") from exc
+        except httpx.HTTPError as exc:
+            raise MiniMaxError(f"MiniMax upload network error: {exc}") from exc
+        if resp.status_code >= 400:
+            raise MiniMaxError(
+                f"MiniMax upload HTTP {resp.status_code}: {resp.text[:200]}"
+            )
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise MiniMaxError(
+                f"MiniMax upload returned non-JSON: {resp.text[:200]}"
+            ) from exc
+        base_resp = payload.get("base_resp") or {}
+        status_code = int(base_resp.get("status_code", 0) or 0)
+        if status_code != 0:
+            self._raise_for_status_code(
+                status_code, base_resp.get("status_msg", "") or ""
+            )
+        file_id = (payload.get("file") or {}).get("file_id") or payload.get("file_id")
+        if not file_id:
+            raise MiniMaxError(f"MiniMax upload missing file_id: {payload}")
+
+        # --- 2) trigger the clone --------------------------------------
+        clone_url = self._build_clone_url("/v1/voice_clone")
+        body = {
+            "file_id": int(file_id),  # string file_id -> 2013 invalid params
+            "voice_id": voice_id,
+            "model": model,
+        }
+        headers = {**auth, "Content-Type": "application/json"}
+        try:
+            resp = await self._client.post(
+                clone_url, headers=headers, json=body, timeout=timeout
+            )
+        except httpx.TimeoutException as exc:
+            raise MiniMaxTimeoutError("MiniMax voice_clone timed out") from exc
+        except httpx.HTTPError as exc:
+            raise MiniMaxError(
+                f"MiniMax voice_clone network error: {exc}"
+            ) from exc
+        if resp.status_code >= 400:
+            raise MiniMaxError(
+                f"MiniMax voice_clone HTTP {resp.status_code}: {resp.text[:200]}"
+            )
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise MiniMaxError(
+                f"MiniMax voice_clone returned non-JSON: {resp.text[:200]}"
+            ) from exc
+        base_resp = payload.get("base_resp") or {}
+        status_code = int(base_resp.get("status_code", -1))
+        if status_code != 0:
+            self._raise_for_status_code(
+                status_code, base_resp.get("status_msg", "") or ""
+            )
+        log.info(
+            "MiniMax voice cloned voice_id=%s model=%s file_id=%s sample_bytes=%d",
+            voice_id, model, file_id, len(sample),
+        )
+
     def _raise_for_status_code(self, status_code: int, status_msg: str) -> None:
         """Map a non-zero MiniMax status_code to a precise exception."""
         if "invalid api key" in status_msg.lower() or status_code in (1002, 1004):

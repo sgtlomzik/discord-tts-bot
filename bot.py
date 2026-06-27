@@ -1295,6 +1295,55 @@ class TTSBot(commands.Bot):
             except OSError:
                 pass
 
+    async def clone_minimax_voice(
+        self,
+        *,
+        name: str,
+        voice_id: str,
+        sample: bytes,
+        filename: str,
+        description: str,
+    ) -> tuple[bool, str]:
+        """Clone ``sample`` on MiniMax, then register + persist the voice.
+
+        Wraps the provider's upload+clone, confirms the fresh clone actually
+        synthesizes (a clone that 'succeeds' but won't speak is useless), then
+        adds the record to the registry and saves data/voices.json. Returns
+        (ok, error_message); on ok the voice ``name`` is ready for
+        voice-set/voice-user. Used by /voicebot voice-clone.
+        """
+        cloud = getattr(self.tts_dispatcher, "cloud", None)
+        if cloud is None:
+            return False, "MiniMax не настроен (нет MINIMAX_API_KEY)."
+        clone = getattr(cloud, "clone_voice", None)
+        if clone is None:
+            return False, "Провайдер не поддерживает клонирование."
+        try:
+            await clone(sample, voice_id=voice_id, filename=filename)
+        except MiniMaxError as exc:
+            return False, f"Ошибка клонирования: {exc}"
+        except Exception as exc:  # network/timeout/decode/etc
+            return False, f"Не удалось клонировать: {type(exc).__name__}: {exc}"
+        # A clone can report success but not yet be usable; confirm it speaks
+        # before we register it so we never persist a dead voice.
+        ok, err = await self.validate_minimax_voice(voice_id)
+        if not ok:
+            return False, f"Клон создан, но не воспроизводится: {err}"
+        record = voice_registry.VoiceRecord(
+            name=name,
+            label=f"{name} (клон)",
+            description=description,
+            provider=voice_registry.PROVIDER_MINIMAX,
+            minimax=voice_registry.MiniMaxParams(voice_id=voice_id),
+        )
+        self.voice_registry.add(record)
+        try:
+            self.persist_voice_registry()
+        except OSError as exc:
+            log.exception("Failed to persist voices.json after voice-clone")
+            return False, f"Голос создан, но не сохранён на диск: {exc}"
+        return True, ""
+
     async def enqueue_tts(
         self,
         text: str,
@@ -2897,6 +2946,101 @@ async def slash_tts_voice_add(
     await interaction.followup.send(
         f"Добавлен голос `{name}` (voice_id=`{voice_id}`). "
         f"Назначьте его через `/voicebot voice-user` или `/voicebot voice-set`.",
+        ephemeral=True,
+    )
+
+
+def _derive_minimax_voice_id(name: str) -> str:
+    """Build a MiniMax-valid voice_id from a kebab-case profile name.
+
+    MiniMax requires a voice_id of >=8 chars containing at least one letter
+    AND one digit, and rejects dashes (2013 invalid params). We strip the
+    name to alphanumerics (no dashes), make sure it starts with a letter,
+    then append digits derived from a uuid — guaranteeing both a digit and
+    uniqueness so a re-clone never silently overwrites a previous voice.
+    """
+    base = re.sub(r"[^a-z0-9]", "", name.lower())
+    if not base or not base[0].isalpha():
+        base = "voice" + base
+    base = base[:16]
+    suffix = str(uuid.uuid4().int)[:4]  # always digits
+    vid = base + suffix
+    if len(vid) < 8:
+        vid = (vid + "00000000")[:8]
+    return vid
+
+
+@tts_group.command(name="voice-clone", description="Клонировать голос из аудиофайла")
+@app_commands.describe(
+    name="Имя профиля (kebab-case: a-z, 0-9, дефис)",
+    sample="Аудиосэмпл (mp3/m4a/wav, 10 сек–5 мин, до 20 МБ)",
+    description="Описание (необязательно)",
+)
+async def slash_tts_voice_clone(
+    interaction: discord.Interaction,
+    name: str,
+    sample: discord.Attachment,
+    description: str = "",
+) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    name = name.strip().lower()
+    if not voice_registry.valid_voice_name(name):
+        await interaction.response.send_message(
+            "Имя должно быть в kebab-case: строчные буквы, цифры и дефис, "
+            "начинаться с буквы или цифры (например `serega-pirat`).",
+            ephemeral=True,
+        )
+        return
+    if name in bot.voice_registry:
+        await interaction.response.send_message(
+            f"Голос `{name}` уже существует. Выберите другое имя.", ephemeral=True
+        )
+        return
+    if sample.size > 20 * 1024 * 1024:
+        await interaction.response.send_message(
+            f"Файл {sample.size / 1024 / 1024:.1f} МБ — лимит MiniMax 20 МБ.",
+            ephemeral=True,
+        )
+        return
+    ctype = (sample.content_type or "").lower()
+    fname = sample.filename.lower()
+    if not (ctype.startswith("audio") or fname.endswith((".mp3", ".m4a", ".wav", ".ogg"))):
+        await interaction.response.send_message(
+            "Нужен аудиофайл (mp3/m4a/wav/ogg).", ephemeral=True
+        )
+        return
+    if bot.tts_dispatcher.cloud is None:
+        await interaction.response.send_message(
+            "MiniMax не настроен (нет MINIMAX_API_KEY) — клонирование недоступно.",
+            ephemeral=True,
+        )
+        return
+    # Download + upload + clone + probe all hit the network; defer so the
+    # interaction token does not expire (3s limit) before we finish.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        data = await sample.read()
+    except discord.HTTPException as exc:
+        await interaction.followup.send(
+            f"Не удалось скачать файл: {exc}", ephemeral=True
+        )
+        return
+    voice_id = _derive_minimax_voice_id(name)
+    ok, err = await bot.clone_minimax_voice(
+        name=name,
+        voice_id=voice_id,
+        sample=data,
+        filename=sample.filename,
+        description=description.strip(),
+    )
+    if not ok:
+        await interaction.followup.send(f"Не удалось: {err}", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"Готово! Голос `{name}` создан (voice_id=`{voice_id}`).\n"
+        f"Назначьте его: `/voicebot voice-user @user {name}` "
+        f"или `/voicebot voice-set {name}`.",
         ephemeral=True,
     )
 
