@@ -584,7 +584,12 @@ def process_text(text: str) -> str:
 # text to either TTS provider. Returns None when there is nothing
 # speakable left, so the caller can drop the message entirely
 # (matches the spec: 186/3358 messages were empty after cleanup).
-def normalize_for_tts(raw: str, *, max_chars: int | None = None) -> str | None:
+def normalize_for_tts(
+    raw: str,
+    *,
+    max_chars: int | None = None,
+    emoji_aliases: dict[str, str] | None = None,
+) -> str | None:
     """Strip Discord markup from a message and prepare it for synthesis.
 
     Removes:
@@ -602,6 +607,10 @@ def normalize_for_tts(raw: str, *, max_chars: int | None = None) -> str | None:
         return None
     text = raw
 
+    # Emoji aliases first: turn aliased custom emoji into their spoken word
+    # *before* the strip regex removes the rest. Unaliased emoji stay silent.
+    if emoji_aliases:
+        text = substitute_emoji_aliases(text, emoji_aliases)
     # Custom emoji: <:name:id> and <a:name:id>
     text = re.sub(r"<a?:\w+:\d+>", " ", text)
     # User/role mentions
@@ -647,8 +656,20 @@ def _is_keyboard_smash_word(word: str) -> bool:
     return unique_chars <= 3 and len(cleaned) >= 5
 
 
-def _strip_discord_tokens_for_speech(raw_text: str) -> str:
-    text = CUSTOM_EMOJI_RE.sub(lambda m: f" {EMOJI_MAP.get(m.group(1), '')} ", raw_text)
+def _strip_discord_tokens_for_speech(
+    raw_text: str, aliases: dict[str, str] | None = None
+) -> str:
+    aliases = aliases or {}
+
+    def _emoji_repl(m: re.Match[str]) -> str:
+        # id-keyed alias wins over the legacy name-keyed EMOJI_MAP fallback;
+        # an emoji with neither becomes silence, as before.
+        say = aliases.get(m.group(2))
+        if say:
+            return f" {say} "
+        return f" {EMOJI_MAP.get(m.group(1), '')} "
+
+    text = CUSTOM_EMOJI_RE.sub(_emoji_repl, raw_text)
     text = MENTION_RE.sub(" ", text)
     text = URL_RE.sub(" ", text)
     text = text.replace("\n", ". ")
@@ -656,10 +677,12 @@ def _strip_discord_tokens_for_speech(raw_text: str) -> str:
     return text.strip()
 
 
-def analyze_message_for_merge(raw_text: str) -> ParsedMessage:
+def analyze_message_for_merge(
+    raw_text: str, aliases: dict[str, str] | None = None
+) -> ParsedMessage:
     raw_text = raw_text or ""
     raw_length = len(raw_text)
-    spoken_text = _strip_discord_tokens_for_speech(raw_text)
+    spoken_text = _strip_discord_tokens_for_speech(raw_text, aliases)
     custom_tokens = list(CUSTOM_EMOJI_RE.finditer(raw_text))
     mention_tokens = list(MENTION_RE.finditer(raw_text))
     url_tokens = list(URL_RE.finditer(raw_text))
@@ -1418,7 +1441,11 @@ class TTSBot(commands.Bot):
         # TTS_MAX_CHARS cap is enforced here (300 by default, per spec
         # §"Препроцессинг текста") — it protects the cloud API quota
         # from accidental walls of text and keeps Piper CPU bounded.
-        cleaned = normalize_for_tts(text, max_chars=TTS_MAX_CHARS)
+        cleaned = normalize_for_tts(
+            text,
+            max_chars=TTS_MAX_CHARS,
+            emoji_aliases=self.config_store.emoji_say_map(),
+        )
         if not cleaned:
             log.info(
                 "Skipped TTS enqueue author=%s reason=empty_after_normalize",
@@ -1556,7 +1583,7 @@ class TTSBot(commands.Bot):
     ) -> None:
         key = (author_id, voice_channel.id)
         now = time.perf_counter()
-        parsed = analyze_message_for_merge(text)
+        parsed = analyze_message_for_merge(text, self.config_store.emoji_say_map())
         previous_ts = self.last_user_message_ts.get(key)
         gap_prev_ms = None if previous_ts is None else round((now - previous_ts) * 1000)
         self.last_user_message_ts[key] = now
@@ -3087,7 +3114,7 @@ async def slash_tts_test(
             ephemeral=True,
         )
         return
-    final_text = normalize_for_tts(text) or ""
+    final_text = normalize_for_tts(text, emoji_aliases=bot.config_store.emoji_say_map()) or ""
     if not final_text:
         await interaction.response.send_message("Нет текста для озвучки.", ephemeral=True)
         return

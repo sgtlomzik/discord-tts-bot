@@ -186,5 +186,76 @@ class ConfigStoreEmojiAliasTests(unittest.TestCase):
             self.assertEqual(loaded.emoji_aliases, {"1": {"name": "K", "say": "кек"}})
 
 
+class NormalizeIntegrationTests(unittest.TestCase):
+    def test_aliased_emoji_becomes_word(self):
+        out = bot.normalize_for_tts("да<:Kekis:1>", emoji_aliases={"1": "кекис"})
+        self.assertEqual(out, "да кекис")
+
+    def test_unaliased_emoji_still_stripped(self):
+        out = bot.normalize_for_tts("привет <:Other:2>", emoji_aliases={"1": "кекис"})
+        self.assertEqual(out, "привет")
+
+    def test_mixed_aliased_and_unaliased(self):
+        out = bot.normalize_for_tts(
+            "<:K:1> и <:Z:2>", emoji_aliases={"1": "кек"}
+        )
+        self.assertEqual(out, "кек и")
+
+    def test_no_aliases_strips_everything(self):
+        self.assertIsNone(bot.normalize_for_tts("<:K:1>"))
+
+    def test_multiple_occurrences_all_replaced(self):
+        out = bot.normalize_for_tts(
+            "<:K:1><:K:1>", emoji_aliases={"1": "кек"}
+        )
+        self.assertEqual(out, "кек кек")
+
+
+class StripForSpeechIntegrationTests(unittest.TestCase):
+    def test_alias_wins_over_emoji_map(self):
+        # "kekw" is in the legacy EMOJI_MAP -> "Кек"; an id alias overrides it.
+        out = bot._strip_discord_tokens_for_speech("<:kekw:1>", {"1": "кекис"})
+        self.assertEqual(out, "кекис")
+
+    def test_emoji_map_fallback_when_no_alias(self):
+        out = bot._strip_discord_tokens_for_speech("<:kekw:1>", {})
+        self.assertEqual(out, "Кек")
+
+    def test_unknown_unaliased_stripped(self):
+        out = bot._strip_discord_tokens_for_speech("hi <:Nope:1> there", {})
+        self.assertEqual(out, "hi there")
+
+
+class MergeAnalysisTests(unittest.TestCase):
+    def test_aliased_emoji_only_message_is_spoken(self):
+        parsed = bot.analyze_message_for_merge("<:Kekis:1>", {"1": "кекис"})
+        # The aliased word survives, so the message is not dropped as empty.
+        self.assertEqual(parsed.spoken_text, "кекис")
+        self.assertTrue(parsed.is_custom_emoji_only)
+
+    def test_unaliased_emoji_only_message_is_empty(self):
+        parsed = bot.analyze_message_for_merge("<:Kekis:1>", {})
+        self.assertEqual(parsed.spoken_text, "")
+        self.assertTrue(parsed.is_custom_emoji_only)
+
+
+class CacheKeyTests(unittest.TestCase):
+    def test_changing_alias_changes_cache_key(self):
+        from tts_providers import TTSPhraseCache
+
+        raw = "смотри <:Kekis:1>"
+        text_a = bot.normalize_for_tts(raw, emoji_aliases={"1": "кекис"})
+        text_b = bot.normalize_for_tts(raw, emoji_aliases={"1": "лол"})
+        self.assertNotEqual(text_a, text_b)
+        key_a = TTSPhraseCache.hash_text(text_a, "bussshy01")
+        key_b = TTSPhraseCache.hash_text(text_b, "bussshy01")
+        # Different normalized text -> different key -> no stale audio served.
+        self.assertNotEqual(key_a, key_b)
+        # Same alias is stable (a repeat hits the same cache entry).
+        self.assertEqual(
+            key_a, TTSPhraseCache.hash_text(text_a, "bussshy01")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
