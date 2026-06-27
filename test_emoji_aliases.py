@@ -17,6 +17,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 def load_bot_module():
@@ -255,6 +256,125 @@ class CacheKeyTests(unittest.TestCase):
         self.assertEqual(
             key_a, TTSPhraseCache.hash_text(text_a, "bussshy01")
         )
+
+
+class _FakeMember:
+    def __init__(self, user_id=400):
+        self.id = user_id
+
+
+def _make_interaction(bot_mod, guild_emojis=()):
+    sent = []
+    guild = types.SimpleNamespace(
+        id=100,
+        emojis=[types.SimpleNamespace(id=eid, name=name) for eid, name in guild_emojis],
+    )
+    interaction = types.SimpleNamespace(
+        guild=guild,
+        user=_FakeMember(),
+        channel_id=300,
+        response=types.SimpleNamespace(
+            send_message=AsyncMock(side_effect=lambda *a, **k: sent.append(a[0] if a else "")),
+        ),
+    )
+    return interaction, sent
+
+
+class EmojiAliasCommandTests(unittest.IsolatedAsyncioTestCase):
+    def _setup(self):
+        bot_mod = load_bot_module()
+        tmp = tempfile.TemporaryDirectory()
+        store = bot_mod.BotConfigStore(Path(tmp.name) / "config.json", set())
+        store._tmp_dir = tmp
+        bot_mod.bot.config_store = store
+        return bot_mod, store
+
+    async def _call(self, bot_mod, cmd, *args):
+        with patch.object(bot_mod.discord, "Member", _FakeMember), patch.object(
+            bot_mod, "is_guild_manager", MagicMock(return_value=True)
+        ):
+            await cmd.callback(*args)
+
+    async def test_add_via_token(self):
+        bot_mod, store = self._setup()
+        interaction, sent = _make_interaction(bot_mod)
+        await self._call(
+            bot_mod, bot_mod.slash_emoji_alias, interaction, "<:Kekis:1035>", "кекис"
+        )
+        self.assertEqual(store.emoji_aliases, {"1035": {"name": "Kekis", "say": "кекис"}})
+        self.assertIn("кекис", sent[0])
+
+    async def test_add_via_shortcode(self):
+        bot_mod, store = self._setup()
+        interaction, sent = _make_interaction(bot_mod, guild_emojis=[(77, "Pepe")])
+        await self._call(
+            bot_mod, bot_mod.slash_emoji_alias, interaction, ":Pepe:", "пепе"
+        )
+        self.assertEqual(store.emoji_aliases, {"77": {"name": "Pepe", "say": "пепе"}})
+
+    async def test_update_overwrites(self):
+        bot_mod, store = self._setup()
+        interaction, _ = _make_interaction(bot_mod)
+        await self._call(bot_mod, bot_mod.slash_emoji_alias, interaction, "<:K:1>", "кек")
+        interaction2, _ = _make_interaction(bot_mod)
+        await self._call(bot_mod, bot_mod.slash_emoji_alias, interaction2, "<:K:1>", "лол")
+        self.assertEqual(store.emoji_aliases["1"]["say"], "лол")
+
+    async def test_reject_unicode_emoji(self):
+        bot_mod, store = self._setup()
+        interaction, sent = _make_interaction(bot_mod)
+        await self._call(bot_mod, bot_mod.slash_emoji_alias, interaction, "😀", "смайл")
+        self.assertEqual(store.emoji_aliases, {})
+        self.assertIn("не поддерживаются", sent[0])
+
+    async def test_reject_plain_text(self):
+        bot_mod, store = self._setup()
+        interaction, sent = _make_interaction(bot_mod)
+        await self._call(bot_mod, bot_mod.slash_emoji_alias, interaction, "просто слова", "x")
+        self.assertEqual(store.emoji_aliases, {})
+
+    async def test_reject_empty_pronunciation(self):
+        bot_mod, store = self._setup()
+        interaction, sent = _make_interaction(bot_mod)
+        # A pronunciation that sanitizes to nothing must be rejected.
+        await self._call(bot_mod, bot_mod.slash_emoji_alias, interaction, "<:K:1>", "<@123>")
+        self.assertEqual(store.emoji_aliases, {})
+
+    async def test_remove_via_token(self):
+        bot_mod, store = self._setup()
+        store.set_emoji_alias("1", "K", "кек")
+        interaction, sent = _make_interaction(bot_mod)
+        await self._call(
+            bot_mod, bot_mod.slash_emoji_alias_remove, interaction, "<:K:1>"
+        )
+        self.assertEqual(store.emoji_aliases, {})
+        self.assertIn("удалён", sent[0])
+
+    async def test_remove_via_raw_id(self):
+        bot_mod, store = self._setup()
+        store.set_emoji_alias("1", "K", "кек")
+        interaction, _ = _make_interaction(bot_mod)
+        await self._call(bot_mod, bot_mod.slash_emoji_alias_remove, interaction, "1")
+        self.assertEqual(store.emoji_aliases, {})
+
+    async def test_remove_unknown(self):
+        bot_mod, store = self._setup()
+        interaction, sent = _make_interaction(bot_mod)
+        await self._call(bot_mod, bot_mod.slash_emoji_alias_remove, interaction, "999")
+        self.assertIn("нет", sent[0])
+
+    async def test_list_empty(self):
+        bot_mod, store = self._setup()
+        interaction, sent = _make_interaction(bot_mod)
+        await self._call(bot_mod, bot_mod.slash_emoji_aliases, interaction)
+        self.assertIn("не заданы", sent[0])
+
+    async def test_list_shows_entries(self):
+        bot_mod, store = self._setup()
+        store.set_emoji_alias("1", "Kekis", "кекис")
+        interaction, sent = _make_interaction(bot_mod)
+        await self._call(bot_mod, bot_mod.slash_emoji_aliases, interaction)
+        self.assertIn("кекис", sent[0])
 
 
 if __name__ == "__main__":
