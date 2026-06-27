@@ -29,8 +29,19 @@ from tts_providers import (
 
 
 def run(coro):
-    """Tiny helper: run a coroutine to completion in tests."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    """Tiny helper: run a coroutine to completion in tests.
+
+    Uses a fresh event loop rather than ``asyncio.get_event_loop()`` so the
+    helper keeps working after an ``IsolatedAsyncioTestCase`` (in another test
+    module) has run and cleared the thread's current loop — otherwise Python
+    3.11 raises ``RuntimeError: There is no current event loop`` under
+    ``unittest discover``.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 class LocalProviderTests(unittest.TestCase):
