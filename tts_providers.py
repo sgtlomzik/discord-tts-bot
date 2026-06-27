@@ -661,6 +661,11 @@ class MiniMaxProvider:
         # every successful synthesis for quota monitoring.
         self._session_chars: int = 0
 
+    @property
+    def session_chars(self) -> int:
+        """Cumulative MiniMax characters billed since process start."""
+        return self._session_chars
+
     async def aclose(self) -> None:
         """Gracefully close the underlying HTTP client.
 

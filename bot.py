@@ -1076,6 +1076,7 @@ class ContinuousTTSAudioSource(discord.AudioSource):
 class TTSBot(commands.Bot):
     def __init__(self) -> None:
         super().__init__(command_prefix=("!tts ", "!tts"), intents=intents)
+        self.started_at = time.time()  # process start, for the stats uptime
         self.message_queue: asyncio.Queue[TTSJob] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
         self.worker_task: asyncio.Task[None] | None = None
         # Prefetch pipeline: generation worker fills ready_queue (bounded by
@@ -3513,6 +3514,153 @@ async def slash_emoji_aliases(interaction: discord.Interaction) -> None:
         rendered = _render_emoji(interaction.guild, emoji_id, entry.get("name", ""))
         lines.append(f"{rendered} → «{entry.get('say', '')}»")
     await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+
+def _fmt_uptime(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}д")
+    if hours:
+        parts.append(f"{hours}ч")
+    parts.append(f"{minutes}м")
+    return " ".join(parts)
+
+
+def _fmt_int(value: int) -> str:
+    return f"{value:,}".replace(",", " ")
+
+
+def _build_stats_embed() -> discord.Embed:
+    disp = bot.tts_dispatcher
+    cache = getattr(disp, "cache", None)
+    cb = getattr(disp, "circuit_breaker", None)
+    cloud = getattr(disp, "cloud", None)
+    embed = discord.Embed(title="📊 TTS • Статистика", color=0x5865F2)
+    if cache is not None:
+        hits, misses = cache.hits, cache.misses
+        total = hits + misses
+        rate = f"{100.0 * hits / total:.0f}%" if total else "—"
+        mb = cache.total_bytes / (1024 * 1024)
+        embed.add_field(
+            name="Кэш",
+            value=f"{rate} попаданий ({hits}/{total}) · {cache.size} фраз · {mb:.1f} МБ",
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Кэш", value="выключен", inline=False)
+    embed.add_field(name="Очередь", value=str(bot.message_queue.qsize()), inline=True)
+    state = cb.state.value if cb is not None else "—"
+    embed.add_field(name="Circuit breaker", value=f"`{state}`", inline=True)
+    chars = getattr(cloud, "session_chars", None)
+    embed.add_field(
+        name="MiniMax символы (сессия)",
+        value=_fmt_int(chars) if chars is not None else "—",
+        inline=True,
+    )
+    embed.add_field(
+        name="Аптайм", value=_fmt_uptime(time.time() - bot.started_at), inline=True
+    )
+    return embed
+
+
+def _build_settings_embed() -> discord.Embed:
+    cache_on = getattr(bot.tts_dispatcher, "cache", None) is not None
+    embed = discord.Embed(title="⚙️ TTS • Настройки", color=0x57F287)
+    embed.add_field(name="Склейка сообщений", value=f"`{TTS_MERGE_ALGORITHM}`", inline=True)
+    embed.add_field(name="Кэш", value="вкл" if cache_on else "выкл", inline=True)
+    embed.add_field(name="Стриминг", value="вкл" if TTS_STREAMING_ENABLED else "выкл", inline=True)
+    embed.add_field(name="Префетч", value="вкл" if TTS_PREFETCH_ENABLED else "выкл", inline=True)
+    embed.add_field(
+        name="Непрерывный поток",
+        value="вкл" if TTS_CONTINUOUS_STREAM else "выкл",
+        inline=True,
+    )
+    embed.add_field(name="Лимит символов", value=str(TTS_MAX_CHARS), inline=True)
+    embed.add_field(name="Авто-отключение", value=f"{IDLE_DISCONNECT_SECONDS}с", inline=True)
+    return embed
+
+
+def _build_voices_embed(guild: discord.Guild | None) -> discord.Embed:
+    reg = bot.voice_registry
+    embed = discord.Embed(title="🎙️ TTS • Голоса", color=0xEB459E)
+    if guild is not None:
+        cfg = bot.config_store.get_guild(guild.id)
+        embed.add_field(name="По умолчанию", value=f"`{cfg.default_voice}`", inline=True)
+        embed.add_field(name="Персональных", value=str(len(cfg.user_voices)), inline=True)
+        embed.add_field(name="В озвучке", value=str(len(cfg.allowed_users)), inline=True)
+    embed.add_field(name="Всего голосов", value=str(len(reg.names())), inline=True)
+    embed.add_field(name="Fallback", value=f"`{reg.fallback_profile}`", inline=True)
+    embed.add_field(
+        name="Алиасов эмодзи", value=str(len(bot.config_store.emoji_aliases)), inline=True
+    )
+    lines: list[str] = []
+    for name in reg.names():
+        rec = reg.get(name)
+        if rec is None:
+            continue
+        tag = "MiniMax" if rec.is_minimax else "Piper"
+        extra = ""
+        if rec.is_minimax and rec.minimax is not None and rec.minimax.emotion:
+            extra = f" · {rec.minimax.emotion}"
+        lines.append(f"`{name}` [{tag}]{extra}")
+    if lines:
+        embed.add_field(name="Список", value="\n".join(lines)[:1000], inline=False)
+    return embed
+
+
+class StatsView(discord.ui.View):
+    """Tabbed stats menu: buttons swap the embed in place (ephemeral)."""
+
+    def __init__(self, guild: discord.Guild | None, *, author_id: int) -> None:
+        super().__init__(timeout=120)
+        self.guild = guild
+        self.author_id = author_id
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Это не ваше меню.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Статистика", emoji="📊", style=discord.ButtonStyle.primary)
+    async def stats_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(embed=_build_stats_embed(), view=self)
+
+    @discord.ui.button(label="Настройки", emoji="⚙️", style=discord.ButtonStyle.secondary)
+    async def settings_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(embed=_build_settings_embed(), view=self)
+
+    @discord.ui.button(label="Голоса", emoji="🎙️", style=discord.ButtonStyle.secondary)
+    async def voices_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(embed=_build_voices_embed(self.guild), view=self)
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+@tts_group.command(name="stats", description="Статистика и настройки TTS")
+async def slash_tts_stats(interaction: discord.Interaction) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    view = StatsView(interaction.guild, author_id=interaction.user.id)
+    await interaction.response.send_message(
+        embed=_build_stats_embed(), view=view, ephemeral=True
+    )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException:
+        pass
 
 
 @tts_group.command(name="status", description="Показать состояние TTS на сервере")
