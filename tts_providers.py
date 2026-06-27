@@ -568,6 +568,59 @@ def _is_valid_configured(cfg: MiniMaxConfig) -> bool:
     return bool(cfg.api_key) and bool(cfg.voice_id)
 
 
+# MiniMax t2a emotion values (besides "" = omit / provider default).
+MINIMAX_EMOTIONS = (
+    "neutral", "happy", "sad", "angry", "fearful", "disgusted", "surprised",
+)
+
+
+def derive_auto_emotion(text: str) -> str:
+    """Heuristic per-message emotion from punctuation/case.
+
+    Used when a voice's emotion is set to ``"auto"``. It is a pure function of
+    the (already normalized) text, which is part of the cache key — so the
+    same text always maps to the same emotion and the cache stays consistent.
+    Returns one of MINIMAX_EMOTIONS, or "" for neutral/no emotion.
+    """
+    if not text:
+        return ""
+    stripped = text.strip()
+    letters = [c for c in stripped if c.isalpha()]
+    if len(letters) >= 4 and all(c.isupper() for c in letters):
+        return "angry"  # SHOUTING
+    if "?!" in stripped or "!?" in stripped:
+        return "surprised"
+    if stripped.endswith("!"):
+        return "happy"
+    return ""
+
+
+def resolve_emotion(emotion: str, text: str) -> str:
+    """Translate the ``"auto"`` sentinel into a concrete emotion for the given
+    text; pass any other value through unchanged."""
+    return derive_auto_emotion(text) if emotion == "auto" else emotion
+
+
+def voice_cache_key(voice) -> str:
+    """Cache key fragment for a voice record.
+
+    A piper voice is keyed by name. A MiniMax voice also folds in the params
+    that change the audio (speed/vol/pitch/emotion/model) so that re-tuning a
+    voice produces a fresh key — the old entry is no longer served and evicts
+    by LRU. ``emotion="auto"`` is a constant here; the concrete emotion is
+    derived from the text, which is already part of the full cache key.
+    """
+    if voice is None:
+        return ""
+    name = getattr(voice, "name", "")
+    mm = getattr(voice, "minimax", None)
+    if getattr(voice, "provider", None) == "minimax" and mm is not None:
+        return "|".join(
+            str(x) for x in (name, mm.speed, mm.vol, mm.pitch, mm.emotion, mm.model)
+        )
+    return name
+
+
 class MiniMaxProvider:
     """Calls MiniMax ``POST /v1/t2a_v2`` and writes MP3 to ``filename``.
 
@@ -640,6 +693,8 @@ class MiniMaxProvider:
         language_boost: str,
     ) -> dict:
         cfg = self._config
+        # "auto" -> a concrete emotion derived from this text (cache-safe).
+        emotion = resolve_emotion(emotion, text)
         voice_setting: dict = {
             "voice_id": voice_id,
             "speed": speed,
@@ -1128,8 +1183,10 @@ class TTSDispatcher:
         with the record's profile name. A cloud failure falls back to the
         registry ``fallback_profile`` (Piper).
         """
-        # Cache key must include the voice so two voices never collide.
-        voice_key = getattr(voice, "name", "") if voice is not None else ""
+        # Cache key must include the voice so two voices never collide, plus
+        # the MiniMax params so re-tuning a voice (speed/pitch/emotion/vol)
+        # yields a fresh key instead of serving stale audio.
+        voice_key = voice_cache_key(voice)
 
         # 1. Cache hit short-circuits everything.
         if self._cache is not None:

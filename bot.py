@@ -3318,6 +3318,90 @@ async def slash_tts_voice_describe(
     )
 
 
+_EMOTION_CHOICES = [
+    app_commands.Choice(name="auto (по тексту)", value="auto"),
+    app_commands.Choice(name="без эмоции", value="none"),
+    app_commands.Choice(name="нейтрально", value="neutral"),
+    app_commands.Choice(name="радость", value="happy"),
+    app_commands.Choice(name="грусть", value="sad"),
+    app_commands.Choice(name="злость", value="angry"),
+    app_commands.Choice(name="страх", value="fearful"),
+    app_commands.Choice(name="отвращение", value="disgusted"),
+    app_commands.Choice(name="удивление", value="surprised"),
+]
+
+
+@tts_group.command(
+    name="voice-tune", description="Настроить выразительность голоса (MiniMax)"
+)
+@app_commands.describe(
+    name="Имя голоса",
+    emotion="Эмоция (auto = подбор по тексту сообщения)",
+    speed="Скорость речи 0.5–2.0 (норма 1.0)",
+    pitch="Высота тона -12..12 (норма 0)",
+    vol="Громкость 0.1–10 (норма 1.0)",
+)
+@app_commands.autocomplete(name=voice_profile_autocomplete)
+@app_commands.choices(emotion=_EMOTION_CHOICES)
+async def slash_tts_voice_tune(
+    interaction: discord.Interaction,
+    name: str,
+    emotion: app_commands.Choice[str] | None = None,
+    speed: app_commands.Range[float, 0.5, 2.0] | None = None,
+    pitch: app_commands.Range[int, -12, 12] | None = None,
+    vol: app_commands.Range[float, 0.1, 10.0] | None = None,
+) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    name = name.strip().lower()
+    rec = bot.voice_registry.get(name)
+    if rec is None:
+        await interaction.response.send_message(
+            f"Голос `{name}` не найден. Список: `/voicebot voices`.", ephemeral=True
+        )
+        return
+    if not rec.is_minimax or rec.minimax is None:
+        await interaction.response.send_message(
+            "Выразительность доступна только для MiniMax-голосов.", ephemeral=True
+        )
+        return
+    if emotion is None and speed is None and pitch is None and vol is None:
+        await interaction.response.send_message(
+            "Укажите хотя бы один параметр: emotion / speed / pitch / vol.",
+            ephemeral=True,
+        )
+        return
+    mm = rec.minimax
+    new_emotion = mm.emotion
+    if emotion is not None:
+        new_emotion = "" if emotion.value == "none" else emotion.value
+    new_speed = mm.speed if speed is None else max(0.5, min(2.0, float(speed)))
+    new_pitch = mm.pitch if pitch is None else max(-12, min(12, int(pitch)))
+    new_vol = mm.vol if vol is None else max(0.1, min(10.0, float(vol)))
+    bot.voice_registry.add(
+        replace(
+            rec,
+            minimax=replace(
+                mm, emotion=new_emotion, speed=new_speed, pitch=new_pitch, vol=new_vol
+            ),
+        )
+    )
+    try:
+        bot.persist_voice_registry()
+    except OSError as exc:
+        log.exception("Failed to persist voices.json after voice-tune")
+        await interaction.response.send_message(
+            f"Не удалось сохранить: {exc}", ephemeral=True
+        )
+        return
+    emotion_label = new_emotion or "—"
+    await interaction.response.send_message(
+        f"Голос `{name}` настроен: эмоция `{emotion_label}`, "
+        f"скорость `{new_speed}`, тон `{new_pitch}`, громкость `{new_vol}`.",
+        ephemeral=True,
+    )
+
+
 def _render_emoji(guild: discord.Guild | None, emoji_id: str, name: str) -> str:
     """Render a stored alias's emoji: prefer the live guild emoji object (so
     animated emoji and exact image render correctly); fall back to a shortcode
