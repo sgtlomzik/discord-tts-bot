@@ -3319,6 +3319,18 @@ _EMOTION_CHOICES = [
     app_commands.Choice(name="удивление", value="surprised"),
 ]
 
+# Current MiniMax T2A model ids (platform.minimax.io/docs/api-reference,
+# checked 2026-07-05). HD = higher quality/cloning fidelity, Turbo = lower
+# latency; 2.8 is the newest generation.
+_MODEL_CHOICES = [
+    app_commands.Choice(name="2.8 HD (новейшая, макс. качество)", value="speech-2.8-hd"),
+    app_commands.Choice(name="2.8 Turbo (новейшая, быстрее)", value="speech-2.8-turbo"),
+    app_commands.Choice(name="2.6 HD", value="speech-2.6-hd"),
+    app_commands.Choice(name="2.6 Turbo", value="speech-2.6-turbo"),
+    app_commands.Choice(name="02 HD", value="speech-02-hd"),
+    app_commands.Choice(name="02 Turbo", value="speech-02-turbo"),
+]
+
 
 @tts_group.command(
     name="voice-tune", description="Настроить выразительность голоса (MiniMax)"
@@ -3329,9 +3341,10 @@ _EMOTION_CHOICES = [
     speed="Скорость речи 0.5–2.0 (норма 1.0)",
     pitch="Высота тона -12..12 (норма 0)",
     vol="Громкость 0.1–10 (норма 1.0)",
+    model="Модель синтеза MiniMax (HD = качество, Turbo = скорость)",
 )
 @app_commands.autocomplete(name=voice_profile_autocomplete)
-@app_commands.choices(emotion=_EMOTION_CHOICES)
+@app_commands.choices(emotion=_EMOTION_CHOICES, model=_MODEL_CHOICES)
 async def slash_tts_voice_tune(
     interaction: discord.Interaction,
     name: str,
@@ -3339,6 +3352,7 @@ async def slash_tts_voice_tune(
     speed: app_commands.Range[float, 0.5, 2.0] | None = None,
     pitch: app_commands.Range[int, -12, 12] | None = None,
     vol: app_commands.Range[float, 0.1, 10.0] | None = None,
+    model: app_commands.Choice[str] | None = None,
 ) -> None:
     if not await require_guild_manager(interaction):
         return
@@ -3354,9 +3368,9 @@ async def slash_tts_voice_tune(
             "Выразительность доступна только для MiniMax-голосов.", ephemeral=True
         )
         return
-    if emotion is None and speed is None and pitch is None and vol is None:
+    if emotion is None and speed is None and pitch is None and vol is None and model is None:
         await interaction.response.send_message(
-            "Укажите хотя бы один параметр: emotion / speed / pitch / vol.",
+            "Укажите хотя бы один параметр: emotion / speed / pitch / vol / model.",
             ephemeral=True,
         )
         return
@@ -3367,11 +3381,17 @@ async def slash_tts_voice_tune(
     new_speed = mm.speed if speed is None else max(0.5, min(2.0, float(speed)))
     new_pitch = mm.pitch if pitch is None else max(-12, min(12, int(pitch)))
     new_vol = mm.vol if vol is None else max(0.1, min(10.0, float(vol)))
+    new_model = mm.model if model is None else model.value
     bot.voice_registry.add(
         replace(
             rec,
             minimax=replace(
-                mm, emotion=new_emotion, speed=new_speed, pitch=new_pitch, vol=new_vol
+                mm,
+                emotion=new_emotion,
+                speed=new_speed,
+                pitch=new_pitch,
+                vol=new_vol,
+                model=new_model,
             ),
         )
     )
@@ -3386,7 +3406,8 @@ async def slash_tts_voice_tune(
     emotion_label = new_emotion or "—"
     await interaction.response.send_message(
         f"Голос `{name}` настроен: эмоция `{emotion_label}`, "
-        f"скорость `{new_speed}`, тон `{new_pitch}`, громкость `{new_vol}`.",
+        f"скорость `{new_speed}`, тон `{new_pitch}`, громкость `{new_vol}`, "
+        f"модель `{new_model}`.",
         ephemeral=True,
     )
 
@@ -3592,8 +3613,10 @@ def _build_voices_embed(guild: discord.Guild | None) -> discord.Embed:
             continue
         tag = "MiniMax" if rec.is_minimax else "Piper"
         extra = ""
-        if rec.is_minimax and rec.minimax is not None and rec.minimax.emotion:
-            extra = f" · {rec.minimax.emotion}"
+        if rec.is_minimax and rec.minimax is not None:
+            extra = f" · {rec.minimax.model}"
+            if rec.minimax.emotion:
+                extra += f" · {rec.minimax.emotion}"
         lines.append(f"`{name}` [{tag}]{extra}")
     if lines:
         embed.add_field(name="Список", value="\n".join(lines)[:1000], inline=False)
