@@ -218,6 +218,27 @@ class VoiceTuneCommandTests(unittest.IsolatedAsyncioTestCase):
         await self._call(bot_mod, interaction, "bussshy")
         self.assertIn("хотя бы один", sent[0])
 
+    async def test_sets_model(self):
+        bot_mod = self._setup()
+        interaction, _ = self._interaction()
+        await self._call(
+            bot_mod, interaction, "bussshy",
+            model=types.SimpleNamespace(value="speech-2.6-hd"),
+        )
+        mm = bot_mod.bot.voice_registry.get("bussshy").minimax
+        self.assertEqual(mm.model, "speech-2.6-hd")
+
+    async def test_model_change_invalidates_cache_key(self):
+        bot_mod = self._setup()
+        before = bot_mod.bot.voice_registry.get("bussshy")
+        interaction, _ = self._interaction()
+        await self._call(
+            bot_mod, interaction, "bussshy",
+            model=types.SimpleNamespace(value="speech-2.8-hd"),
+        )
+        after = bot_mod.bot.voice_registry.get("bussshy")
+        self.assertNotEqual(voice_cache_key(before), voice_cache_key(after))
+
 
 if __name__ == "__main__":
     unittest.main()
