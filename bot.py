@@ -356,6 +356,7 @@ class GuildConfig:
     allowed_users: set[int] = field(default_factory=set)
     default_voice: str = DEFAULT_VOICE_PROFILE
     user_voices: dict[int, str] = field(default_factory=dict)
+    user_fixed_phrases: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -523,11 +524,17 @@ class BotConfigStore:
             default_voice = raw_config.get("default_voice", DEFAULT_VOICE_PROFILE)
             if not self._is_valid_voice(default_voice):
                 default_voice = DEFAULT_VOICE_PROFILE
+            user_fixed_phrases = {
+                int(user_id): phrase
+                for user_id, phrase in raw_config.get("user_fixed_phrases", {}).items()
+                if str(user_id).isdigit() and isinstance(phrase, str) and phrase.strip()
+            }
             self.guilds[guild_id] = GuildConfig(
                 enabled=bool(raw_config.get("enabled", True)),
                 allowed_users=allowed_users,
                 default_voice=default_voice,
                 user_voices=user_voices,
+                user_fixed_phrases=user_fixed_phrases,
             )
 
         raw_aliases = data.get("emoji_aliases", {}) if isinstance(data, dict) else {}
@@ -558,6 +565,10 @@ class BotConfigStore:
                     "user_voices": {
                         str(user_id): voice
                         for user_id, voice in sorted(config.user_voices.items())
+                    },
+                    "user_fixed_phrases": {
+                        str(user_id): phrase
+                        for user_id, phrase in sorted(config.user_fixed_phrases.items())
                     },
                 }
                 for guild_id, config in sorted(self.guilds.items())
@@ -599,6 +610,7 @@ class BotConfigStore:
         config = self.get_guild(guild_id)
         config.allowed_users.discard(user_id)
         config.user_voices.pop(user_id, None)
+        config.user_fixed_phrases.pop(user_id, None)
         self.save()
 
     def set_enabled(self, guild_id: int, enabled: bool) -> None:
@@ -620,6 +632,17 @@ class BotConfigStore:
     def voice_for_user(self, guild_id: int, user_id: int) -> str:
         config = self.get_guild(guild_id)
         return config.user_voices.get(user_id, config.default_voice)
+
+    def set_user_fixed_phrase(self, guild_id: int, user_id: int, phrase: str) -> None:
+        self.get_guild(guild_id).user_fixed_phrases[user_id] = phrase
+        self.save()
+
+    def clear_user_fixed_phrase(self, guild_id: int, user_id: int) -> None:
+        self.get_guild(guild_id).user_fixed_phrases.pop(user_id, None)
+        self.save()
+
+    def fixed_phrase_for_user(self, guild_id: int, user_id: int) -> str | None:
+        return self.get_guild(guild_id).user_fixed_phrases.get(user_id)
 
     def emoji_say_map(self) -> dict[str, str]:
         """id -> spoken word, for substitution during normalization."""
@@ -2912,12 +2935,13 @@ async def on_message(message: discord.Message) -> None:
         and message.author.voice
         and isinstance(message.author.voice.channel, discord.VoiceChannel)
     ):
+        fixed_phrase = bot.config_store.fixed_phrase_for_user(message.guild.id, message.author.id)
         await bot.queue_or_merge_message(
-            message.content,
+            fixed_phrase if fixed_phrase is not None else message.content,
             message.author.voice.channel,
             message.author.id,
             message.channel.id,
-            mentions=build_mention_say_map(message),
+            mentions={} if fixed_phrase is not None else build_mention_say_map(message),
         )
 
     await bot.process_commands(message)
@@ -3104,6 +3128,35 @@ async def slash_tts_voice_clear(interaction: discord.Interaction, user: discord.
     assert guild is not None
     bot.config_store.clear_user_voice(guild.id, user.id)
     await interaction.response.send_message(f"Персональная озвучка сброшена: {user.mention}", ephemeral=True)
+
+
+@tts_group.command(name="voice-say-set", description="Всегда озвучивать вместо сообщений пользователя фиксированную фразу")
+@app_commands.describe(user="Пользователь", phrase="Фраза, которая будет озвучиваться вместо его сообщений")
+async def slash_tts_voice_say_set(interaction: discord.Interaction, user: discord.Member, phrase: str) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    phrase = phrase.strip()
+    if not phrase:
+        await interaction.response.send_message("Фраза не может быть пустой.", ephemeral=True)
+        return
+    guild = interaction.guild
+    assert guild is not None
+    bot.config_store.set_user_fixed_phrase(guild.id, user.id, phrase)
+    await interaction.response.send_message(
+        f"Для {user.mention} вместо сообщений теперь всегда озвучивается: «{phrase}».",
+        ephemeral=True,
+    )
+
+
+@tts_group.command(name="voice-say-clear", description="Убрать фиксированную фразу пользователя")
+@app_commands.describe(user="Пользователь")
+async def slash_tts_voice_say_clear(interaction: discord.Interaction, user: discord.Member) -> None:
+    if not await require_guild_manager(interaction):
+        return
+    guild = interaction.guild
+    assert guild is not None
+    bot.config_store.clear_user_fixed_phrase(guild.id, user.id)
+    await interaction.response.send_message(f"Фиксированная фраза сброшена: {user.mention}", ephemeral=True)
 
 
 @tts_group.command(name="voices", description="Показать доступные озвучки")
