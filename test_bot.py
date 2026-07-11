@@ -175,7 +175,10 @@ class TTSBotTests(unittest.TestCase):
         bot = load_bot_module()
 
         command_names = {command.name for command in bot.tts_group.commands}
-        self.assertTrue({"voice-set", "voice-user", "voice-clear", "voices"} <= command_names)
+        self.assertTrue(
+            {"voice-set", "voice-user", "voice-clear", "voice-say-set", "voice-say-clear", "voices"}
+            <= command_names
+        )
 
     def test_config_store_removes_user_voice_when_user_denied(self):
         bot = load_bot_module()
@@ -189,6 +192,50 @@ class TTSBotTests(unittest.TestCase):
             config = store.get_guild(10)
             self.assertNotIn(222, config.allowed_users)
             self.assertNotIn(222, config.user_voices)
+
+    def test_config_store_persists_user_fixed_phrase(self):
+        bot = load_bot_module()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            store = bot.BotConfigStore(path, {111})
+
+            self.assertIsNone(store.fixed_phrase_for_user(10, 222))
+
+            store.set_user_fixed_phrase(10, 222, "Бип-боп, это робот")
+
+            loaded = bot.BotConfigStore(path, set())
+            self.assertEqual(loaded.fixed_phrase_for_user(10, 222), "Бип-боп, это робот")
+
+            loaded.clear_user_fixed_phrase(10, 222)
+            self.assertIsNone(loaded.fixed_phrase_for_user(10, 222))
+
+    def test_config_store_removes_user_fixed_phrase_when_user_denied(self):
+        bot = load_bot_module()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = bot.BotConfigStore(Path(tmp_dir) / "config.json", set())
+            store.add_user(10, 222)
+            store.set_user_fixed_phrase(10, 222, "Заглушка")
+            store.remove_user(10, 222)
+
+            config = store.get_guild(10)
+            self.assertNotIn(222, config.user_fixed_phrases)
+
+    def test_config_store_ignores_blank_or_invalid_saved_fixed_phrases(self):
+        bot = load_bot_module()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(
+                '{"guilds":{"10":{"user_fixed_phrases":{"222":"   ","333":"ok","abc":"bad"}}}}',
+                encoding="utf-8",
+            )
+
+            store = bot.BotConfigStore(path, set())
+            config = store.get_guild(10)
+
+            self.assertEqual(config.user_fixed_phrases, {333: "ok"})
 
     def test_config_store_ignores_unknown_saved_voice_profiles(self):
         bot = load_bot_module()
