@@ -128,15 +128,15 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
         cloud.stream_audio = lambda *a, **k: _slow_tail()
         tts_bot.tts_dispatcher._cloud = cloud
 
-        original = bot_mod.TTS_STREAM_TTFA_TIMEOUT
-        bot_mod.TTS_STREAM_TTFA_TIMEOUT = 0.1  # tiny: would kill the tail if misapplied
+        original = bot_mod.config.TTS_STREAM_TTFA_TIMEOUT
+        bot_mod.config.TTS_STREAM_TTFA_TIMEOUT = 0.1  # tiny: would kill the tail if misapplied
         try:
             source = FakeSource(bot_mod.PCM_FRAME_BYTES)
             status, frames = await tts_bot._stream_tts_to_source(
                 source, _minimax_voice(), _job(bot_mod)
             )
         finally:
-            bot_mod.TTS_STREAM_TTFA_TIMEOUT = original
+            bot_mod.config.TTS_STREAM_TTFA_TIMEOUT = original
 
         self.assertEqual(status, "ok")
         self.assertGreater(frames, 10)  # full ~0.4s clip decoded despite slow tail

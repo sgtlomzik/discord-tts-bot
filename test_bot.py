@@ -56,17 +56,17 @@ class TTSBotTests(unittest.TestCase):
 
     def test_selective_hold_default_separator_is_comma(self):
         bot = load_bot_module()
-        self.assertEqual(bot.TTS_SELECTIVE_HOLD_JOIN_SEPARATOR, ", ")
+        self.assertEqual(bot.config.TTS_SELECTIVE_HOLD_JOIN_SEPARATOR, ", ")
 
     def test_invalid_merge_algorithm_falls_back_to_legacy(self):
         with patch.dict("os.environ", {"TTS_MERGE_ALGORITHM": "mystery"}):
             bot = load_bot_module()
-        self.assertEqual(bot.TTS_MERGE_ALGORITHM, "legacy")
+        self.assertEqual(bot.config.TTS_MERGE_ALGORITHM, "legacy")
 
     def test_runtime_has_ruslan_and_irina_piper_voices(self):
         bot = load_bot_module()
 
-        self.assertEqual(bot.DEFAULT_VOICE_PROFILE, "piper-ruslan")
+        self.assertEqual(bot.config.DEFAULT_VOICE_PROFILE, "piper-ruslan")
         self.assertEqual(
             list(bot.VOICE_PROFILES),
             ["piper-ruslan", "piper-irina"],
@@ -250,7 +250,7 @@ class TTSBotTests(unittest.TestCase):
             store = bot.BotConfigStore(path, set())
             config = store.get_guild(10)
 
-            self.assertEqual(config.default_voice, bot.DEFAULT_VOICE_PROFILE)
+            self.assertEqual(config.default_voice, bot.config.DEFAULT_VOICE_PROFILE)
             self.assertEqual(config.user_voices, {})
 
     def test_playback_prepare_command_adds_preroll_after_speech_trim(self):
@@ -269,9 +269,9 @@ class TTSBotTests(unittest.TestCase):
     def test_default_preroll_and_idle_frames_are_silent(self):
         bot = load_bot_module()
 
-        self.assertEqual(bot.TTS_PREROLL_MODE, "silence")
-        self.assertEqual(bot.TTS_IDLE_FRAME_MODE, "silence")
-        self.assertIn("anullsrc", bot.build_preroll_lavfi_source(bot.TTS_PREROLL_MODE, "0.2"))
+        self.assertEqual(bot.config.TTS_PREROLL_MODE, "silence")
+        self.assertEqual(bot.config.TTS_IDLE_FRAME_MODE, "silence")
+        self.assertIn("anullsrc", bot.build_preroll_lavfi_source(bot.config.TTS_PREROLL_MODE, "0.2"))
 
     def test_preroll_lavfi_source_supports_sine_noise_and_silence(self):
         bot = load_bot_module()
@@ -379,7 +379,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tts_worker_uses_continuous_stream_when_enabled(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_CONTINUOUS_STREAM = True
+        bot_mod.config.TTS_CONTINUOUS_STREAM = True
         tts_bot = bot_mod.TTSBot()
 
         source = types.SimpleNamespace(enqueue_frames=MagicMock(), wait_until_drained=AsyncMock(return_value=True))
@@ -410,7 +410,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tts_worker_uses_play_file_when_continuous_stream_disabled(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_CONTINUOUS_STREAM = False
+        bot_mod.config.TTS_CONTINUOUS_STREAM = False
         tts_bot = bot_mod.TTSBot()
 
         tts_bot.wait_until_ready = AsyncMock()
@@ -555,7 +555,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auto_connect_skips_when_disabled(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_AUTO_CONNECT_ENABLED = False
+        bot_mod.config.TTS_AUTO_CONNECT_ENABLED = False
         tts_bot = bot_mod.TTSBot()
         tts_bot.config_store = temp_config_store(bot_mod, {441612025286885397})
         tts_bot.ensure_voice = AsyncMock()
@@ -678,8 +678,8 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_queue_or_merge_short_messages_combines_text(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "legacy"
-        bot_mod.TTS_MERGE_WINDOW_MS = 100000
+        bot_mod.config.TTS_MERGE_ALGORITHM = "legacy"
+        bot_mod.config.TTS_MERGE_WINDOW_MS = 100000
         tts_bot = bot_mod.TTSBot()
         tts_bot.config_store = temp_config_store(bot_mod, {300})
 
@@ -701,7 +701,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_starts_buffer_for_meaningful_starter(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
 
         guild = types.SimpleNamespace(id=100)
@@ -711,7 +711,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_emoji_inside_buffer_forces_flush_before_new(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
 
         guild = types.SimpleNamespace(id=100)
@@ -725,8 +725,8 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_fixture_meaningful_series_stays_together_until_limit(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
-        bot_mod.TTS_SELECTIVE_HOLD_MAX_PARTS = 5
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_SELECTIVE_HOLD_MAX_PARTS = 5
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -742,7 +742,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_fixture_single_digit_appends_inside_buffer(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -755,7 +755,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_fixture_single_reaction_after_pause_is_immediate(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -770,8 +770,8 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_reaction_pause_applies_only_outside_active_buffer(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
-        bot_mod.TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS = 100
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS = 100
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -785,7 +785,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_applies_to_any_allowed_author(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -797,7 +797,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_with_empty_target_users_still_uses_selective_path(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -809,7 +809,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_custom_emoji_raw_length_over_40_is_not_long_or_spoken_raw(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -822,7 +822,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_active_buffer_plus_question_flushes_before_question(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -837,8 +837,8 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_hard_cap_is_based_on_first_message(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
-        bot_mod.TTS_SELECTIVE_HOLD_HARD_CAP_MS = 1200
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_SELECTIVE_HOLD_HARD_CAP_MS = 1200
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -853,7 +853,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_old_buffer_enqueue_failure_blocks_later_message(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -866,7 +866,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_active_buffer_plus_immediate_long_preserves_order(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -881,7 +881,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_stale_timer_does_not_flush_new_generation(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -897,7 +897,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_logs_stale_timer_ignored(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)
@@ -914,7 +914,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selective_hold_double_flush_emits_once(self):
         bot_mod = load_bot_module()
-        bot_mod.TTS_MERGE_ALGORITHM = "selective_hold_v2"
+        bot_mod.config.TTS_MERGE_ALGORITHM = "selective_hold_v2"
         tts_bot = bot_mod.TTSBot()
         guild = types.SimpleNamespace(id=100)
         voice_channel = types.SimpleNamespace(id=200, guild=guild)

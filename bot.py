@@ -39,122 +39,23 @@ from tts_providers import (
     load_minimax_config_from_env,
 )
 import voice_registry
+from ttsbot import config
 
+# Re-read the environment on every exec of this file: production gets the
+# same env-derived state as before the package split, and each test load
+# of bot.py starts from a clean configuration.
+config.reload()
+config.setup_logging()
 
-LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format=LOG_FORMAT)
 log = logging.getLogger("tts_bot")
 
-TMP_DIR = Path(os.getenv("TTS_TMP_DIR", "/dev/shm"))
+parse_user_ids = config.parse_user_ids
+
 PCM_SAMPLE_RATE = 48000
 PCM_CHANNELS = 2
 PCM_SAMPLE_WIDTH = 2
 PCM_FRAME_MS = 20
 PCM_FRAME_BYTES = int(PCM_SAMPLE_RATE * PCM_FRAME_MS / 1000) * PCM_CHANNELS * PCM_SAMPLE_WIDTH
-BOT_CONFIG_PATH = Path(os.getenv("BOT_CONFIG_PATH", "/app/data/config.json"))
-# Catalog of available voices (Piper + MiniMax). Lives in the mounted
-# ./data volume next to config.json; seeded on first start. This is the
-# CATALOG only — selection state stays in BotConfigStore/config.json.
-VOICES_REGISTRY_PATH = Path(
-    os.getenv("VOICES_REGISTRY_PATH", str(BOT_CONFIG_PATH.parent / "voices.json"))
-)
-DEFAULT_WHITELIST = "441612025286885397"
-DEFAULT_VOICE_PROFILE = os.getenv("TTS_DEFAULT_VOICE_PROFILE", "piper-ruslan").strip()
-
-TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-MAX_TEXT_LENGTH = int(os.getenv("TTS_MAX_TEXT_LENGTH", "500"))
-# Per-message character cap applied at the enqueue boundary, before
-# any provider is invoked. The spec recommends ~300 to protect the
-# cloud API quota from accidental walls of text. Default 300; the
-# legacy TTS_MAX_TEXT_LENGTH cap (500) is still the hard ceiling if
-# this is unset/zero.
-TTS_MAX_CHARS = int(os.getenv("TTS_MAX_CHARS", "300"))
-QUEUE_MAXSIZE = int(os.getenv("TTS_QUEUE_MAXSIZE", "50"))
-TTS_PREROLL_MS = int(os.getenv("TTS_PREROLL_MS", os.getenv("TTS_START_PAD_MS", "250")))
-TTS_PREROLL_MODE = os.getenv("TTS_PREROLL_MODE", "silence").strip().lower()
-TTS_PREROLL_VOLUME_DB = float(os.getenv("TTS_PREROLL_VOLUME_DB", "-90"))
-TTS_SILENCE_TAIL_MS = int(os.getenv("TTS_SILENCE_TAIL_MS", "200"))
-TTS_CONTINUOUS_STREAM = os.getenv("TTS_CONTINUOUS_STREAM", "1").strip().lower() not in {"0", "false", "no"}
-# Stream MiniMax audio chunk-by-chunk so the bot starts talking before the
-# whole clip is generated (cuts Time-To-First-Audio). Requires the
-# continuous stream. Feature-flagged for instant revert without a redeploy.
-TTS_STREAMING_ENABLED = os.getenv("TTS_STREAMING_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
-# Budget for the FIRST audio chunk only. After the first chunk the stream
-# lives as long as it needs (long messages legitimately stream for seconds).
-TTS_STREAM_TTFA_TIMEOUT = float(os.getenv("TTS_STREAM_TTFA_TIMEOUT", os.getenv("TTS_REQUEST_TIMEOUT", "2.5")))
-# Prefetch: decouple generation from playback so message N+1 is synthesized
-# while N is still playing (cuts queue_wait under bursts). Playback stays
-# strictly sequential FIFO. TTS_PREFETCH_ENABLED=0 reverts to the proven
-# single-worker path (runtime kill-switch). Lookahead = messages generated
-# ahead (1 is plenty; playback serializes anyway).
-TTS_PREFETCH_ENABLED = os.getenv("TTS_PREFETCH_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
-TTS_PREFETCH_LOOKAHEAD = max(1, int(os.getenv("TTS_PREFETCH_LOOKAHEAD", "1")))
-TTS_IDLE_FRAME_MODE = os.getenv("TTS_IDLE_FRAME_MODE", "silence").strip().lower()
-TTS_IDLE_VOLUME_DB = float(os.getenv("TTS_IDLE_VOLUME_DB", "-60"))
-TTS_STREAM_TAIL_MS = int(os.getenv("TTS_STREAM_TAIL_MS", "200"))
-TTS_MAX_CONTINUOUS_IDLE_SECONDS = int(os.getenv("TTS_MAX_CONTINUOUS_IDLE_SECONDS", "900"))
-IDLE_DISCONNECT_SECONDS = int(os.getenv("TTS_IDLE_DISCONNECT_SECONDS", "60"))
-TTS_AUTO_CONNECT_ENABLED = os.getenv("TTS_AUTO_CONNECT_ENABLED", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-}
-AUTO_CONNECT_SUPPRESS_SECONDS = int(os.getenv("TTS_AUTO_CONNECT_SUPPRESS_SECONDS", "30"))
-TTS_TRIM_SILENCE = os.getenv("TTS_TRIM_SILENCE", "1").strip().lower() not in {"0", "false", "no"}
-FFMPEG_LOW_DELAY = os.getenv("FFMPEG_LOW_DELAY", "1").strip().lower() not in {"0", "false", "no"}
-TTS_MERGE_SHORT_MESSAGES = os.getenv("TTS_MERGE_SHORT_MESSAGES", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-}
-TTS_MERGE_MAX_CHARS = int(os.getenv("TTS_MERGE_MAX_CHARS", "40"))
-TTS_MERGE_WINDOW_MS = int(os.getenv("TTS_MERGE_WINDOW_MS", "900"))
-TTS_MERGE_MAX_PARTS = int(os.getenv("TTS_MERGE_MAX_PARTS", "4"))
-TTS_MERGE_ALGORITHM = os.getenv("TTS_MERGE_ALGORITHM", "legacy").strip().lower()
-if TTS_MERGE_ALGORITHM not in {"legacy", "selective_hold_v2", "off"}:
-    log.warning("Unknown TTS_MERGE_ALGORITHM=%s; using legacy", TTS_MERGE_ALGORITHM)
-    TTS_MERGE_ALGORITHM = "legacy"
-TTS_SELECTIVE_HOLD_ENABLED = os.getenv("TTS_SELECTIVE_HOLD_ENABLED", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-}
-TTS_SELECTIVE_HOLD_HARD_CAP_MS = int(os.getenv("TTS_SELECTIVE_HOLD_HARD_CAP_MS", "1200"))
-TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN = int(os.getenv("TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN", "10"))
-TTS_SELECTIVE_HOLD_START_MIN_WORDS_ALT = int(os.getenv("TTS_SELECTIVE_HOLD_START_MIN_WORDS_ALT", "2"))
-TTS_SELECTIVE_HOLD_START_MIN_EFFECTIVE_LEN_ALT = int(os.getenv("TTS_SELECTIVE_HOLD_START_MIN_EFFECTIVE_LEN_ALT", "6"))
-TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS = int(os.getenv("TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS", "5000"))
-TTS_SELECTIVE_HOLD_MAX_PARTS = int(os.getenv("TTS_SELECTIVE_HOLD_MAX_PARTS", "3"))
-TTS_SELECTIVE_HOLD_MAX_GROUP_EFFECTIVE_LEN = int(os.getenv("TTS_SELECTIVE_HOLD_MAX_GROUP_EFFECTIVE_LEN", "56"))
-TTS_SELECTIVE_HOLD_JOIN_SEPARATOR = os.getenv("TTS_SELECTIVE_HOLD_JOIN_SEPARATOR", ", ")
-TTS_SELECTIVE_HOLD_DROP_URL_ONLY = os.getenv("TTS_SELECTIVE_HOLD_DROP_URL_ONLY", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-}
-TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY = os.getenv("TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-}
-TTS_SELECTIVE_HOLD_LOG_DECISIONS = os.getenv("TTS_SELECTIVE_HOLD_LOG_DECISIONS", "0").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-}
-TTS_SELECTIVE_HOLD_ENABLE_ORDER_PRESERVING_FLUSH = os.getenv(
-    "TTS_SELECTIVE_HOLD_ENABLE_ORDER_PRESERVING_FLUSH", "1"
-).strip().lower() not in {"0", "false", "no"}
-TTS_QUEUE_PUT_TIMEOUT_MS = int(os.getenv("TTS_QUEUE_PUT_TIMEOUT_MS", "500"))
-
-VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
-PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "/app/models/ru_RU-ruslan-medium.onnx").strip()
-PIPER_CONFIG_PATH = os.getenv(
-    "PIPER_CONFIG_PATH",
-    "/app/models/ru_RU-ruslan-medium.onnx.json",
-).strip()
-PIPER_SPEAKER = int(os.getenv("PIPER_SPEAKER", "-1"))
-PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.0"))
 
 EMOJI_MAP = {
     "Blya2x": "Бля",
@@ -324,22 +225,6 @@ def speak_unicode_emoji(text: str) -> str:
     return "".join(out)
 
 
-def parse_user_ids(value: str) -> set[int]:
-    user_ids: set[int] = set()
-    for part in value.replace(";", ",").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            user_ids.add(int(part))
-        except ValueError:
-            log.warning("Ignoring invalid WHITELIST_USERS entry: %r", part)
-    return user_ids
-
-
-WHITELIST_USERS = parse_user_ids(os.getenv("WHITELIST_USERS", DEFAULT_WHITELIST))
-
-
 @dataclass(frozen=True)
 class VoiceProfile:
     name: str
@@ -354,7 +239,7 @@ class VoiceProfile:
 class GuildConfig:
     enabled: bool = True
     allowed_users: set[int] = field(default_factory=set)
-    default_voice: str = DEFAULT_VOICE_PROFILE
+    default_voice: str = config.DEFAULT_VOICE_PROFILE
     user_voices: dict[int, str] = field(default_factory=dict)
     user_fixed_phrases: dict[int, str] = field(default_factory=dict)
 
@@ -443,32 +328,31 @@ VOICE_PROFILES: dict[str, VoiceProfile] = {
     "piper-ruslan": VoiceProfile(
         name="piper-ruslan",
         label="Piper Ruslan",
-        piper_model_path=PIPER_MODEL_PATH,
-        piper_config_path=PIPER_CONFIG_PATH,
-        piper_speaker=PIPER_SPEAKER,
-        piper_length_scale=PIPER_LENGTH_SCALE,
+        piper_model_path=config.PIPER_MODEL_PATH,
+        piper_config_path=config.PIPER_CONFIG_PATH,
+        piper_speaker=config.PIPER_SPEAKER,
+        piper_length_scale=config.PIPER_LENGTH_SCALE,
     ),
     "piper-irina": VoiceProfile(
         name="piper-irina",
         label="Piper Irina",
         piper_model_path="/app/models/ru_RU-irina-medium.onnx",
         piper_config_path="/app/models/ru_RU-irina-medium.onnx.json",
-        piper_speaker=PIPER_SPEAKER,
-        piper_length_scale=PIPER_LENGTH_SCALE,
+        piper_speaker=config.PIPER_SPEAKER,
+        piper_length_scale=config.PIPER_LENGTH_SCALE,
     ),
 }
 
-if DEFAULT_VOICE_PROFILE not in VOICE_PROFILES:
-    log.warning("Unknown TTS_DEFAULT_VOICE_PROFILE=%s; using piper-ruslan", DEFAULT_VOICE_PROFILE)
-    DEFAULT_VOICE_PROFILE = "piper-ruslan"
+if config.DEFAULT_VOICE_PROFILE not in VOICE_PROFILES:
+    log.warning(
+        "Unknown TTS_DEFAULT_VOICE_PROFILE=%s; using piper-ruslan", config.DEFAULT_VOICE_PROFILE
+    )
+    config.DEFAULT_VOICE_PROFILE = "piper-ruslan"
 
-if TTS_PREROLL_MODE not in {"noise", "sine", "silence"}:
-    log.warning("Unknown TTS_PREROLL_MODE=%s; using noise", TTS_PREROLL_MODE)
-    TTS_PREROLL_MODE = "noise"
-
-if TTS_IDLE_FRAME_MODE not in {"comfort_noise", "silence"}:
-    log.warning("Unknown TTS_IDLE_FRAME_MODE=%s; using comfort_noise", TTS_IDLE_FRAME_MODE)
-    TTS_IDLE_FRAME_MODE = "comfort_noise"
+# Snapshot of the env-derived configuration for read-only consumers (the
+# tests read constants off this module). Writes that must affect runtime
+# behavior go through ``config.NAME`` — code reads config at call time.
+globals().update({_k: _v for _k, _v in vars(config).items() if _k.isupper()})
 
 
 class BotConfigStore:
@@ -521,9 +405,9 @@ class BotConfigStore:
                 for user_id, voice in raw_config.get("user_voices", {}).items()
                 if str(user_id).isdigit() and self._is_valid_voice(voice)
             }
-            default_voice = raw_config.get("default_voice", DEFAULT_VOICE_PROFILE)
+            default_voice = raw_config.get("default_voice", config.DEFAULT_VOICE_PROFILE)
             if not self._is_valid_voice(default_voice):
-                default_voice = DEFAULT_VOICE_PROFILE
+                default_voice = config.DEFAULT_VOICE_PROFILE
             user_fixed_phrases = {
                 int(user_id): phrase
                 for user_id, phrase in raw_config.get("user_fixed_phrases", {}).items()
@@ -735,7 +619,7 @@ def normalize_for_tts(
     if not text:
         return None
 
-    limit = max_chars if max_chars is not None else MAX_TEXT_LENGTH
+    limit = max_chars if max_chars is not None else config.MAX_TEXT_LENGTH
     if limit and len(text) > limit:
         text = text[:limit].rstrip()
         if not text:
@@ -825,12 +709,12 @@ def analyze_message_for_merge(
             effective_length += min(len(word), 3)
         else:
             effective_length += min(len(word), 12)
-    if is_url_only and TTS_SELECTIVE_HOLD_DROP_URL_ONLY:
+    if is_url_only and config.TTS_SELECTIVE_HOLD_DROP_URL_ONLY:
         spoken_text = ""
         effective_length = 0
     # A bare mention now resolves to a name (feature: read mentions aloud), so
     # only drop a mention-only message when nothing resolved (e.g. unknown id).
-    if is_mention_only and TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY and not spoken_text:
+    if is_mention_only and config.TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY and not spoken_text:
         spoken_text = ""
         effective_length = 0
     return ParsedMessage(
@@ -908,9 +792,9 @@ def build_playback_filter_complex(
 
 
 def build_playback_prepare_command(source: Path, prepared: Path) -> list[str]:
-    preroll_seconds = seconds_from_ms(TTS_PREROLL_MS)
-    tail_seconds = seconds_from_ms(TTS_SILENCE_TAIL_MS)
-    filter_complex = build_playback_filter_complex(TTS_TRIM_SILENCE, TTS_PREROLL_VOLUME_DB)
+    preroll_seconds = seconds_from_ms(config.TTS_PREROLL_MS)
+    tail_seconds = seconds_from_ms(config.TTS_SILENCE_TAIL_MS)
+    filter_complex = build_playback_filter_complex(config.TTS_TRIM_SILENCE, config.TTS_PREROLL_VOLUME_DB)
 
     return [
         "ffmpeg",
@@ -923,7 +807,7 @@ def build_playback_prepare_command(source: Path, prepared: Path) -> list[str]:
         "-f",
         "lavfi",
         "-i",
-        build_preroll_lavfi_source(TTS_PREROLL_MODE, preroll_seconds),
+        build_preroll_lavfi_source(config.TTS_PREROLL_MODE, preroll_seconds),
         "-f",
         "lavfi",
         "-i",
@@ -944,7 +828,7 @@ def build_playback_prepare_command(source: Path, prepared: Path) -> list[str]:
 
 def build_tts_pcm_command(source: Path) -> list[str]:
     audio_filters: list[str] = ["aformat=sample_rates=48000:channel_layouts=stereo"]
-    if TTS_TRIM_SILENCE:
+    if config.TTS_TRIM_SILENCE:
         audio_filters.append(
             "silenceremove="
             "start_periods=1:start_silence=0.03:start_threshold=-50dB:"
@@ -1088,12 +972,12 @@ class TTSBot(commands.Bot):
     def __init__(self) -> None:
         super().__init__(command_prefix=("!tts ", "!tts"), intents=intents)
         self.started_at = time.time()  # process start, for the stats uptime
-        self.message_queue: asyncio.Queue[TTSJob] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+        self.message_queue: asyncio.Queue[TTSJob] = asyncio.Queue(maxsize=config.QUEUE_MAXSIZE)
         self.worker_task: asyncio.Task[None] | None = None
         # Prefetch pipeline: generation worker fills ready_queue (bounded by
         # lookahead) with PreparedAudio; playback worker drains it in order.
         self.ready_queue: asyncio.Queue[PreparedAudio] = asyncio.Queue(
-            maxsize=TTS_PREFETCH_LOOKAHEAD
+            maxsize=config.TTS_PREFETCH_LOOKAHEAD
         )
         self.generation_task: asyncio.Task[None] | None = None
         self.playback_task: asyncio.Task[None] | None = None
@@ -1110,15 +994,15 @@ class TTSBot(commands.Bot):
         # BotConfigStore.
         _mm_seed = load_minimax_config_from_env()
         self.voice_registry = voice_registry.load_or_seed(
-            VOICES_REGISTRY_PATH,
+            config.VOICES_REGISTRY_PATH,
             VOICE_PROFILES,
-            fallback_profile=DEFAULT_VOICE_PROFILE,
+            fallback_profile=config.DEFAULT_VOICE_PROFILE,
             minimax_voice_id=_mm_seed.voice_id,
             minimax_model=_mm_seed.model,
             minimax_language_boost=_mm_seed.language_boost,
         )
         self.config_store = BotConfigStore(
-            BOT_CONFIG_PATH, WHITELIST_USERS, voice_registry=self.voice_registry
+            config.BOT_CONFIG_PATH, config.WHITELIST_USERS, voice_registry=self.voice_registry
         )
         self.piper_voices: dict[tuple[str, str], object] = {}
         # TTS provider abstraction (see tts_providers.py). Skeleton
@@ -1155,7 +1039,7 @@ class TTSBot(commands.Bot):
             log.info("Slash commands synced count=%s group=/%s", len(synced), tts_group.name)
         except Exception:
             log.exception("Failed to sync slash commands")
-        if TTS_PREFETCH_ENABLED:
+        if config.TTS_PREFETCH_ENABLED:
             self.generation_task = asyncio.create_task(
                 self._generation_worker(), name="tts-generation")
             self.playback_task = asyncio.create_task(
@@ -1209,12 +1093,12 @@ class TTSBot(commands.Bot):
         return lock
 
     def set_voice_connect_cooldown(self, guild_id: int, reason: str) -> None:
-        until = time.monotonic() + VOICE_CONNECT_COOLDOWN_SECONDS
+        until = time.monotonic() + config.VOICE_CONNECT_COOLDOWN_SECONDS
         self.voice_connect_cooldown_until[guild_id] = until
         log.warning(
             "Voice connect cooldown set guild=%s seconds=%s reason=%s",
             guild_id,
-            VOICE_CONNECT_COOLDOWN_SECONDS,
+            config.VOICE_CONNECT_COOLDOWN_SECONDS,
             reason,
         )
 
@@ -1230,14 +1114,14 @@ class TTSBot(commands.Bot):
         return remaining
 
     def suppress_auto_connect(self, guild_id: int, reason: str) -> None:
-        if AUTO_CONNECT_SUPPRESS_SECONDS <= 0:
+        if config.AUTO_CONNECT_SUPPRESS_SECONDS <= 0:
             return
-        until = time.monotonic() + AUTO_CONNECT_SUPPRESS_SECONDS
+        until = time.monotonic() + config.AUTO_CONNECT_SUPPRESS_SECONDS
         self.suppress_auto_connect_until[guild_id] = until
         log.info(
             "Auto-connect suppressed guild=%s seconds=%s reason=%s",
             guild_id,
-            AUTO_CONNECT_SUPPRESS_SECONDS,
+            config.AUTO_CONNECT_SUPPRESS_SECONDS,
             reason,
         )
 
@@ -1259,7 +1143,7 @@ class TTSBot(commands.Bot):
             name=f"idle-disconnect-{guild.id}",
         )
         self.idle_disconnect_tasks[guild.id] = task
-        log.info("Scheduled idle disconnect guild=%s timeout=%ss", guild.id, IDLE_DISCONNECT_SECONDS)
+        log.info("Scheduled idle disconnect guild=%s timeout=%ss", guild.id, config.IDLE_DISCONNECT_SECONDS)
 
     def has_active_voice_playback(self, guild_id: int, vc: discord.VoiceClient) -> bool:
         source = self.continuous_sources.get(guild_id)
@@ -1281,8 +1165,8 @@ class TTSBot(commands.Bot):
         try:
             poll_interval = 5.0
             elapsed = 0.0
-            while elapsed < IDLE_DISCONNECT_SECONDS:
-                remaining = IDLE_DISCONNECT_SECONDS - elapsed
+            while elapsed < config.IDLE_DISCONNECT_SECONDS:
+                remaining = config.IDLE_DISCONNECT_SECONDS - elapsed
                 await asyncio.sleep(min(poll_interval, remaining))
                 elapsed += poll_interval
 
@@ -1333,7 +1217,7 @@ class TTSBot(commands.Bot):
             log.exception("Idle disconnect task failed guild=%s", guild.id)
 
     def schedule_continuous_idle_stop(self, guild: discord.Guild) -> None:
-        if not TTS_CONTINUOUS_STREAM or TTS_MAX_CONTINUOUS_IDLE_SECONDS <= 0:
+        if not config.TTS_CONTINUOUS_STREAM or config.TTS_MAX_CONTINUOUS_IDLE_SECONDS <= 0:
             return
 
         self.cancel_continuous_idle_stop(guild.id)
@@ -1345,12 +1229,12 @@ class TTSBot(commands.Bot):
         log.info(
             "Scheduled continuous stream idle stop guild=%s timeout=%ss",
             guild.id,
-            TTS_MAX_CONTINUOUS_IDLE_SECONDS,
+            config.TTS_MAX_CONTINUOUS_IDLE_SECONDS,
         )
 
     async def _continuous_idle_stop_after_timeout(self, guild: discord.Guild) -> None:
         try:
-            await asyncio.sleep(TTS_MAX_CONTINUOUS_IDLE_SECONDS)
+            await asyncio.sleep(config.TTS_MAX_CONTINUOUS_IDLE_SECONDS)
 
             source = self.continuous_sources.get(guild.id)
             if not source or source.stopped:
@@ -1469,7 +1353,7 @@ class TTSBot(commands.Bot):
         return vc
 
     async def warmup_tts(self) -> None:
-        filename = TMP_DIR / f"warmup_{uuid.uuid4().hex}.wav"
+        filename = config.TMP_DIR / f"warmup_{uuid.uuid4().hex}.wav"
         try:
             # Warm Piper ONNX directly, bypassing the dispatcher. The
             # whole point of warmup is to preload the local model so the
@@ -1518,7 +1402,7 @@ class TTSBot(commands.Bot):
         name = (
             voice_profile
             or self.voice_registry.fallback_profile
-            or DEFAULT_VOICE_PROFILE
+            or config.DEFAULT_VOICE_PROFILE
         )
         rec = self.voice_registry.get(name)
         if rec is not None and rec.is_piper and rec.piper is not None:
@@ -1530,11 +1414,11 @@ class TTSBot(commands.Bot):
                 piper_speaker=rec.piper.speaker,
                 piper_length_scale=rec.piper.length_scale,
             )
-        return VOICE_PROFILES.get(name, VOICE_PROFILES[DEFAULT_VOICE_PROFILE])
+        return VOICE_PROFILES.get(name, VOICE_PROFILES[config.DEFAULT_VOICE_PROFILE])
 
     def persist_voice_registry(self) -> None:
         """Atomically write the current catalog to data/voices.json."""
-        voice_registry.save_registry(VOICES_REGISTRY_PATH, self.voice_registry)
+        voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
 
     async def validate_minimax_voice(self, voice_id: str) -> tuple[bool, str]:
         """Probe a MiniMax voice_id with a short phrase.
@@ -1546,7 +1430,7 @@ class TTSBot(commands.Bot):
         cloud = getattr(self.tts_dispatcher, "cloud", None)
         if cloud is None:
             return False, "MiniMax не настроен (нет MINIMAX_API_KEY)."
-        tmp = TMP_DIR / f"voiceadd_{uuid.uuid4().hex}.mp3"
+        tmp = config.TMP_DIR / f"voiceadd_{uuid.uuid4().hex}.mp3"
         try:
             await cloud.synthesize("проверка голоса", tmp, voice_id=voice_id)
             return True, ""
@@ -1626,7 +1510,7 @@ class TTSBot(commands.Bot):
         # from accidental walls of text and keeps Piper CPU bounded.
         cleaned = normalize_for_tts(
             text,
-            max_chars=TTS_MAX_CHARS,
+            max_chars=config.TTS_MAX_CHARS,
             emoji_aliases=self.config_store.emoji_say_map(),
         )
         if not cleaned:
@@ -1650,7 +1534,7 @@ class TTSBot(commands.Bot):
             )
             await asyncio.wait_for(
                 self.message_queue.put(job),
-                timeout=max(TTS_QUEUE_PUT_TIMEOUT_MS, 1) / 1000.0,
+                timeout=max(config.TTS_QUEUE_PUT_TIMEOUT_MS, 1) / 1000.0,
             )
             log.info(
                 "Queued TTS guild=%s text_channel=%s voice_channel=%s author=%s queue=%s chars=%s voice=%s",
@@ -1680,10 +1564,10 @@ class TTSBot(commands.Bot):
         return generation
 
     def _decision_log(self, decision: str, parsed: ParsedMessage, **extra: object) -> None:
-        if not TTS_SELECTIVE_HOLD_LOG_DECISIONS:
+        if not config.TTS_SELECTIVE_HOLD_LOG_DECISIONS:
             return
         payload = {
-            "decision_policy": TTS_MERGE_ALGORITHM,
+            "decision_policy": config.TTS_MERGE_ALGORITHM,
             "decision": decision,
             "raw_length": parsed.raw_length,
             "effective_length": parsed.effective_length,
@@ -1774,19 +1658,19 @@ class TTSBot(commands.Bot):
         gap_prev_ms = None if previous_ts is None else round((now - previous_ts) * 1000)
         self.last_user_message_ts[key] = now
 
-        if TTS_MERGE_ALGORITHM == "off":
+        if config.TTS_MERGE_ALGORITHM == "off":
             if parsed.spoken_text:
                 await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
             return
 
         selective_enabled_for_author = (
-            TTS_MERGE_ALGORITHM == "selective_hold_v2"
-            and TTS_SELECTIVE_HOLD_ENABLED
+            config.TTS_MERGE_ALGORITHM == "selective_hold_v2"
+            and config.TTS_SELECTIVE_HOLD_ENABLED
         )
         if not selective_enabled_for_author:
             if not parsed.spoken_text:
                 return
-            if not TTS_MERGE_SHORT_MESSAGES or len(parsed.spoken_text) > TTS_MERGE_MAX_CHARS:
+            if not config.TTS_MERGE_SHORT_MESSAGES or len(parsed.spoken_text) > config.TTS_MERGE_MAX_CHARS:
                 await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
                 return
             async with self._merge_lock(key):
@@ -1799,7 +1683,7 @@ class TTSBot(commands.Bot):
                         text_channel_id=text_channel_id,
                         first_ts=now,
                         last_ts=now,
-                        deadline_ts=now + max(TTS_MERGE_WINDOW_MS, 0) / 1000.0,
+                        deadline_ts=now + max(config.TTS_MERGE_WINDOW_MS, 0) / 1000.0,
                         generation_id=self._next_merge_generation(key),
                         join_separator=". ",
                         items=[],
@@ -1810,7 +1694,7 @@ class TTSBot(commands.Bot):
                     state.timer_task.cancel()
                 state.generation_id += 1
                 state.timer_task = asyncio.create_task(
-                    self._flush_merge_after_delay(key, state.generation_id, time.perf_counter() + max(TTS_MERGE_WINDOW_MS, 0) / 1000.0)
+                    self._flush_merge_after_delay(key, state.generation_id, time.perf_counter() + max(config.TTS_MERGE_WINDOW_MS, 0) / 1000.0)
                 )
             return
 
@@ -1820,7 +1704,7 @@ class TTSBot(commands.Bot):
                 if not parsed.spoken_text:
                     self._decision_log("drop_empty", parsed)
                     return
-                if parsed.effective_length >= max(TTS_MERGE_MAX_CHARS, 40):
+                if parsed.effective_length >= max(config.TTS_MERGE_MAX_CHARS, 40):
                     self._decision_log("immediate_long", parsed)
                     await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
                     return
@@ -1834,7 +1718,7 @@ class TTSBot(commands.Bot):
                     and (
                         previous_ts is None
                         or gap_prev_ms is not None
-                        and gap_prev_ms > TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS
+                        and gap_prev_ms > config.TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS
                     )
                 ):
                     self._decision_log(
@@ -1845,10 +1729,10 @@ class TTSBot(commands.Bot):
                     await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
                     return
                 strong = (
-                    parsed.effective_length >= TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN
+                    parsed.effective_length >= config.TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN
                     or (
-                        parsed.effective_length >= TTS_SELECTIVE_HOLD_START_MIN_EFFECTIVE_LEN_ALT
-                        and parsed.word_count >= TTS_SELECTIVE_HOLD_START_MIN_WORDS_ALT
+                        parsed.effective_length >= config.TTS_SELECTIVE_HOLD_START_MIN_EFFECTIVE_LEN_ALT
+                        and parsed.word_count >= config.TTS_SELECTIVE_HOLD_START_MIN_WORDS_ALT
                     )
                     or (parsed.is_single_digit and parsed.effective_length >= 4)
                 )
@@ -1857,7 +1741,7 @@ class TTSBot(commands.Bot):
                     await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
                     return
                 generation = self._next_merge_generation(key)
-                deadline = now + max(TTS_SELECTIVE_HOLD_HARD_CAP_MS, 1) / 1000.0
+                deadline = now + max(config.TTS_SELECTIVE_HOLD_HARD_CAP_MS, 1) / 1000.0
                 state = MergeBufferState(
                     key=key,
                     voice_channel=voice_channel,
@@ -1867,7 +1751,7 @@ class TTSBot(commands.Bot):
                     last_ts=now,
                     deadline_ts=deadline,
                     generation_id=generation,
-                    join_separator=TTS_SELECTIVE_HOLD_JOIN_SEPARATOR,
+                    join_separator=config.TTS_SELECTIVE_HOLD_JOIN_SEPARATOR,
                     items=[parsed],
                     has_substantive_starter=True,
                 )
@@ -1876,7 +1760,7 @@ class TTSBot(commands.Bot):
                 self._decision_log(
                     "hold_start",
                     parsed,
-                    chosen_timeout_ms=TTS_SELECTIVE_HOLD_HARD_CAP_MS,
+                    chosen_timeout_ms=config.TTS_SELECTIVE_HOLD_HARD_CAP_MS,
                     messages_in_buffer=1,
                     buffer_age_ms=0,
                 )
@@ -1911,8 +1795,8 @@ class TTSBot(commands.Bot):
             prospective_parts = len(state.items) + 1
             prospective_effective = state.effective_len_total + parsed.effective_length
             if (
-                prospective_parts > max(TTS_SELECTIVE_HOLD_MAX_PARTS, 1)
-                or prospective_effective > max(TTS_SELECTIVE_HOLD_MAX_GROUP_EFFECTIVE_LEN, 1)
+                prospective_parts > max(config.TTS_SELECTIVE_HOLD_MAX_PARTS, 1)
+                or prospective_effective > max(config.TTS_SELECTIVE_HOLD_MAX_GROUP_EFFECTIVE_LEN, 1)
             ):
                 ok = await self._flush_buffer_locked(key, "flush_before_reclassify")
                 if ok:
@@ -1965,8 +1849,8 @@ class TTSBot(commands.Bot):
     async def generate_piper_file(self, text: str, filename: Path, profile: VoiceProfile) -> None:
         if PiperVoice is None:
             raise RuntimeError("piper-tts is not installed")
-        model_value = profile.piper_model_path or PIPER_MODEL_PATH
-        config_value = profile.piper_config_path or PIPER_CONFIG_PATH
+        model_value = profile.piper_model_path or config.PIPER_MODEL_PATH
+        config_value = profile.piper_config_path or config.PIPER_CONFIG_PATH
         if not model_value:
             raise RuntimeError("PIPER_MODEL_PATH is not set")
         model_path = Path(model_value)
@@ -2031,8 +1915,8 @@ class TTSBot(commands.Bot):
     def _should_attempt_stream(self, voice) -> bool:
         """True when a job qualifies for the streaming fast path."""
         return (
-            TTS_STREAMING_ENABLED
-            and TTS_CONTINUOUS_STREAM
+            config.TTS_STREAMING_ENABLED
+            and config.TTS_CONTINUOUS_STREAM
             and voice is not None
             and getattr(voice, "is_minimax", False)
             and self.tts_dispatcher.cloud is not None
@@ -2141,7 +2025,7 @@ class TTSBot(commands.Bot):
         #    fallback to Piper (no audio has played yet).
         try:
             first_chunk = await asyncio.wait_for(
-                agen.__anext__(), timeout=TTS_STREAM_TTFA_TIMEOUT
+                agen.__anext__(), timeout=config.TTS_STREAM_TTFA_TIMEOUT
             )
         except StopAsyncIteration:
             await agen.aclose()
@@ -2150,7 +2034,7 @@ class TTSBot(commands.Bot):
         except asyncio.TimeoutError:
             await agen.aclose()
             log.warning(
-                "Stream TTFA exceeded %.2fs; falling back to Piper", TTS_STREAM_TTFA_TIMEOUT
+                "Stream TTFA exceeded %.2fs; falling back to Piper", config.TTS_STREAM_TTFA_TIMEOUT
             )
             return ("pre_audio", 0)
         except Exception as exc:
@@ -2284,7 +2168,7 @@ class TTSBot(commands.Bot):
     async def _generation_worker(self) -> None:
         await self.wait_until_ready()
         await self.warmup_tts()
-        log.info("TTS generation worker started (lookahead=%d)", TTS_PREFETCH_LOOKAHEAD)
+        log.info("TTS generation worker started (lookahead=%d)", config.TTS_PREFETCH_LOOKAHEAD)
         while not self.is_closed():
             job = await self.message_queue.get()
             prepared = PreparedAudio(job=job, channel=asyncio.Queue())
@@ -2363,7 +2247,7 @@ class TTSBot(commands.Bot):
         if prepared.cancelled:
             return
         job = prepared.job
-        filename = TMP_DIR / f"tts_{uuid.uuid4().hex}.wav"
+        filename = config.TMP_DIR / f"tts_{uuid.uuid4().hex}.wav"
         try:
             prepared.provider = await self.tts_dispatcher.synthesize(
                 job.text, filename, voice=voice
@@ -2396,7 +2280,7 @@ class TTSBot(commands.Bot):
         )
         try:
             first_chunk = await asyncio.wait_for(
-                agen.__anext__(), timeout=TTS_STREAM_TTFA_TIMEOUT
+                agen.__anext__(), timeout=config.TTS_STREAM_TTFA_TIMEOUT
             )
         except StopAsyncIteration:
             await agen.aclose()
@@ -2404,7 +2288,7 @@ class TTSBot(commands.Bot):
             return ("pre_audio", 0)
         except asyncio.TimeoutError:
             await agen.aclose()
-            log.warning("Stream TTFA exceeded %.2fs; Piper fallback", TTS_STREAM_TTFA_TIMEOUT)
+            log.warning("Stream TTFA exceeded %.2fs; Piper fallback", config.TTS_STREAM_TTFA_TIMEOUT)
             return ("pre_audio", 0)
         except Exception as exc:
             await agen.aclose()
@@ -2594,7 +2478,7 @@ class TTSBot(commands.Bot):
 
         while not self.is_closed():
             job = await self.message_queue.get()
-            filename = TMP_DIR / f"tts_{uuid.uuid4().hex}.wav"
+            filename = config.TMP_DIR / f"tts_{uuid.uuid4().hex}.wav"
 
             try:
                 worker_started = time.perf_counter()
@@ -2650,7 +2534,7 @@ class TTSBot(commands.Bot):
                 )
 
                 try:
-                    if TTS_CONTINUOUS_STREAM:
+                    if config.TTS_CONTINUOUS_STREAM:
                         source = self.ensure_continuous_player(vc)
                         frames = await self.prepare_tts_pcm_frames(filename)
                         audio_enqueue_ts = time.perf_counter()
@@ -2707,7 +2591,7 @@ class TTSBot(commands.Bot):
         source = self.continuous_sources.get(guild_id)
         source_created = False
         if source is None or source.stopped:
-            source = ContinuousTTSAudioSource(build_idle_pcm_frame(TTS_IDLE_FRAME_MODE, TTS_IDLE_VOLUME_DB))
+            source = ContinuousTTSAudioSource(build_idle_pcm_frame(config.TTS_IDLE_FRAME_MODE, config.TTS_IDLE_VOLUME_DB))
             self.continuous_sources[guild_id] = source
             source_created = True
 
@@ -2720,9 +2604,9 @@ class TTSBot(commands.Bot):
             log.info(
                 "Continuous TTS stream started guild=%s mode=%s idle_volume_db=%s max_idle_seconds=%s",
                 guild_id,
-                TTS_IDLE_FRAME_MODE,
-                TTS_IDLE_VOLUME_DB,
-                TTS_MAX_CONTINUOUS_IDLE_SECONDS,
+                config.TTS_IDLE_FRAME_MODE,
+                config.TTS_IDLE_VOLUME_DB,
+                config.TTS_MAX_CONTINUOUS_IDLE_SECONDS,
             )
         return source
 
@@ -2739,7 +2623,7 @@ class TTSBot(commands.Bot):
             stderr_text = stderr.decode("utf-8", errors="ignore").strip()
             raise RuntimeError(f"ffmpeg PCM preparation failed rc={proc.returncode} stderr={stderr_text}")
 
-        frames = split_pcm_frames(stdout, TTS_STREAM_TAIL_MS)
+        frames = split_pcm_frames(stdout, config.TTS_STREAM_TAIL_MS)
         if not frames:
             raise RuntimeError("ffmpeg PCM preparation produced no audio frames")
 
@@ -2749,7 +2633,7 @@ class TTSBot(commands.Bot):
             source.stat().st_size if source.exists() else "unknown",
             len(stdout),
             len(frames),
-            TTS_STREAM_TAIL_MS,
+            config.TTS_STREAM_TAIL_MS,
         )
         return frames
 
@@ -2778,10 +2662,10 @@ class TTSBot(commands.Bot):
             time.perf_counter() - started,
             source.stat().st_size if source.exists() else "unknown",
             prepared.stat().st_size,
-            TTS_PREROLL_MS,
-            TTS_PREROLL_MODE,
-            TTS_PREROLL_VOLUME_DB,
-            TTS_SILENCE_TAIL_MS,
+            config.TTS_PREROLL_MS,
+            config.TTS_PREROLL_MODE,
+            config.TTS_PREROLL_VOLUME_DB,
+            config.TTS_SILENCE_TAIL_MS,
         )
         return prepared
 
@@ -2800,13 +2684,13 @@ class TTSBot(commands.Bot):
             loop.call_soon_threadsafe(finished.set)
 
         before_options = "-hide_banner -loglevel warning"
-        if FFMPEG_LOW_DELAY:
+        if config.FFMPEG_LOW_DELAY:
             before_options = (
                 f"{before_options} "
                 "-fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0"
             )
 
-        prepared = TMP_DIR / f"playback_{uuid.uuid4().hex}.wav"
+        prepared = config.TMP_DIR / f"playback_{uuid.uuid4().hex}.wav"
         playback_file = filename
         try:
             try:
@@ -2849,7 +2733,7 @@ class TTSBot(commands.Bot):
             log.exception("Voice disconnect cleanup failed")
 
     async def auto_connect_for_member(self, member: discord.Member, channel: discord.VoiceChannel) -> None:
-        if not TTS_AUTO_CONNECT_ENABLED:
+        if not config.TTS_AUTO_CONNECT_ENABLED:
             log.info(
                 "Skip auto-connect guild=%s member=%s reason=disabled",
                 channel.guild.id,
@@ -2905,40 +2789,40 @@ bot = TTSBot()
 async def on_ready() -> None:
     log.info("TTS bot logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
     log.info("Opus loaded: %s", discord.opus.is_loaded())
-    log.info("Env fallback whitelist users: %s", ",".join(str(user_id) for user_id in sorted(WHITELIST_USERS)))
-    log.info("Bot config path: %s", BOT_CONFIG_PATH)
+    log.info("Env fallback whitelist users: %s", ",".join(str(user_id) for user_id in sorted(config.WHITELIST_USERS)))
+    log.info("Bot config path: %s", config.BOT_CONFIG_PATH)
     log.info("Voice profiles: %s", ",".join(sorted(VOICE_PROFILES)))
-    log.info("Piper tuning: speaker=%s length_scale=%.2f", PIPER_SPEAKER, PIPER_LENGTH_SCALE)
+    log.info("Piper tuning: speaker=%s length_scale=%.2f", config.PIPER_SPEAKER, config.PIPER_LENGTH_SCALE)
     log.info(
         "Per-message cap: max_text_length=%s tts_max_chars=%s",
-        MAX_TEXT_LENGTH, TTS_MAX_CHARS,
+        config.MAX_TEXT_LENGTH, config.TTS_MAX_CHARS,
     )
     log.info(
         "Playback tuning: preroll_ms=%s preroll_mode=%s preroll_volume_db=%s tail_ms=%s trim_silence=%s ffmpeg_low_delay=%s",
-        TTS_PREROLL_MS,
-        TTS_PREROLL_MODE,
-        TTS_PREROLL_VOLUME_DB,
-        TTS_SILENCE_TAIL_MS,
-        TTS_TRIM_SILENCE,
-        FFMPEG_LOW_DELAY,
+        config.TTS_PREROLL_MS,
+        config.TTS_PREROLL_MODE,
+        config.TTS_PREROLL_VOLUME_DB,
+        config.TTS_SILENCE_TAIL_MS,
+        config.TTS_TRIM_SILENCE,
+        config.FFMPEG_LOW_DELAY,
     )
     log.info(
         "Continuous stream: enabled=%s idle_mode=%s idle_volume_db=%s stream_tail_ms=%s max_idle_seconds=%s",
-        TTS_CONTINUOUS_STREAM,
-        TTS_IDLE_FRAME_MODE,
-        TTS_IDLE_VOLUME_DB,
-        TTS_STREAM_TAIL_MS,
-        TTS_MAX_CONTINUOUS_IDLE_SECONDS,
+        config.TTS_CONTINUOUS_STREAM,
+        config.TTS_IDLE_FRAME_MODE,
+        config.TTS_IDLE_VOLUME_DB,
+        config.TTS_STREAM_TAIL_MS,
+        config.TTS_MAX_CONTINUOUS_IDLE_SECONDS,
     )
     log.info(
         "Merge tuning: algorithm=%s enabled=%s max_chars=%s window_ms=%s max_parts=%s selective_enabled=%s selective_scope=all_allowed_users reaction_pause_ms=%s",
-        TTS_MERGE_ALGORITHM,
-        TTS_MERGE_SHORT_MESSAGES,
-        TTS_MERGE_MAX_CHARS,
-        TTS_MERGE_WINDOW_MS,
-        TTS_MERGE_MAX_PARTS,
-        TTS_SELECTIVE_HOLD_ENABLED,
-        TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS,
+        config.TTS_MERGE_ALGORITHM,
+        config.TTS_MERGE_SHORT_MESSAGES,
+        config.TTS_MERGE_MAX_CHARS,
+        config.TTS_MERGE_WINDOW_MS,
+        config.TTS_MERGE_MAX_PARTS,
+        config.TTS_SELECTIVE_HOLD_ENABLED,
+        config.TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS,
     )
 
 
@@ -3651,17 +3535,17 @@ def _build_stats_embed() -> discord.Embed:
 def _build_settings_embed() -> discord.Embed:
     cache_on = getattr(bot.tts_dispatcher, "cache", None) is not None
     embed = discord.Embed(title="⚙️ TTS • Настройки", color=0x57F287)
-    embed.add_field(name="Склейка сообщений", value=f"`{TTS_MERGE_ALGORITHM}`", inline=True)
+    embed.add_field(name="Склейка сообщений", value=f"`{config.TTS_MERGE_ALGORITHM}`", inline=True)
     embed.add_field(name="Кэш", value="вкл" if cache_on else "выкл", inline=True)
-    embed.add_field(name="Стриминг", value="вкл" if TTS_STREAMING_ENABLED else "выкл", inline=True)
-    embed.add_field(name="Префетч", value="вкл" if TTS_PREFETCH_ENABLED else "выкл", inline=True)
+    embed.add_field(name="Стриминг", value="вкл" if config.TTS_STREAMING_ENABLED else "выкл", inline=True)
+    embed.add_field(name="Префетч", value="вкл" if config.TTS_PREFETCH_ENABLED else "выкл", inline=True)
     embed.add_field(
         name="Непрерывный поток",
-        value="вкл" if TTS_CONTINUOUS_STREAM else "выкл",
+        value="вкл" if config.TTS_CONTINUOUS_STREAM else "выкл",
         inline=True,
     )
-    embed.add_field(name="Лимит символов", value=str(TTS_MAX_CHARS), inline=True)
-    embed.add_field(name="Авто-отключение", value=f"{IDLE_DISCONNECT_SECONDS}с", inline=True)
+    embed.add_field(name="Лимит символов", value=str(config.TTS_MAX_CHARS), inline=True)
+    embed.add_field(name="Авто-отключение", value=f"{config.IDLE_DISCONNECT_SECONDS}с", inline=True)
     return embed
 
 
@@ -3751,18 +3635,18 @@ async def slash_tts_status(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("Команда доступна только на сервере.", ephemeral=True)
         return
-    config = bot.config_store.get_guild(interaction.guild.id)
+    guild_config = bot.config_store.get_guild(interaction.guild.id)
     vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
     channel_name = getattr(getattr(vc, "channel", None), "name", "не подключен") if vc else "не подключен"
     await interaction.response.send_message(
         "\n".join(
             [
-                f"Enabled: `{config.enabled}`",
+                f"Enabled: `{guild_config.enabled}`",
                 f"Voice channel: `{channel_name}`",
                 f"Queue: `{bot.message_queue.qsize()}`",
-                f"Default voice: `{config.default_voice}`",
-                f"Allowed users: `{len(config.allowed_users)}`",
-                f"Merge: `{TTS_MERGE_SHORT_MESSAGES}`",
+                f"Default voice: `{guild_config.default_voice}`",
+                f"Allowed users: `{len(guild_config.allowed_users)}`",
+                f"Merge: `{config.TTS_MERGE_SHORT_MESSAGES}`",
             ]
         ),
         ephemeral=True,
@@ -3850,16 +3734,16 @@ async def join(ctx: commands.Context) -> None:
 
 
 def main() -> None:
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    config.TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    if not TOKEN:
+    if not config.TOKEN:
         raise RuntimeError("DISCORD_TOKEN is not set")
-    if not WHITELIST_USERS:
+    if not config.WHITELIST_USERS:
         raise RuntimeError("WHITELIST_USERS is empty")
     if not load_opus():
         raise RuntimeError("Opus is required for Discord voice playback")
 
-    bot.run(TOKEN, log_handler=None)
+    bot.run(config.TOKEN, log_handler=None)
 
 
 if __name__ == "__main__":

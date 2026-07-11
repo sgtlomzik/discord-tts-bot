@@ -26,7 +26,7 @@ class NormalizeForTTSTests(unittest.TestCase):
         """Spec recommends ~300 char cap. The cap is exposed as the
         module-level TTS_MAX_CHARS constant and is the value passed
         to normalize_for_tts from enqueue_tts."""
-        self.assertEqual(self.bot.TTS_MAX_CHARS, 300)
+        self.assertEqual(self.bot.config.TTS_MAX_CHARS, 300)
 
     def test_enqueue_tts_uses_tts_max_chars_cap(self):
         """End-to-end: TTS_MAX_CHARS is the cap that enqueue_tts
@@ -34,10 +34,10 @@ class NormalizeForTTSTests(unittest.TestCase):
         and inspecting that long messages get truncated to that size.
         """
         long_text = "а" * 500
-        target = long_text[:self.bot.TTS_MAX_CHARS]
-        out = self.bot.normalize_for_tts(long_text, max_chars=self.bot.TTS_MAX_CHARS)
+        target = long_text[:self.bot.config.TTS_MAX_CHARS]
+        out = self.bot.normalize_for_tts(long_text, max_chars=self.bot.config.TTS_MAX_CHARS)
         self.assertIsNotNone(out)
-        self.assertEqual(len(out), self.bot.TTS_MAX_CHARS)
+        self.assertEqual(len(out), self.bot.config.TTS_MAX_CHARS)
         self.assertEqual(out, target)
 
     # ----- strip rules (spec §"Препроцессинг текста") -----
