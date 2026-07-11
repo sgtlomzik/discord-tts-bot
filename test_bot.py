@@ -122,7 +122,7 @@ class TTSBotTests(unittest.TestCase):
 
         requested = FakeVoiceChannel()
         with patch.object(bot.discord, "VoiceChannel", FakeVoiceChannel):
-            self.assertIs(bot.resolve_tts_command_voice_channel(None, requested), requested)
+            self.assertIs(bot.resolve_tts_command_voice_channel(None, None, requested), requested)
 
     def test_resolve_tts_command_voice_channel_uses_connected_bot_channel_before_user_channel(self):
         bot = load_bot_module()
@@ -146,7 +146,7 @@ class TTSBotTests(unittest.TestCase):
             patch.object(bot.discord, "VoiceChannel", FakeVoiceChannel),
             patch.object(bot.discord.utils, "get", MagicMock(return_value=voice_client)),
         ):
-            self.assertIs(bot.resolve_tts_command_voice_channel(interaction), bot_channel)
+            self.assertIs(bot.resolve_tts_command_voice_channel(bot.bot, interaction), bot_channel)
 
     def test_resolve_tts_command_voice_channel_falls_back_to_user_channel(self):
         bot = load_bot_module()
@@ -164,7 +164,7 @@ class TTSBotTests(unittest.TestCase):
             patch.object(bot.discord, "VoiceChannel", FakeVoiceChannel),
             patch.object(bot.discord.utils, "get", MagicMock(return_value=None)),
         ):
-            self.assertIs(bot.resolve_tts_command_voice_channel(interaction), user_channel)
+            self.assertIs(bot.resolve_tts_command_voice_channel(bot.bot, interaction), user_channel)
 
     def test_slash_group_uses_non_reserved_name(self):
         bot = load_bot_module()
@@ -963,7 +963,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(bot_mod.discord, "Member", FakeMember),
-            patch.object(bot_mod, "resolve_tts_command_voice_channel", MagicMock(return_value=target_channel)),
+            patch.object(bot_mod.tts_commands, "resolve_tts_command_voice_channel", MagicMock(return_value=target_channel)),
         ):
             await bot_mod.slash_tts_test.callback(interaction, "проверка")
 

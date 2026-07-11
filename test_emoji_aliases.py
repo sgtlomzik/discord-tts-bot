@@ -329,7 +329,7 @@ class EmojiAliasCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def _call(self, bot_mod, cmd, *args):
         with patch.object(bot_mod.discord, "Member", _FakeMember), patch.object(
-            bot_mod, "is_guild_manager", MagicMock(return_value=True)
+            bot_mod.tts_commands, "is_guild_manager", MagicMock(return_value=True)
         ):
             await cmd.callback(*args)
 

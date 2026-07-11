@@ -157,7 +157,7 @@ class VoiceTuneCommandTests(unittest.IsolatedAsyncioTestCase):
         return interaction, sent
 
     async def _call(self, bot_mod, *args, **kwargs):
-        with patch.object(bot_mod, "is_guild_manager", MagicMock(return_value=True)), patch.object(
+        with patch.object(bot_mod.tts_commands, "is_guild_manager", MagicMock(return_value=True)), patch.object(
             bot_mod.discord, "Member", type(args[0].user)
         ):
             await bot_mod.slash_tts_voice_tune.callback(*args, **kwargs)
