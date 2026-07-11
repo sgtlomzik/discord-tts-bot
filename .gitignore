@@ -28,3 +28,6 @@ scripts/voice_samples/*.mp3
 scripts/voice_samples/*.wav
 scripts/voice_samples/*.m4a
 scripts/voice_samples/_preview_*
+
+# Local Discord chat exports / metrics (personal data; never commit)
+exports/
