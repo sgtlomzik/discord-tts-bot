@@ -12,3 +12,12 @@ __pycache__/
 *.bak
 *.bak-*
 tts_*.mp3
+.venv/
+models/
+data/
+exports/
+docs/
+scripts/voice_samples/
+test_*.py
+*.md
+.github/

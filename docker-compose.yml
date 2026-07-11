@@ -1,7 +1,10 @@
 services:
   tts_bot:
     build: .
-    image: custom-tts-bot:latest
+    # Prebuilt image published by .github/workflows/docker.yml;
+    # `docker compose pull` fetches it, `docker compose up -d --build`
+    # rebuilds locally instead.
+    image: ghcr.io/OWNER/discord-tts-bot:latest
     container_name: discord_tts_bot
     env_file:
       - path: .env
