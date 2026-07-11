@@ -19,8 +19,8 @@ The bot is a single-process Discord service that:
 
 The current production runtime is intentionally small:
 
-- one Python module for the bot logic;
-- one unittest file for coverage;
+- one Python package (`ttsbot/`) plus a thin `bot.py` entrypoint;
+- a unittest suite (`test_*.py`) for coverage;
 - one container image;
 - one local Piper voice model;
 - one JSON config file for guild state.
@@ -29,8 +29,36 @@ The current production runtime is intentionally small:
 
 The active runtime pieces are:
 
-- `bot.py` - application logic, Discord events, queueing, TTS, playback, and slash commands.
-- `test_bot.py` - unit and async integration-style tests.
+- `bot.py` - composition root and entrypoint: reloads config, creates the
+  bot, attaches events and slash commands, re-exports the public API
+  (the tests exec this file per test case).
+- `ttsbot/` - the application package:
+  - `config.py` - every env-derived tunable as a module global, with
+    `reload()`; runtime code reads `config.NAME` at call time.
+  - `textnorm.py` - Discord markup stripping, emoji aliases, mention
+    resolution, `normalize_for_tts`.
+  - `messages.py` - `ParsedMessage` / `MergeBufferState` and
+    `analyze_message_for_merge` for the merge layer.
+  - `models.py` - `VoiceProfile`, `GuildConfig`, `TTSJob`,
+    `PreparedAudio` and the hardcoded Piper `VOICE_PROFILES`.
+  - `store.py` - `BotConfigStore` (data/config.json persistence).
+  - `audio.py` - PCM constants and framing, ffmpeg command builders,
+    Opus loading, `ContinuousTTSAudioSource`.
+  - `core.py` - the `TTSBot` class: construction and task lifecycle,
+    composed from the four concern mixins below.
+  - `voice_lifecycle.py` - connect/move locks, cooldowns, stale-client
+    recovery, idle disconnect, auto-connect policy.
+  - `merge.py` - the enqueue boundary and legacy/selective-hold merge
+    decisions.
+  - `pipeline.py` - Piper/MiniMax synthesis, the streaming fast path,
+    the prefetch generation worker and the legacy single worker.
+  - `playback.py` - PCM preparation and the continuous player feed.
+  - `commands.py` - `build_commands(bot)` creates the /voicebot group
+    bound to a bot instance; `events.py` - `register_events(bot)`.
+- `tts_providers.py` - provider abstraction: dispatcher, MiniMax client,
+  phrase cache, circuit breaker (standalone module, own test files).
+- `voice_registry.py` - the unified voice catalog (data/voices.json).
+- `test_*.py` - unit and async integration-style tests.
 - `docker-compose.yml` - container wiring and bind mounts.
 - `Dockerfile` - image build and system packages.
 - `requirements.txt` - Python dependencies.
@@ -41,6 +69,9 @@ The active runtime pieces are:
 At runtime, the container mounts:
 
 - `/app/bot.py`
+- `/app/ttsbot`
+- `/app/tts_providers.py`
+- `/app/voice_registry.py`
 - `/app/models`
 - `/app/data`
 
@@ -357,13 +388,22 @@ It covers:
 - voice connect cooldowns;
 - worker success and failure paths.
 
-The current test suite is important because the architecture is compact: most behavior changes happen in one file, so tests are the main guardrail.
+The current test suite is important because it pins the public surface of the package: the tests exec `bot.py` per test case, mutate `ttsbot.config` for tuning, and exercise the pipeline through the facade — so a module can be reworked internally while the suite guards the observable behavior.
 
 ## 14. File Responsibility Map
 
 ### `bot.py`
 
-Holds the bot lifecycle, merge logic, TTS generation, playback, voice handling, and commands.
+Composition root: config reload, bot construction, command/event
+registration, `main()`. Also the backward-compatibility facade — it
+re-exports the package API so tests (and any external callers) can keep
+using `bot.<name>`.
+
+### `ttsbot/`
+
+The application package; see section 2 for the per-module breakdown.
+Config is read at call time (`config.NAME`), so tests tune behavior by
+mutating `ttsbot.config` directly.
 
 ### `test_bot.py`
 
