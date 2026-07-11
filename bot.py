@@ -67,6 +67,15 @@ from ttsbot.messages import (
     analyze_message_for_merge,
     is_reaction_like,
 )
+from ttsbot.models import (
+    GuildConfig,
+    PreparedAudio,
+    TTSJob,
+    VOICE_PROFILES,
+    VoiceProfile,
+    reload_voice_profiles,
+)
+from ttsbot.store import BotConfigStore
 
 # Re-read the environment on every exec of this file: production gets the
 # same env-derived state as before the package split, and each test load
@@ -85,270 +94,15 @@ PCM_FRAME_MS = 20
 PCM_FRAME_BYTES = int(PCM_SAMPLE_RATE * PCM_FRAME_MS / 1000) * PCM_CHANNELS * PCM_SAMPLE_WIDTH
 
 
-@dataclass(frozen=True)
-class VoiceProfile:
-    name: str
-    label: str
-    piper_model_path: str = ""
-    piper_config_path: str = ""
-    piper_speaker: int = -1
-    piper_length_scale: float = 1.0
-
-
-@dataclass
-class GuildConfig:
-    enabled: bool = True
-    allowed_users: set[int] = field(default_factory=set)
-    default_voice: str = config.DEFAULT_VOICE_PROFILE
-    user_voices: dict[int, str] = field(default_factory=dict)
-    user_fixed_phrases: dict[int, str] = field(default_factory=dict)
-
-
-@dataclass
-class TTSJob:
-    text: str
-    voice_channel: discord.VoiceChannel
-    queued_at: float
-    author_id: int
-    guild_id: int
-    text_channel_id: int
-    voice_profile: str
-    message_ts: float = field(default_factory=time.perf_counter)
-
-
-@dataclass(eq=False)  # identity-based: each prepared item is unique (set member)
-class PreparedAudio:
-    """A job whose audio is being (or has been) generated ahead of playback.
-
-    The generation worker fills ``channel`` with batches of 20ms PCM frames
-    (``list[bytes]``) and ends it with a ``None`` sentinel. The playback
-    worker drains ``channel`` into the continuous player in order. ``cancelled``
-    is set by ``queue-clear`` to stop generation/playback of this item.
-    """
-    job: TTSJob
-    channel: asyncio.Queue
-    cancelled: bool = False
-    provider: str = ""
-
-
-VOICE_PROFILES: dict[str, VoiceProfile] = {
-    "piper-ruslan": VoiceProfile(
-        name="piper-ruslan",
-        label="Piper Ruslan",
-        piper_model_path=config.PIPER_MODEL_PATH,
-        piper_config_path=config.PIPER_CONFIG_PATH,
-        piper_speaker=config.PIPER_SPEAKER,
-        piper_length_scale=config.PIPER_LENGTH_SCALE,
-    ),
-    "piper-irina": VoiceProfile(
-        name="piper-irina",
-        label="Piper Irina",
-        piper_model_path="/app/models/ru_RU-irina-medium.onnx",
-        piper_config_path="/app/models/ru_RU-irina-medium.onnx.json",
-        piper_speaker=config.PIPER_SPEAKER,
-        piper_length_scale=config.PIPER_LENGTH_SCALE,
-    ),
-}
-
-if config.DEFAULT_VOICE_PROFILE not in VOICE_PROFILES:
-    log.warning(
-        "Unknown TTS_DEFAULT_VOICE_PROFILE=%s; using piper-ruslan", config.DEFAULT_VOICE_PROFILE
-    )
-    config.DEFAULT_VOICE_PROFILE = "piper-ruslan"
+# Rebuild the hardcoded Piper profiles from the (re)loaded config and
+# validate the default profile name.
+reload_voice_profiles()
 
 # Snapshot of the env-derived configuration for read-only consumers (the
 # tests read constants off this module). Writes that must affect runtime
 # behavior go through ``config.NAME`` — code reads config at call time.
 globals().update({_k: _v for _k, _v in vars(config).items() if _k.isupper()})
 
-
-class BotConfigStore:
-    def __init__(self, path: Path, fallback_users: set[int], voice_registry=None) -> None:
-        self.path = path
-        self.fallback_users = set(fallback_users)
-        # Validate stored voice names against the unified registry when
-        # available (so MiniMax assignments survive reload); otherwise fall
-        # back to the hardcoded Piper profiles (keeps tests that construct
-        # the store without a registry working unchanged).
-        self.voice_registry = voice_registry
-        self.guilds: dict[int, GuildConfig] = {}
-        # Custom-emoji pronunciation aliases, keyed by emoji id (globally
-        # unique, stable). Value: {"name": <display name>, "say": <spoken>}.
-        # TODO(per-guild): aliases are global for now (like voice clones);
-        # key by guild_id when per-guild pronunciations are needed.
-        self.emoji_aliases: dict[str, dict[str, str]] = {}
-        self.load()
-
-    def _is_valid_voice(self, name: str) -> bool:
-        if self.voice_registry is not None:
-            return name in self.voice_registry
-        return name in VOICE_PROFILES
-
-    def load(self) -> None:
-        if not self.path.exists():
-            return
-
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            log.exception("Failed to read bot config: %s", self.path)
-            return
-
-        guilds = data.get("guilds", {}) if isinstance(data, dict) else {}
-        for guild_id_raw, raw_config in guilds.items():
-            try:
-                guild_id = int(guild_id_raw)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(raw_config, dict):
-                continue
-            allowed_users = {
-                int(user_id)
-                for user_id in raw_config.get("allowed_users", [])
-                if str(user_id).isdigit()
-            }
-            user_voices = {
-                int(user_id): voice
-                for user_id, voice in raw_config.get("user_voices", {}).items()
-                if str(user_id).isdigit() and self._is_valid_voice(voice)
-            }
-            default_voice = raw_config.get("default_voice", config.DEFAULT_VOICE_PROFILE)
-            if not self._is_valid_voice(default_voice):
-                default_voice = config.DEFAULT_VOICE_PROFILE
-            user_fixed_phrases = {
-                int(user_id): phrase
-                for user_id, phrase in raw_config.get("user_fixed_phrases", {}).items()
-                if str(user_id).isdigit() and isinstance(phrase, str) and phrase.strip()
-            }
-            self.guilds[guild_id] = GuildConfig(
-                enabled=bool(raw_config.get("enabled", True)),
-                allowed_users=allowed_users,
-                default_voice=default_voice,
-                user_voices=user_voices,
-                user_fixed_phrases=user_fixed_phrases,
-            )
-
-        raw_aliases = data.get("emoji_aliases", {}) if isinstance(data, dict) else {}
-        emoji_aliases: dict[str, dict[str, str]] = {}
-        if isinstance(raw_aliases, dict):
-            for emoji_id, entry in raw_aliases.items():
-                if not str(emoji_id).isdigit() or not isinstance(entry, dict):
-                    continue
-                say = entry.get("say")
-                if not isinstance(say, str) or not say.strip():
-                    continue
-                name = entry.get("name")
-                emoji_aliases[str(emoji_id)] = {
-                    "name": name if isinstance(name, str) else "",
-                    "say": say,
-                }
-        self.emoji_aliases = emoji_aliases
-
-    def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "version": 1,
-            "guilds": {
-                str(guild_id): {
-                    "enabled": config.enabled,
-                    "allowed_users": sorted(config.allowed_users),
-                    "default_voice": config.default_voice,
-                    "user_voices": {
-                        str(user_id): voice
-                        for user_id, voice in sorted(config.user_voices.items())
-                    },
-                    "user_fixed_phrases": {
-                        str(user_id): phrase
-                        for user_id, phrase in sorted(config.user_fixed_phrases.items())
-                    },
-                }
-                for guild_id, config in sorted(self.guilds.items())
-            },
-            "emoji_aliases": {
-                emoji_id: {"name": entry.get("name", ""), "say": entry.get("say", "")}
-                for emoji_id, entry in sorted(self.emoji_aliases.items())
-            },
-        }
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=str(self.path.parent),
-            delete=False,
-        ) as tmp_file:
-            json.dump(data, tmp_file, ensure_ascii=False, indent=2)
-            tmp_file.write("\n")
-            tmp_path = Path(tmp_file.name)
-        tmp_path.replace(self.path)
-
-    def get_guild(self, guild_id: int) -> GuildConfig:
-        config = self.guilds.get(guild_id)
-        if config is None:
-            config = GuildConfig(allowed_users=set(self.fallback_users))
-            self.guilds[guild_id] = config
-        return config
-
-    def is_enabled(self, guild_id: int) -> bool:
-        return self.get_guild(guild_id).enabled
-
-    def is_allowed(self, guild_id: int, user_id: int) -> bool:
-        return user_id in self.get_guild(guild_id).allowed_users
-
-    def add_user(self, guild_id: int, user_id: int) -> None:
-        self.get_guild(guild_id).allowed_users.add(user_id)
-        self.save()
-
-    def remove_user(self, guild_id: int, user_id: int) -> None:
-        config = self.get_guild(guild_id)
-        config.allowed_users.discard(user_id)
-        config.user_voices.pop(user_id, None)
-        config.user_fixed_phrases.pop(user_id, None)
-        self.save()
-
-    def set_enabled(self, guild_id: int, enabled: bool) -> None:
-        self.get_guild(guild_id).enabled = enabled
-        self.save()
-
-    def set_default_voice(self, guild_id: int, voice_name: str) -> None:
-        self.get_guild(guild_id).default_voice = voice_name
-        self.save()
-
-    def set_user_voice(self, guild_id: int, user_id: int, voice_name: str) -> None:
-        self.get_guild(guild_id).user_voices[user_id] = voice_name
-        self.save()
-
-    def clear_user_voice(self, guild_id: int, user_id: int) -> None:
-        self.get_guild(guild_id).user_voices.pop(user_id, None)
-        self.save()
-
-    def voice_for_user(self, guild_id: int, user_id: int) -> str:
-        config = self.get_guild(guild_id)
-        return config.user_voices.get(user_id, config.default_voice)
-
-    def set_user_fixed_phrase(self, guild_id: int, user_id: int, phrase: str) -> None:
-        self.get_guild(guild_id).user_fixed_phrases[user_id] = phrase
-        self.save()
-
-    def clear_user_fixed_phrase(self, guild_id: int, user_id: int) -> None:
-        self.get_guild(guild_id).user_fixed_phrases.pop(user_id, None)
-        self.save()
-
-    def fixed_phrase_for_user(self, guild_id: int, user_id: int) -> str | None:
-        return self.get_guild(guild_id).user_fixed_phrases.get(user_id)
-
-    def emoji_say_map(self) -> dict[str, str]:
-        """id -> spoken word, for substitution during normalization."""
-        return {emoji_id: entry["say"] for emoji_id, entry in self.emoji_aliases.items()}
-
-    def set_emoji_alias(self, emoji_id: str, name: str, say: str) -> None:
-        self.emoji_aliases[str(emoji_id)] = {"name": name, "say": say}
-        self.save()
-
-    def remove_emoji_alias(self, emoji_id: str) -> bool:
-        existed = str(emoji_id) in self.emoji_aliases
-        self.emoji_aliases.pop(str(emoji_id), None)
-        if existed:
-            self.save()
-        return existed
 
 intents = discord.Intents.default()
 intents.message_content = True
