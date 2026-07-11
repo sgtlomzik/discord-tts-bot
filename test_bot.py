@@ -482,6 +482,31 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(tts_bot.voice_connect_cooldown_remaining(guild.id), 0.0)
 
+    async def test_ensure_voice_recovers_from_stale_voice_client(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+
+        # Zombie: registered on the guild but its socket is dead. connect()
+        # would raise "Already connected" if we didn't clean it up first.
+        stale_vc = types.SimpleNamespace(
+            is_connected=MagicMock(return_value=False),
+            disconnect=AsyncMock(),
+        )
+        guild = types.SimpleNamespace(id=77, voice_client=stale_vc)
+        new_vc = types.SimpleNamespace(is_connected=MagicMock(return_value=True))
+        voice_channel = types.SimpleNamespace(
+            id=88,
+            guild=guild,
+            connect=AsyncMock(return_value=new_vc),
+        )
+
+        result = await tts_bot.ensure_voice(voice_channel)
+
+        self.assertIs(result, new_vc)
+        stale_vc.disconnect.assert_awaited_once_with(force=True)
+        voice_channel.connect.assert_awaited_once()
+        self.assertEqual(tts_bot.voice_connect_cooldown_remaining(guild.id), 0.0)
+
     async def test_auto_connect_skips_during_cooldown(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()

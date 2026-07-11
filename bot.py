@@ -1386,6 +1386,25 @@ class TTSBot(commands.Bot):
             vc = discord.utils.get(self.voice_clients, guild=voice_channel.guild)
 
             if not vc or not vc.is_connected():
+                # A prior handshake may have died (network flakiness) yet left a
+                # VoiceClient registered on the guild whose socket is dead.
+                # connect() would then raise "Already connected" and we'd get
+                # stuck cooldown-looping forever, so force-clean the stale client
+                # before (re)connecting.
+                stale_vc = getattr(voice_channel.guild, "voice_client", None)
+                if stale_vc is not None and not stale_vc.is_connected():
+                    log.warning(
+                        "Cleaning up stale voice client guild=%s channel=%s",
+                        guild_id,
+                        voice_channel.id,
+                    )
+                    try:
+                        await stale_vc.disconnect(force=True)
+                    except Exception:
+                        log.exception(
+                            "Stale voice client cleanup failed guild=%s", guild_id
+                        )
+
                 log.info(
                     "Connecting to voice channel guild=%s channel=%s",
                     guild_id,
