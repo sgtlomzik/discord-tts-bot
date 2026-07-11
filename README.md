@@ -5,8 +5,8 @@ Built for Russian-speaking communities: local [Piper](https://github.com/OHF-Voi
 voices work fully offline, and [MiniMax](https://www.minimax.io/) cloud voices
 (including voice cloning) can be layered on top with automatic fallback to Piper.
 
-[![CI](https://github.com/OWNER/discord-tts-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/discord-tts-bot/actions/workflows/ci.yml)
-[![Docker](https://github.com/OWNER/discord-tts-bot/actions/workflows/docker.yml/badge.svg)](https://github.com/OWNER/discord-tts-bot/actions/workflows/docker.yml)
+[![CI](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/ci.yml)
+[![Docker](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/docker.yml/badge.svg)](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/docker.yml)
 
 ## Features
 
@@ -36,7 +36,7 @@ Prerequisites: a Discord application with a bot token
 (enable the **Message Content** intent), Docker with the compose plugin.
 
 ```bash
-git clone https://github.com/OWNER/discord-tts-bot.git
+git clone https://github.com/sgtlomzik/discord-tts-bot.git
 cd discord-tts-bot
 
 # 1. Configure
