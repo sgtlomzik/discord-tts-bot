@@ -1,41 +1,36 @@
+# --- Secrets & local environment --------------------------------------
 .env
 *.env
 !.env.example
+.env.bak*
 
-.codex
+# --- Python ------------------------------------------------------------
 .venv/
-models/
-
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
+# --- Runtime state (mounted into the container, never committed) -------
+data/
+models/
+
+# --- Local-only files ---------------------------------------------------
+# Discord chat exports / metrics (personal data)
+exports/
+# Operator-local working notes
+/supertonic_*.md
+# Voice samples and clone previews (may contain personal recordings)
+scripts/voice_samples/*
+!scripts/voice_samples/.gitkeep
+!scripts/voice_samples/README.md
+# Host-specific compose tweaks (VPN network_mode, dev code mounts, ...)
+docker-compose.override.yml
+
+# --- Editor / OS noise ---------------------------------------------------
+.DS_Store
+Thumbs.db
 *.log
 *.tmp
 *.bak
-*.bak-*
-tts_*.mp3
-data/*.json
-
-.DS_Store
-Thumbs.db
-
-# Voice samples and clone previews are operator-local files (may
-# contain personal recordings); never commit them.
-scripts/voice_samples/*.mp3
-scripts/voice_samples/*.wav
-scripts/voice_samples/*.m4a
-scripts/voice_samples/_preview_*
-
-# Local Discord chat exports / metrics (personal data; never commit)
-exports/
-
-# Runtime state and local diagnostics (cache, voice registry, wav dumps)
-data/
-.env.bak*
-supertonic_*.md
-
-# Host-specific compose tweaks stay local
-docker-compose.override.yml

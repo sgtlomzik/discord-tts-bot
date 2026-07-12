@@ -1,5 +1,6 @@
 discord.py==2.7.1
 PyNaCl==1.6.2
+# DAVE (Discord voice E2EE): imported dynamically by discord.py when present
 davey==0.1.5
 piper-tts==1.4.2
 httpx==0.28.1
