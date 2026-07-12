@@ -67,14 +67,15 @@ The active runtime pieces are:
 - `models/ru_RU-ruslan-medium.onnx` and `.json` - Piper voice model files.
 - `data/config.json` - persisted guild/user settings.
 
-At runtime, the container mounts:
+At runtime, the container mounts only state:
 
-- `/app/bot.py`
-- `/app/ttsbot`
-- `/app/models`
-- `/app/data`
+- `/app/models` (read-only voice models)
+- `/app/data` (guild config, voice catalog, phrase cache)
 
-This means code changes and config changes are reflected without rebuilding the whole image in the same way a fully baked image would require.
+Code ships inside the image (built by CI and published to GHCR), so a
+deployment is `docker compose pull && docker compose up -d`. For hot-reload
+development, bind-mount `./bot.py` and `./ttsbot` via a local
+`docker-compose.override.yml`.
 
 ## 3. Execution Flow
 
