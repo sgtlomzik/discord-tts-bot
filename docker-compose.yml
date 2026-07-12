@@ -13,8 +13,9 @@ services:
     # an untracked docker-compose.override.yml — compose merges it in
     # automatically.
     restart: unless-stopped
+    # Code ships inside the image; only data and models are mounted.
+    # (For hot-reload development, bind-mount ./bot.py and ./ttsbot in
+    # your docker-compose.override.yml.)
     volumes:
-      - ./bot.py:/app/bot.py
-      - ./ttsbot:/app/ttsbot
       - ./models:/app/models:ro
       - ./data:/app/data
