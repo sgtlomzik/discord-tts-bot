@@ -18,6 +18,6 @@ data/
 exports/
 docs/
 scripts/voice_samples/
-test_*.py
+tests/
 *.md
 .github/

@@ -21,7 +21,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-import voice_registry
+from ttsbot import voice_registry
 from dataclasses import replace
 
 from ttsbot import config

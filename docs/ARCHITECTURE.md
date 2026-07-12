@@ -20,7 +20,7 @@ The bot is a single-process Discord service that:
 The current production runtime is intentionally small:
 
 - one Python package (`ttsbot/`) plus a thin `bot.py` entrypoint;
-- a unittest suite (`test_*.py`) for coverage;
+- a unittest suite (`tests/`) for coverage;
 - one container image;
 - one local Piper voice model;
 - one JSON config file for guild state.
@@ -55,10 +55,11 @@ The active runtime pieces are:
   - `playback.py` - PCM preparation and the continuous player feed.
   - `commands.py` - `build_commands(bot)` creates the /voicebot group
     bound to a bot instance; `events.py` - `register_events(bot)`.
-- `tts_providers.py` - provider abstraction: dispatcher, MiniMax client,
-  phrase cache, circuit breaker (standalone module, own test files).
-- `voice_registry.py` - the unified voice catalog (data/voices.json).
-- `test_*.py` - unit and async integration-style tests.
+- `ttsbot/providers.py` - provider abstraction: dispatcher, MiniMax
+  client, phrase cache, circuit breaker.
+- `ttsbot/voice_registry.py` - the unified voice catalog
+  (data/voices.json).
+- `tests/` - unit and async integration-style tests.
 - `docker-compose.yml` - container wiring and bind mounts.
 - `Dockerfile` - image build and system packages.
 - `requirements.txt` - Python dependencies.
@@ -70,8 +71,6 @@ At runtime, the container mounts:
 
 - `/app/bot.py`
 - `/app/ttsbot`
-- `/app/tts_providers.py`
-- `/app/voice_registry.py`
 - `/app/models`
 - `/app/data`
 
@@ -374,7 +373,7 @@ The important current engine-specific values are:
 
 ## 13. Tests
 
-`test_bot.py` is the main safety net.
+`tests/test_bot.py` is the main safety net.
 
 It covers:
 
@@ -405,7 +404,7 @@ The application package; see section 2 for the per-module breakdown.
 Config is read at call time (`config.NAME`), so tests tune behavior by
 mutating `ttsbot.config` directly.
 
-### `test_bot.py`
+### `tests/`
 
 Verifies parser behavior, queue semantics, engine selection assumptions, and worker behavior.
 

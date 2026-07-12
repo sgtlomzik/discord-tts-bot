@@ -14,7 +14,5 @@ services:
     volumes:
       - ./bot.py:/app/bot.py
       - ./ttsbot:/app/ttsbot
-      - ./tts_providers.py:/app/tts_providers.py
-      - ./voice_registry.py:/app/voice_registry.py
       - ./models:/app/models:ro
       - ./data:/app/data

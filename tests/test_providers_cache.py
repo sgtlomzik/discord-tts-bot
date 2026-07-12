@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tts_providers import TTSCacheConfig, TTSPhraseCache
+from ttsbot.providers import TTSCacheConfig, TTSPhraseCache
 
 
 class TTSPhraseCacheTests(unittest.TestCase):
@@ -227,7 +227,7 @@ class DispatcherCacheIntegrationTests(unittest.TestCase):
         return fake_piper
 
     def test_second_call_for_same_text_hits_cache_and_skips_provider(self):
-        from tts_providers import (
+        from ttsbot.providers import (
             DispatcherConfig, LocalProvider, PrimaryProvider, TTSDispatcher,
         )
         calls = {"n": 0}
@@ -260,7 +260,7 @@ class DispatcherCacheIntegrationTests(unittest.TestCase):
         self.assertEqual(target_b.read_bytes(), b"PIPER_OUT")
 
     def test_cache_disabled_does_not_short_circuit(self):
-        from tts_providers import (
+        from ttsbot.providers import (
             DispatcherConfig, LocalProvider, PrimaryProvider, TTSDispatcher,
         )
         calls = {"n": 0}

@@ -14,8 +14,8 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
-import voice_registry
-from tts_providers import (
+from ttsbot import voice_registry
+from ttsbot.providers import (
     LocalProvider,
     TTSDispatcher,
     TTSPhraseCache,
@@ -88,7 +88,7 @@ class TTSBot(
             config.BOT_CONFIG_PATH, config.WHITELIST_USERS, voice_registry=self.voice_registry
         )
         self.piper_voices: dict[tuple[str, str], object] = {}
-        # TTS provider abstraction (see tts_providers.py). Skeleton
+        # TTS provider abstraction (see ttsbot/providers.py). Skeleton
         # behavior in this commit: dispatcher always routes to local.
         # Cloud provider (MiniMax) and full CB logic land in commits 3+
         # and 6 respectively.

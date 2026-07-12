@@ -31,3 +31,8 @@ scripts/voice_samples/_preview_*
 
 # Local Discord chat exports / metrics (personal data; never commit)
 exports/
+
+# Runtime state and local diagnostics (cache, voice registry, wav dumps)
+data/
+.env.bak*
+supertonic_*.md

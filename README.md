@@ -91,7 +91,7 @@ Everything is configured through environment variables — see
 ```bash
 python3.11 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s . -p 'test_*.py'   # ~300 tests, no network needed
+python -m unittest discover -s tests -p 'test_*.py'  # ~300 tests, no network needed
 ```
 
 The application lives in the `ttsbot/` package; `bot.py` is the entrypoint

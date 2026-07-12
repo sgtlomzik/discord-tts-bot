@@ -15,7 +15,7 @@ import unittest
 
 import httpx
 
-from tts_providers import (
+from ttsbot.providers import (
     MiniMaxConfig,
     MiniMaxError,
     MiniMaxProvider,

@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 def load_bot_module():
-    module_path = Path(__file__).with_name("bot.py")
+    module_path = Path(__file__).resolve().parent.parent / "bot.py"
     spec = importlib.util.spec_from_file_location("tts_bot_module_mentions", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None

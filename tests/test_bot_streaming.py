@@ -11,9 +11,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-import voice_registry as vr
+from ttsbot import voice_registry as vr
 from test_bot import load_bot_module
-from tts_providers import TTSCacheConfig, TTSPhraseCache
+from ttsbot.providers import TTSCacheConfig, TTSPhraseCache
 
 
 async def _chunks_then_raise(data: bytes):

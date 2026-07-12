@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
 
-from tts_providers import DispatcherConfig, PrimaryProvider, TTSDispatcher
-from voice_registry import MiniMaxParams, PiperParams, VoiceRecord
+from ttsbot.providers import DispatcherConfig, PrimaryProvider, TTSDispatcher
+from ttsbot.voice_registry import MiniMaxParams, PiperParams, VoiceRecord
 
 
 def _piper_record(name="piper-ruslan"):

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import httpx
 
-from tts_providers import (
+from ttsbot.providers import (
     MiniMaxAuthError,
     MiniMaxConfig,
     MiniMaxError,

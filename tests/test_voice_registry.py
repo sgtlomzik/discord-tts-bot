@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-import voice_registry as vr
+from ttsbot import voice_registry as vr
 
 
 def _piper_profiles() -> dict:

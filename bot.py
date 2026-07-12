@@ -13,7 +13,7 @@ import time  # noqa: F401  (patched via bot_mod.time in tests)
 
 import discord
 
-import voice_registry  # noqa: F401  (re-export: tests use bot_mod.voice_registry)
+from ttsbot import voice_registry  # noqa: F401  (re-export: tests use bot_mod.voice_registry)
 from ttsbot import config
 from ttsbot.textnorm import (
     CUSTOM_EMOJI_RE,

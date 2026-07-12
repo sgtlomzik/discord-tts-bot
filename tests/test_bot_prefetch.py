@@ -17,7 +17,7 @@ from test_bot_streaming import (
     _chunks,
     _minimax_voice,
 )
-from tts_providers import TTSCacheConfig, TTSPhraseCache
+from ttsbot.providers import TTSCacheConfig, TTSPhraseCache
 
 
 def _job(bot_mod, text="привет", gid=1):

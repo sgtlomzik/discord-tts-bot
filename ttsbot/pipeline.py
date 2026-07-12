@@ -21,8 +21,8 @@ except Exception:  # pragma: no cover - optional dependency
     PiperVoice = None
     SynthesisConfig = None
 
-import voice_registry
-from tts_providers import (
+from ttsbot import voice_registry
+from ttsbot.providers import (
     MiniMaxError,
     MiniMaxProvider,
     MiniMaxVoiceNotFoundError,
