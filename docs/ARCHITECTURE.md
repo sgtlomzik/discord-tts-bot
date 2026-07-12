@@ -343,6 +343,7 @@ Current commands:
 - `voice-user` - assign a voice profile to one member;
 - `voice-clear` - clear a member's voice override;
 - `status` - show current runtime state;
+- `limit` - show or change the per-message text length cap (persisted in `data/config.json`);
 - `queue-clear` - clear queued work;
 - `test` - enqueue a test phrase, optionally to a specific voice channel.
 

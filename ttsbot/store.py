@@ -31,6 +31,10 @@ class BotConfigStore:
         # TODO(per-guild): aliases are global for now (like voice clones);
         # key by guild_id when per-guild pronunciations are needed.
         self.emoji_aliases: dict[str, dict[str, str]] = {}
+        # Runtime-adjustable global settings that override env defaults
+        # (currently only tts_max_chars, set via /voicebot limit). Applied
+        # to the config module on load so the override survives restarts.
+        self.settings: dict[str, int] = {}
         self.load()
 
     def _is_valid_voice(self, name: str) -> bool:
@@ -98,6 +102,29 @@ class BotConfigStore:
                 }
         self.emoji_aliases = emoji_aliases
 
+        raw_settings = data.get("settings", {}) if isinstance(data, dict) else {}
+        if isinstance(raw_settings, dict):
+            max_chars = raw_settings.get("tts_max_chars")
+            if isinstance(max_chars, int) and max_chars > 0:
+                self.settings["tts_max_chars"] = max_chars
+        self._apply_settings()
+
+    def _apply_settings(self) -> None:
+        """Push stored overrides into the live config module."""
+        max_chars = self.settings.get("tts_max_chars")
+        if isinstance(max_chars, int) and max_chars > 0:
+            config.TTS_MAX_CHARS = max_chars
+            # TTS_MAX_CHARS is enforced at the enqueue boundary, but
+            # MAX_TEXT_LENGTH is a hard ceiling deeper in normalization —
+            # lift it so the requested limit actually takes effect.
+            if config.MAX_TEXT_LENGTH < max_chars:
+                config.MAX_TEXT_LENGTH = max_chars
+
+    def set_tts_max_chars(self, value: int) -> None:
+        self.settings["tts_max_chars"] = int(value)
+        self._apply_settings()
+        self.save()
+
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
@@ -122,6 +149,7 @@ class BotConfigStore:
                 emoji_id: {"name": entry.get("name", ""), "say": entry.get("say", "")}
                 for emoji_id, entry in sorted(self.emoji_aliases.items())
             },
+            "settings": dict(sorted(self.settings.items())),
         }
         with tempfile.NamedTemporaryFile(
             "w",

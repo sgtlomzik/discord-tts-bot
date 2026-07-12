@@ -106,7 +106,7 @@ python bot.py
 `voice-user`, `voice-clear`, `voice-add`, `voice-clone`, `voice-tune`,
 `voice-describe`, `voice-say-set`, `voice-say-clear`, `emoji-alias`,
 `emoji-aliases`, `emoji-alias-remove`, `status`, `stats`, `test`,
-`queue-clear` — плюс легаси-команды `!tts join` / `!tts stop`.
+`limit`, `queue-clear` — плюс легаси-команды `!tts join` / `!tts stop`.
 
 ## Разработка
 

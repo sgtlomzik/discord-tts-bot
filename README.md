@@ -105,7 +105,7 @@ Everything is configured through environment variables — see
 `voice-user`, `voice-clear`, `voice-add`, `voice-clone`, `voice-tune`,
 `voice-describe`, `voice-say-set`, `voice-say-clear`, `emoji-alias`,
 `emoji-aliases`, `emoji-alias-remove`, `status`, `stats`, `test`,
-`queue-clear` — plus legacy `!tts join` / `!tts stop` text commands.
+`limit`, `queue-clear` — plus legacy `!tts join` / `!tts stop` text commands.
 
 ## Development
 

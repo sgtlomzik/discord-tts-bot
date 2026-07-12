@@ -708,6 +708,14 @@ def build_commands(bot):
             inline=True,
         )
         embed.add_field(name="Лимит символов", value=str(config.TTS_MAX_CHARS), inline=True)
+        if config.TTS_AUDIO_LIMIT_ENABLED:
+            audio_limit = (
+                f"{config.TTS_AUDIO_CHARS_PER_SECOND:g} симв/с × "
+                f"{config.TTS_AUDIO_LIMIT_SAFETY:g}, мин {config.TTS_AUDIO_LIMIT_MIN_SECONDS:g}с"
+            )
+        else:
+            audio_limit = "выкл"
+        embed.add_field(name="Лимит аудио", value=audio_limit, inline=True)
         embed.add_field(name="Авто-отключение", value=f"{config.IDLE_DISCONNECT_SECONDS}с", inline=True)
         return embed
 
@@ -850,6 +858,32 @@ def build_commands(bot):
             return
         await interaction.response.send_message("Тестовая фраза добавлена в очередь.", ephemeral=True)
         await bot.enqueue_tts(final_text, target_channel, interaction.user.id, interaction.channel_id or 0)
+
+
+    @tts_group.command(
+        name="limit", description="Максимальная длина озвучиваемого текста (символов)"
+    )
+    @app_commands.describe(
+        chars="Новый лимит символов на сообщение (50–2000); пусто — показать текущий"
+    )
+    async def slash_tts_limit(
+        interaction: discord.Interaction,
+        chars: app_commands.Range[int, 50, 2000] | None = None,
+    ) -> None:
+        if not await require_guild_manager(interaction):
+            return
+        if chars is None:
+            await interaction.response.send_message(
+                f"Текущий лимит: `{config.TTS_MAX_CHARS}` символов на сообщение.",
+                ephemeral=True,
+            )
+            return
+        bot.config_store.set_tts_max_chars(int(chars))
+        await interaction.response.send_message(
+            f"Лимит длины текста: `{config.TTS_MAX_CHARS}` символов на сообщение. "
+            "Более длинные сообщения будут обрезаться.",
+            ephemeral=True,
+        )
 
 
     @tts_group.command(name="queue-clear", description="Очистить очередь TTS")
