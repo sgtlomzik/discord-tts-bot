@@ -62,6 +62,8 @@ def reload() -> None:
     global TTS_SELECTIVE_HOLD_JOIN_SEPARATOR, TTS_SELECTIVE_HOLD_DROP_URL_ONLY
     global TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY, TTS_SELECTIVE_HOLD_LOG_DECISIONS
     global TTS_SELECTIVE_HOLD_ENABLE_ORDER_PRESERVING_FLUSH, TTS_QUEUE_PUT_TIMEOUT_MS
+    global TTS_AUDIO_LIMIT_ENABLED, TTS_AUDIO_CHARS_PER_SECOND
+    global TTS_AUDIO_LIMIT_SAFETY, TTS_AUDIO_LIMIT_MIN_SECONDS
     global VOICE_CONNECT_COOLDOWN_SECONDS
     global PIPER_MODELS_DIR, PIPER_MODEL_PATH, PIPER_CONFIG_PATH
     global PIPER_SPEAKER, PIPER_LENGTH_SCALE
@@ -150,6 +152,16 @@ def reload() -> None:
         "TTS_SELECTIVE_HOLD_ENABLE_ORDER_PRESERVING_FLUSH", "1"
     )
     TTS_QUEUE_PUT_TIMEOUT_MS = int(os.getenv("TTS_QUEUE_PUT_TIMEOUT_MS", "500"))
+    # Playback length guard: MiniMax occasionally "stutters" and streams one
+    # sound forever. We cap playback at a rough estimate of how long the text
+    # SHOULD take to speak: chars / chars-per-second (at voice speed 1.0),
+    # scaled by the voice speed, times a safety margin, with a floor for
+    # very short texts. Anything past the cap is cut off and the stream is
+    # treated as truncated (never cached).
+    TTS_AUDIO_LIMIT_ENABLED = _flag("TTS_AUDIO_LIMIT_ENABLED", "1")
+    TTS_AUDIO_CHARS_PER_SECOND = float(os.getenv("TTS_AUDIO_CHARS_PER_SECOND", "12"))
+    TTS_AUDIO_LIMIT_SAFETY = float(os.getenv("TTS_AUDIO_LIMIT_SAFETY", "2.0"))
+    TTS_AUDIO_LIMIT_MIN_SECONDS = float(os.getenv("TTS_AUDIO_LIMIT_MIN_SECONDS", "5"))
 
     VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
     # One knob for bare-metal runs: point PIPER_MODELS_DIR at ./models and

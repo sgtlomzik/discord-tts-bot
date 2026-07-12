@@ -40,6 +40,53 @@ from ttsbot.models import PreparedAudio, TTSJob, VOICE_PROFILES, VoiceProfile
 log = logging.getLogger("tts_bot")
 
 
+def _voice_speed_factor(voice) -> float:
+    """Playback speed of a voice relative to 1.0 (higher = faster speech).
+
+    MiniMax exposes ``speed`` directly; Piper's ``length_scale`` stretches
+    duration, so speed is its inverse.
+    """
+    if voice is None:
+        return 1.0
+    mm = getattr(voice, "minimax", None)
+    if getattr(voice, "is_minimax", False) and mm is not None:
+        return max(float(getattr(mm, "speed", 1.0) or 1.0), 0.1)
+    piper = getattr(voice, "piper", None)
+    if piper is not None:
+        length_scale = float(getattr(piper, "length_scale", 1.0) or 1.0)
+        return max(1.0 / max(length_scale, 0.1), 0.1)
+    return 1.0
+
+
+def playback_frame_limit(text: str, voice=None) -> int | None:
+    """Max plausible 20ms frames for ``text``, or None when the guard is off.
+
+    Estimate: chars / TTS_AUDIO_CHARS_PER_SECOND at speed 1.0, divided by the
+    voice speed factor, times TTS_AUDIO_LIMIT_SAFETY, floored at
+    TTS_AUDIO_LIMIT_MIN_SECONDS. Guards against MiniMax stutter loops that
+    stream one sound indefinitely.
+    """
+    if not config.TTS_AUDIO_LIMIT_ENABLED:
+        return None
+    cps = max(config.TTS_AUDIO_CHARS_PER_SECOND, 0.1)
+    seconds = len(text) / cps / _voice_speed_factor(voice)
+    seconds = max(seconds * max(config.TTS_AUDIO_LIMIT_SAFETY, 1.0),
+                  config.TTS_AUDIO_LIMIT_MIN_SECONDS)
+    return max(1, int(seconds * 1000 / PCM_FRAME_MS))
+
+
+def limit_pcm_frames(frames: list[bytes], text: str, voice=None) -> list[bytes]:
+    """Truncate an already-decoded frame list to the playback limit."""
+    limit = playback_frame_limit(text, voice)
+    if limit is None or len(frames) <= limit:
+        return frames
+    log.warning(
+        "Audio length limit: decoded %d frames for %d chars, capping at %d (%.1fs)",
+        len(frames), len(text), limit, limit * PCM_FRAME_MS / 1000,
+    )
+    return frames[:limit]
+
+
 class SynthesisPipelineMixin:
     """TTS generation, streaming and worker loops; mixed into TTSBot."""
 
@@ -294,6 +341,7 @@ class SynthesisPipelineMixin:
                 except Exception:
                     log.exception("Cached audio decode failed; streaming instead")
                     frames = []
+                frames = limit_pcm_frames(frames, job.text, voice)
                 if frames:
                     source.enqueue_frames(frames)
                     log.info(
@@ -425,6 +473,10 @@ class SynthesisPipelineMixin:
                 mid_error.append(exc)
             finally:
                 try:
+                    await agen.aclose()
+                except Exception:
+                    pass
+                try:
                     proc.stdin.close()
                 except Exception:
                     pass
@@ -436,7 +488,9 @@ class SynthesisPipelineMixin:
 
         feeder = asyncio.create_task(_feed())
 
+        frame_limit = playback_frame_limit(job.text, voice)
         frames_enqueued = 0
+        limit_hit = False
         first_frame_ts: float | None = None
         leftover = b""
         try:
@@ -448,21 +502,37 @@ class SynthesisPipelineMixin:
                 n = len(buf) - (len(buf) % PCM_FRAME_BYTES)
                 if n:
                     out_frames = [buf[i:i + PCM_FRAME_BYTES] for i in range(0, n, PCM_FRAME_BYTES)]
-                    source.enqueue_frames(out_frames)
-                    if first_frame_ts is None:
-                        first_frame_ts = time.perf_counter()
-                        log.info(
-                            "Stream first audio guild=%s channel=%s "
-                            "message_to_first_audio_s=%.3f queue_to_first_audio_s=%.3f",
-                            job.voice_channel.guild.id, job.voice_channel.id,
-                            first_frame_ts - job.message_ts,
-                            first_frame_ts - job.queued_at,
+                    if frame_limit is not None and frames_enqueued + len(out_frames) > frame_limit:
+                        out_frames = out_frames[:max(frame_limit - frames_enqueued, 0)]
+                        limit_hit = True
+                    if out_frames:
+                        source.enqueue_frames(out_frames)
+                        if first_frame_ts is None:
+                            first_frame_ts = time.perf_counter()
+                            log.info(
+                                "Stream first audio guild=%s channel=%s "
+                                "message_to_first_audio_s=%.3f queue_to_first_audio_s=%.3f",
+                                job.voice_channel.guild.id, job.voice_channel.id,
+                                first_frame_ts - job.message_ts,
+                                first_frame_ts - job.queued_at,
+                            )
+                        frames_enqueued += len(out_frames)
+                    if limit_hit:
+                        log.warning(
+                            "Audio length limit hit guild=%s: %d frames (%.1fs) for %d chars; "
+                            "aborting stream (likely a stutter loop)",
+                            job.voice_channel.guild.id, frames_enqueued,
+                            frames_enqueued * PCM_FRAME_MS / 1000, len(job.text),
                         )
-                    frames_enqueued += len(out_frames)
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        break
                 leftover = buf[n:]
         finally:
             await feeder
-            if leftover:
+            if leftover and not limit_hit:
                 source.enqueue_frames(
                     [leftover + b"\x00" * (PCM_FRAME_BYTES - len(leftover))]
                 )
@@ -481,6 +551,9 @@ class SynthesisPipelineMixin:
                 except OSError:
                     pass
 
+        if limit_hit:
+            _discard_cache()  # a stutter loop must never be cached
+            return ("truncated", frames_enqueued)
         if mid_error:
             _discard_cache()  # never cache a partial stream
             log.warning(
@@ -557,7 +630,7 @@ class SynthesisPipelineMixin:
         if cache is not None:
             cached = cache.lookup(job.text, voice.name)
             if cached is not None:
-                frames = await self._safe_pcm_frames(cached)
+                frames = limit_pcm_frames(await self._safe_pcm_frames(cached), job.text, voice)
                 if frames and not prepared.cancelled:
                     await prepared.channel.put(frames)
                     prepared.provider = "cache"
@@ -594,7 +667,7 @@ class SynthesisPipelineMixin:
             )
             if prepared.cancelled:
                 return
-            frames = await self._safe_pcm_frames(filename)
+            frames = limit_pcm_frames(await self._safe_pcm_frames(filename), job.text, voice)
             if frames:
                 await prepared.channel.put(frames)
         finally:
@@ -675,6 +748,10 @@ class SynthesisPipelineMixin:
                 mid_error.append(exc)
             finally:
                 try:
+                    await agen.aclose()
+                except Exception:
+                    pass
+                try:
                     proc.stdin.close()
                 except Exception:
                     pass
@@ -685,7 +762,9 @@ class SynthesisPipelineMixin:
                         pass
 
         feeder = asyncio.create_task(_feed())
+        frame_limit = playback_frame_limit(job.text, voice)
         frames_count = 0
+        limit_hit = False
         leftover = b""
         try:
             while True:
@@ -696,12 +775,28 @@ class SynthesisPipelineMixin:
                 n = len(buf) - (len(buf) % PCM_FRAME_BYTES)
                 if n and not prepared.cancelled:
                     out_frames = [buf[i:i + PCM_FRAME_BYTES] for i in range(0, n, PCM_FRAME_BYTES)]
-                    await prepared.channel.put(out_frames)
-                    frames_count += len(out_frames)
+                    if frame_limit is not None and frames_count + len(out_frames) > frame_limit:
+                        out_frames = out_frames[:max(frame_limit - frames_count, 0)]
+                        limit_hit = True
+                    if out_frames:
+                        await prepared.channel.put(out_frames)
+                        frames_count += len(out_frames)
+                    if limit_hit:
+                        log.warning(
+                            "Audio length limit hit guild=%s: %d frames (%.1fs) for %d chars; "
+                            "aborting stream (likely a stutter loop)",
+                            job.guild_id, frames_count,
+                            frames_count * PCM_FRAME_MS / 1000, len(job.text),
+                        )
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        break
                 leftover = buf[n:]
         finally:
             await feeder
-            if leftover and not prepared.cancelled:
+            if leftover and not prepared.cancelled and not limit_hit:
                 await prepared.channel.put(
                     [leftover + b"\x00" * (PCM_FRAME_BYTES - len(leftover))]
                 )
@@ -723,6 +818,9 @@ class SynthesisPipelineMixin:
         if prepared.cancelled:
             _discard()
             return ("cancelled", frames_count)
+        if limit_hit:
+            _discard()  # a stutter loop must never be cached
+            return ("truncated", frames_count)
         if mid_error:
             _discard()
             log.warning("Stream failed mid-stream after %d frames (%s); truncated",
@@ -804,7 +902,13 @@ class SynthesisPipelineMixin:
                 try:
                     if config.TTS_CONTINUOUS_STREAM:
                         source = self.ensure_continuous_player(vc)
-                        frames = await self.prepare_tts_pcm_frames(filename)
+                        file_voice = (
+                            self.voice_registry.get(file_voice_name)
+                            or self.voice_registry.fallback_record()
+                        )
+                        frames = limit_pcm_frames(
+                            await self.prepare_tts_pcm_frames(filename), job.text, file_voice
+                        )
                         audio_enqueue_ts = time.perf_counter()
                         source.enqueue_frames(frames)
                         log.info(
