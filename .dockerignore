@@ -1,23 +1,8 @@
-.git
-.env
-*.env
-!.env.example
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-*.log
-*.tmp
-*.bak
-*.bak-*
-tts_*.mp3
-.venv/
-models/
-data/
-exports/
-docs/
-scripts/voice_samples/
-tests/
-*.md
-.github/
+# Allowlist: the image copies only requirements.txt, bot.py and ttsbot/
+# (see Dockerfile), so exclude everything else from the build context.
+*
+!requirements.txt
+!bot.py
+!ttsbot
+**/__pycache__
+**/*.py[cod]
