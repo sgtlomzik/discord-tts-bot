@@ -36,3 +36,6 @@ exports/
 data/
 .env.bak*
 supertonic_*.md
+
+# Host-specific compose tweaks stay local
+docker-compose.override.yml

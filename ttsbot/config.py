@@ -16,7 +16,9 @@ LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
 log = logging.getLogger("tts_bot")
 
-DEFAULT_WHITELIST = "441612025286885397"
+# No implicit whitelist: WHITELIST_USERS must be set (main() fails fast
+# otherwise), so a public build never ships with someone's personal id.
+DEFAULT_WHITELIST = ""
 
 
 def setup_logging() -> None:
@@ -61,7 +63,8 @@ def reload() -> None:
     global TTS_SELECTIVE_HOLD_DROP_MENTION_ONLY, TTS_SELECTIVE_HOLD_LOG_DECISIONS
     global TTS_SELECTIVE_HOLD_ENABLE_ORDER_PRESERVING_FLUSH, TTS_QUEUE_PUT_TIMEOUT_MS
     global VOICE_CONNECT_COOLDOWN_SECONDS
-    global PIPER_MODEL_PATH, PIPER_CONFIG_PATH, PIPER_SPEAKER, PIPER_LENGTH_SCALE
+    global PIPER_MODELS_DIR, PIPER_MODEL_PATH, PIPER_CONFIG_PATH
+    global PIPER_SPEAKER, PIPER_LENGTH_SCALE
     global WHITELIST_USERS
 
     TMP_DIR = Path(os.getenv("TTS_TMP_DIR", "/dev/shm"))
@@ -149,11 +152,13 @@ def reload() -> None:
     TTS_QUEUE_PUT_TIMEOUT_MS = int(os.getenv("TTS_QUEUE_PUT_TIMEOUT_MS", "500"))
 
     VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
-    PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "/app/models/ru_RU-ruslan-medium.onnx").strip()
-    PIPER_CONFIG_PATH = os.getenv(
-        "PIPER_CONFIG_PATH",
-        "/app/models/ru_RU-ruslan-medium.onnx.json",
+    # One knob for bare-metal runs: point PIPER_MODELS_DIR at ./models and
+    # the per-voice defaults follow. Explicit *_PATH values still win.
+    PIPER_MODELS_DIR = os.getenv("PIPER_MODELS_DIR", "/app/models").strip().rstrip("/") or "/app/models"
+    PIPER_MODEL_PATH = os.getenv(
+        "PIPER_MODEL_PATH", f"{PIPER_MODELS_DIR}/ru_RU-ruslan-medium.onnx"
     ).strip()
+    PIPER_CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH", f"{PIPER_MODEL_PATH}.json").strip()
     PIPER_SPEAKER = int(os.getenv("PIPER_SPEAKER", "-1"))
     PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.0"))
 

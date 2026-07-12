@@ -9,7 +9,9 @@ services:
     env_file:
       - path: .env
         required: false
-    network_mode: "container:gluetun"
+    # Host-specific tweaks (VPN network_mode, extra mounts, ...) belong in
+    # an untracked docker-compose.override.yml — compose merges it in
+    # automatically.
     restart: unless-stopped
     volumes:
       - ./bot.py:/app/bot.py

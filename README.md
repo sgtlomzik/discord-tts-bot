@@ -1,5 +1,7 @@
 # Discord TTS Bot
 
+**English** | [Русский](README.ru.md)
+
 A self-hosted Discord bot that reads chat messages aloud in a voice channel.
 Built for Russian-speaking communities: local [Piper](https://github.com/OHF-Voice/piper1-gpl)
 voices work fully offline, and [MiniMax](https://www.minimax.io/) cloud voices
@@ -30,8 +32,9 @@ voices work fully offline, and [MiniMax](https://www.minimax.io/) cloud voices
   covers enabling TTS, the user whitelist, voices, cloning, emoji aliases,
   stats and queue control.
 
-## Quick start
+## Quick start (Docker)
 
+Docker is optional — see [Running without Docker](#running-without-docker).
 Prerequisites: a Discord application with a bot token
 (enable the **Message Content** intent), Docker with the compose plugin.
 
@@ -50,10 +53,8 @@ docker compose pull && docker compose up -d
 ```
 
 Or build the image locally instead of pulling: `docker compose up -d --build`.
-
-> **Note:** the committed `docker-compose.yml` routes the bot through a
-> `gluetun` VPN container (`network_mode`). If you don't need that, remove the
-> `network_mode` line — the bot only needs outbound internet access.
+Host-specific tweaks (custom networking, extra mounts) belong in an untracked
+`docker-compose.override.yml`, which compose merges automatically.
 
 Invite the bot to your server with the `bot` + `applications.commands` scopes
 and voice permissions (Connect, Speak), then in Discord:
@@ -63,6 +64,26 @@ and voice permissions (Connect, Speak), then in Discord:
 /voicebot allow @user
 /voicebot test text: привет
 ```
+
+## Running without Docker
+
+The bot is a single Python process; Docker only packages ffmpeg/libopus and
+loads the env file for you.
+
+```bash
+sudo apt install ffmpeg libopus0          # system deps (Debian/Ubuntu)
+python3.11 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+./scripts/download_models.sh
+
+cp .env.example .env                      # edit DISCORD_TOKEN, WHITELIST_USERS
+set -a; . ./.env; set +a                  # nothing loads .env for you outside Docker
+export PIPER_MODELS_DIR=./models BOT_CONFIG_PATH=./data/config.json
+python bot.py
+```
+
+For unattended runs wrap the same thing in a systemd unit with
+`EnvironmentFile=/path/to/.env`.
 
 ## Configuration
 

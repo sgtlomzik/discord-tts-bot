@@ -80,8 +80,8 @@ def reload_voice_profiles() -> None:
             "piper-irina": VoiceProfile(
                 name="piper-irina",
                 label="Piper Irina",
-                piper_model_path="/app/models/ru_RU-irina-medium.onnx",
-                piper_config_path="/app/models/ru_RU-irina-medium.onnx.json",
+                piper_model_path=f"{config.PIPER_MODELS_DIR}/ru_RU-irina-medium.onnx",
+                piper_config_path=f"{config.PIPER_MODELS_DIR}/ru_RU-irina-medium.onnx.json",
                 piper_speaker=config.PIPER_SPEAKER,
                 piper_length_scale=config.PIPER_LENGTH_SCALE,
             ),
