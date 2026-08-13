@@ -122,6 +122,18 @@ class NormalizeForTTSTests(unittest.TestCase):
             "line one. line two",
         )
 
+    def test_unicode_emoji_conversion_caches_repeated_text(self):
+        convert = self.bot.speak_unicode_emoji
+        convert.cache_clear()
+        text = "repeat \U0001f602"
+
+        first = convert(text)
+        second = convert(text)
+
+        self.assertEqual(second, first)
+        self.assertEqual(convert.cache_info().hits, 1)
+        self.assertEqual(convert.cache_info().maxsize, 2048)
+
     # ----- length cap -----
 
     def test_truncates_long_message(self):

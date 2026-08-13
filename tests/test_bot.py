@@ -346,6 +346,60 @@ class TTSBotTests(unittest.TestCase):
 
 
 class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_continuous_audio_source_wait_avoids_thread_pool(self):
+        bot_mod = load_bot_module()
+        idle = b"\x00" * bot_mod.PCM_FRAME_BYTES
+        speech = b"\x01" * bot_mod.PCM_FRAME_BYTES
+        source = bot_mod.ContinuousTTSAudioSource(idle)
+        source.enqueue_frames([speech])
+
+        with patch("ttsbot.audio.asyncio.to_thread", side_effect=AssertionError("thread pool used")):
+            waiter = asyncio.create_task(source.wait_until_drained(timeout=0.5))
+            await asyncio.sleep(0)
+            self.assertEqual(source.read(), speech)
+            self.assertTrue(await waiter)
+
+    async def test_continuous_audio_source_ignores_stale_drain_notification(self):
+        bot_mod = load_bot_module()
+        idle = b"\x00" * bot_mod.PCM_FRAME_BYTES
+        first = b"\x01" * bot_mod.PCM_FRAME_BYTES
+        second = b"\x02" * bot_mod.PCM_FRAME_BYTES
+        source = bot_mod.ContinuousTTSAudioSource(idle)
+        source.enqueue_frames([first])
+
+        waiter = asyncio.create_task(source.wait_until_drained(timeout=0.5))
+        await asyncio.sleep(0)
+        self.assertEqual(source.read(), first)
+        source.enqueue_frames([second])
+        await asyncio.sleep(0)
+        self.assertFalse(waiter.done())
+
+        self.assertEqual(source.read(), second)
+        self.assertTrue(await waiter)
+
+    async def test_merge_path_enqueues_pre_normalized_text_without_reprocessing(self):
+        bot_mod = load_bot_module()
+        original_algorithm = bot_mod.config.TTS_MERGE_ALGORITHM
+        bot_mod.config.TTS_MERGE_ALGORITHM = "off"
+        tts_bot = bot_mod.TTSBot()
+        voice_channel = types.SimpleNamespace(
+            id=200, guild=types.SimpleNamespace(id=100)
+        )
+
+        try:
+            with patch(
+                "ttsbot.merge.normalize_for_tts",
+                side_effect=AssertionError("normalized text was processed twice"),
+            ):
+                await tts_bot.queue_or_merge_message(
+                    "hello \U0001f602", voice_channel, 300, 400
+                )
+        finally:
+            bot_mod.config.TTS_MERGE_ALGORITHM = original_algorithm
+
+        job = await tts_bot.message_queue.get()
+        self.assertNotIn("\U0001f602", job.text)
+
     async def test_tts_worker_does_not_disconnect_on_tts_generation_error(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()

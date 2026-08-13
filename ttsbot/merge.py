@@ -30,17 +30,27 @@ class MergeQueueMixin:
         author_id: int,
         text_channel_id: int,
         message_ts: float | None = None,
+        *,
+        normalized: bool = False,
     ) -> bool:
         # Normalize once at the boundary so every caller (merge buffer,
         # /voicebot test, future commands) gets identical cleanup. The
         # TTS_MAX_CHARS cap is enforced here (300 by default, per spec
         # §"Препроцессинг текста") — it protects the cloud API quota
         # from accidental walls of text and keeps Piper CPU bounded.
-        cleaned = normalize_for_tts(
-            text,
-            max_chars=config.TTS_MAX_CHARS,
-            emoji_aliases=self.config_store.emoji_say_map(),
-        )
+        if normalized:
+            # The merge analyzer already stripped Discord tokens, resolved
+            # emoji/mentions and collapsed whitespace. Avoid doing that work
+            # again on the hot message path; only enforce the final quota cap.
+            cleaned = text.strip()
+            if config.TTS_MAX_CHARS and len(cleaned) > config.TTS_MAX_CHARS:
+                cleaned = cleaned[:config.TTS_MAX_CHARS].rstrip()
+        else:
+            cleaned = normalize_for_tts(
+                text,
+                max_chars=config.TTS_MAX_CHARS,
+                emoji_aliases=self.config_store.emoji_say_map(),
+            )
         if not cleaned:
             log.info(
                 "Skipped TTS enqueue author=%s reason=empty_after_normalize",
@@ -71,7 +81,7 @@ class MergeQueueMixin:
                 voice_channel.id,
                 author_id,
                 self.message_queue.qsize(),
-                len(text),
+                len(cleaned),
                 voice_profile,
             )
             return True
@@ -122,6 +132,7 @@ class MergeQueueMixin:
                 state.author_id,
                 state.text_channel_id,
                 message_ts=state.first_ts,
+                normalized=True,
             )
             if ok:
                 log.info(
@@ -188,7 +199,10 @@ class MergeQueueMixin:
 
         if config.TTS_MERGE_ALGORITHM == "off":
             if parsed.spoken_text:
-                await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                await self.enqueue_tts(
+                    parsed.spoken_text, voice_channel, author_id, text_channel_id,
+                    message_ts=now, normalized=True,
+                )
             return
 
         selective_enabled_for_author = (
@@ -199,7 +213,10 @@ class MergeQueueMixin:
             if not parsed.spoken_text:
                 return
             if not config.TTS_MERGE_SHORT_MESSAGES or len(parsed.spoken_text) > config.TTS_MERGE_MAX_CHARS:
-                await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                await self.enqueue_tts(
+                    parsed.spoken_text, voice_channel, author_id, text_channel_id,
+                    message_ts=now, normalized=True,
+                )
                 return
             async with self._merge_lock(key):
                 state = self.merge_buffers.get(key)
@@ -234,12 +251,18 @@ class MergeQueueMixin:
                     return
                 if parsed.effective_length >= max(config.TTS_MERGE_MAX_CHARS, 40):
                     self._decision_log("immediate_long", parsed)
-                    await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                    await self.enqueue_tts(
+                        parsed.spoken_text, voice_channel, author_id, text_channel_id,
+                        message_ts=now, normalized=True,
+                    )
                     return
                 if parsed.is_special_only or parsed.is_caps_shout or parsed.is_keyboard_smash or parsed.is_question_or_terminal:
                     self._decision_log("immediate_special", parsed)
                     if parsed.spoken_text:
-                        await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                        await self.enqueue_tts(
+                            parsed.spoken_text, voice_channel, author_id, text_channel_id,
+                            message_ts=now, normalized=True,
+                        )
                     return
                 if (
                     is_reaction_like(parsed)
@@ -254,7 +277,10 @@ class MergeQueueMixin:
                         parsed,
                         gap_prev_ms=gap_prev_ms,
                     )
-                    await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                    await self.enqueue_tts(
+                        parsed.spoken_text, voice_channel, author_id, text_channel_id,
+                        message_ts=now, normalized=True,
+                    )
                     return
                 strong = (
                     parsed.effective_length >= config.TTS_SELECTIVE_HOLD_START_EFFECTIVE_LEN
@@ -266,7 +292,10 @@ class MergeQueueMixin:
                 )
                 if not strong:
                     self._decision_log("immediate_default", parsed)
-                    await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                    await self.enqueue_tts(
+                        parsed.spoken_text, voice_channel, author_id, text_channel_id,
+                        message_ts=now, normalized=True,
+                    )
                     return
                 generation = self._next_merge_generation(key)
                 deadline = now + max(config.TTS_SELECTIVE_HOLD_HARD_CAP_MS, 1) / 1000.0
@@ -297,7 +326,10 @@ class MergeQueueMixin:
             if state.voice_channel.id != voice_channel.id or state.text_channel_id != text_channel_id:
                 await self._flush_buffer_locked(key, "voice_context_changed")
                 if parsed.spoken_text:
-                    await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                    await self.enqueue_tts(
+                        parsed.spoken_text, voice_channel, author_id, text_channel_id,
+                        message_ts=now, normalized=True,
+                    )
                 return
 
             hard_break = (
@@ -317,7 +349,10 @@ class MergeQueueMixin:
                 )
                 ok = await self._flush_buffer_locked(key, "flush_before_hard_break")
                 if ok and parsed.spoken_text:
-                    await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                    await self.enqueue_tts(
+                        parsed.spoken_text, voice_channel, author_id, text_channel_id,
+                        message_ts=now, normalized=True,
+                    )
                 return
 
             prospective_parts = len(state.items) + 1
@@ -328,7 +363,10 @@ class MergeQueueMixin:
             ):
                 ok = await self._flush_buffer_locked(key, "flush_before_reclassify")
                 if ok:
-                    await self.enqueue_tts(parsed.spoken_text, voice_channel, author_id, text_channel_id, message_ts=now)
+                    await self.enqueue_tts(
+                        parsed.spoken_text, voice_channel, author_id, text_channel_id,
+                        message_ts=now, normalized=True,
+                    )
                 return
 
             state.items.append(parsed)

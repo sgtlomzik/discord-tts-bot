@@ -7,6 +7,7 @@ message objects used for mention resolution) — no bot state, no I/O.
 import logging
 import re
 import unicodedata
+from functools import lru_cache
 
 import discord
 import emoji
@@ -152,6 +153,7 @@ def resolve_mentions(text: str, mention_names: dict[str, str]) -> str:
     return MENTION_ID_RE.sub(_repl, text)
 
 
+@lru_cache(maxsize=2048)
 def speak_unicode_emoji(text: str) -> str:
     """Replace standard Unicode emoji with their Russian names so the bot
     reads them aloud (😂 -> "смеется до слез", 🇷🇺 -> "флаг Россия").

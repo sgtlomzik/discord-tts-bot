@@ -207,8 +207,24 @@ class ContinuousTTSAudioSource(discord.AudioSource):
         self._stopped = threading.Event()
         self._drained = threading.Event()
         self._drained.set()
+        self._async_drained = asyncio.Event()
+        self._async_drained.set()
+        self._drained_loop: asyncio.AbstractEventLoop | None = None
         self._lock = threading.Lock()
         self._pending_frames = 0
+
+    def _mark_drained(self) -> None:
+        self._drained.set()
+        loop = self._drained_loop
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._mark_async_drained_if_current)
+
+    def _mark_async_drained_if_current(self) -> None:
+        # A new batch may have been queued after the audio thread scheduled
+        # this callback but before the event loop runs it. Do not let that
+        # stale notification complete the new batch's waiter early.
+        if self._drained.is_set():
+            self._async_drained.set()
 
     def read(self) -> bytes:
         if self._stopped.is_set():
@@ -222,7 +238,7 @@ class ContinuousTTSAudioSource(discord.AudioSource):
         with self._lock:
             self._pending_frames = max(0, self._pending_frames - 1)
             if self._pending_frames == 0:
-                self._drained.set()
+                self._mark_drained()
         return frame
 
     def is_opus(self) -> bool:
@@ -234,17 +250,39 @@ class ContinuousTTSAudioSource(discord.AudioSource):
         with self._lock:
             self._pending_frames += len(frames)
             self._drained.clear()
+            self._async_drained.clear()
         for frame in frames:
             if len(frame) != PCM_FRAME_BYTES:
                 raise ValueError(f"PCM frame must be {PCM_FRAME_BYTES} bytes, got {len(frame)}")
             self.frames.put(frame)
 
     async def wait_until_drained(self, timeout: float | None = None) -> bool:
-        return await asyncio.to_thread(self._drained.wait, timeout)
+        if self._drained.is_set():
+            return True
+
+        loop = asyncio.get_running_loop()
+        if self._drained_loop is not None and self._drained_loop is not loop:
+            # Defensive fallback for the unusual case where one source crosses
+            # event loops. Production keeps each source on the bot's one loop.
+            return await asyncio.to_thread(self._drained.wait, timeout)
+        self._drained_loop = loop
+
+        # Close the small race between the first is_set() and storing the loop.
+        if self._drained.is_set():
+            self._async_drained.set()
+
+        try:
+            if timeout is None:
+                await self._async_drained.wait()
+            else:
+                await asyncio.wait_for(self._async_drained.wait(), timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     def stop(self) -> None:
         self._stopped.set()
-        self._drained.set()
+        self._mark_drained()
 
     def cleanup(self) -> None:
         self.stop()

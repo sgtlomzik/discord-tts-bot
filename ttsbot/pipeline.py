@@ -40,6 +40,33 @@ from ttsbot.models import PreparedAudio, TTSJob, VOICE_PROFILES, VoiceProfile
 log = logging.getLogger("tts_bot")
 
 
+async def _close_subprocess_stdin(writer) -> None:
+    """Close an asyncio subprocess pipe and consume deferred pipe errors."""
+    if writer is None:
+        return
+    try:
+        writer.close()
+    except Exception:
+        return
+    try:
+        await writer.wait_closed()
+    except (BrokenPipeError, ConnectionResetError):
+        # Expected when the audio-length guard intentionally kills ffmpeg.
+        pass
+    except Exception:
+        log.debug("Failed to close ffmpeg stdin cleanly", exc_info=True)
+
+
+async def _finish_feeder(feeder: asyncio.Task[None], *, cancel: bool = False) -> None:
+    """Stop and retrieve a feeder task without leaking cancellation/errors."""
+    if cancel and not feeder.done():
+        feeder.cancel()
+    try:
+        await feeder
+    except asyncio.CancelledError:
+        pass
+
+
 def _voice_speed_factor(voice) -> float:
     """Playback speed of a voice relative to 1.0 (higher = faster speech).
 
@@ -476,10 +503,7 @@ class SynthesisPipelineMixin:
                     await agen.aclose()
                 except Exception:
                     pass
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
+                await _close_subprocess_stdin(proc.stdin)
                 if cache_part is not None:
                     try:
                         cache_part.close()
@@ -524,14 +548,22 @@ class SynthesisPipelineMixin:
                             job.voice_channel.guild.id, frames_enqueued,
                             frames_enqueued * PCM_FRAME_MS / 1000, len(job.text),
                         )
+                        feeder.cancel()
                         try:
                             proc.kill()
                         except ProcessLookupError:
                             pass
                         break
                 leftover = buf[n:]
+        except BaseException:
+            feeder.cancel()
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            raise
         finally:
-            await feeder
+            await _finish_feeder(feeder, cancel=limit_hit)
             if leftover and not limit_hit:
                 source.enqueue_frames(
                     [leftover + b"\x00" * (PCM_FRAME_BYTES - len(leftover))]
@@ -751,10 +783,7 @@ class SynthesisPipelineMixin:
                     await agen.aclose()
                 except Exception:
                     pass
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
+                await _close_subprocess_stdin(proc.stdin)
                 if cache_part is not None:
                     try:
                         cache_part.close()
@@ -788,14 +817,22 @@ class SynthesisPipelineMixin:
                             job.guild_id, frames_count,
                             frames_count * PCM_FRAME_MS / 1000, len(job.text),
                         )
+                        feeder.cancel()
                         try:
                             proc.kill()
                         except ProcessLookupError:
                             pass
                         break
                 leftover = buf[n:]
+        except BaseException:
+            feeder.cancel()
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            raise
         finally:
-            await feeder
+            await _finish_feeder(feeder, cancel=limit_hit or prepared.cancelled)
             if leftover and not prepared.cancelled and not limit_hit:
                 await prepared.channel.put(
                     [leftover + b"\x00" * (PCM_FRAME_BYTES - len(leftover))]

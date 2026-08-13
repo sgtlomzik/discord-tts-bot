@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 from ttsbot import voice_registry as vr
 from test_bot import load_bot_module
 from ttsbot.providers import TTSCacheConfig, TTSPhraseCache
+from ttsbot.pipeline import _close_subprocess_stdin
 
 
 async def _chunks_then_raise(data: bytes):
@@ -88,6 +89,15 @@ class FakeSource:
 
 @unittest.skipUnless(_MP3, "ffmpeg required")
 class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_subprocess_stdin_close_consumes_broken_pipe(self):
+        writer = MagicMock()
+        writer.wait_closed = AsyncMock(side_effect=BrokenPipeError())
+
+        await _close_subprocess_stdin(writer)
+
+        writer.close.assert_called_once_with()
+        writer.wait_closed.assert_awaited_once_with()
+
     async def test_real_ffmpeg_pump_enqueues_frames_ok(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()

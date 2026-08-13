@@ -857,7 +857,13 @@ def build_commands(bot):
             await interaction.response.send_message("Нет текста для озвучки.", ephemeral=True)
             return
         await interaction.response.send_message("Тестовая фраза добавлена в очередь.", ephemeral=True)
-        await bot.enqueue_tts(final_text, target_channel, interaction.user.id, interaction.channel_id or 0)
+        await bot.enqueue_tts(
+            final_text,
+            target_channel,
+            interaction.user.id,
+            interaction.channel_id or 0,
+            normalized=True,
+        )
 
 
     @tts_group.command(
