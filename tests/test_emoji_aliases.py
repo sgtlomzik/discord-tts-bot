@@ -19,6 +19,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import emoji as emoji_lib
+
+from ttsbot import textnorm
+
 
 def load_bot_module():
     module_path = Path(__file__).resolve().parent.parent / "bot.py"
@@ -243,6 +247,66 @@ class MergeAnalysisTests(unittest.TestCase):
 class UnicodeEmojiTests(unittest.TestCase):
     def _clean(self, s):
         return " ".join(bot.speak_unicode_emoji(s).split())
+
+    @staticmethod
+    def _reference_conversion(text):
+        """The pre-optimization conversion, kept small for parity checks."""
+        matches = emoji_lib.emoji_list(text)
+        if not matches:
+            return text
+        out = []
+        last = 0
+        for match in matches:
+            out.append(text[last : match["match_start"]])
+            char = match["emoji"]
+            name = emoji_lib.demojize(char, language="ru", delimiters=("", ""))
+            if name == char:
+                name = emoji_lib.demojize(char, language="en", delimiters=("", ""))
+            name = name.replace("_", " ").strip()
+            out.append(f" {name} " if name and name != char else " ")
+            last = match["match_end"]
+        out.append(text[last:])
+        return "".join(out)
+
+    def test_no_emoji_gate_covers_entire_installed_corpus(self):
+        missed = [
+            sequence
+            for sequence in emoji_lib.EMOJI_DATA
+            if not textnorm._might_contain_unicode_emoji(sequence)
+        ]
+        self.assertEqual(missed, [])
+
+    def test_no_emoji_gate_keeps_plain_numbers_on_fast_path(self):
+        self.assertFalse(textnorm._might_contain_unicode_emoji("message 12345"))
+        self.assertTrue(textnorm._might_contain_unicode_emoji("keycap 1️⃣"))
+
+    def test_fast_path_output_matches_previous_conversion(self):
+        corpus = (
+            "plain 12345",
+            "keycap 1️⃣",
+            "flag 🇷🇺",
+            "skin 👍🏽",
+            "family 👨‍👩‍👧‍👦",
+            "variation ❤️",
+            "mixed text 😂 and 🔥",
+        )
+        for raw in corpus:
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    textnorm.speak_unicode_emoji(raw),
+                    self._reference_conversion(raw),
+                )
+
+    def test_per_emoji_name_cache_is_bounded_and_reused_across_messages(self):
+        textnorm.speak_unicode_emoji.cache_clear()
+        textnorm._spoken_unicode_emoji_name.cache_clear()
+
+        textnorm.speak_unicode_emoji("first 😂")
+        textnorm.speak_unicode_emoji("second 😂")
+
+        cache = textnorm._spoken_unicode_emoji_name.cache_info()
+        self.assertEqual(cache.maxsize, 512)
+        self.assertGreaterEqual(cache.hits, 1)
 
     def test_named_in_russian(self):
         self.assertEqual(self._clean("😂"), "смеется до слез")

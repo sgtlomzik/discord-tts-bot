@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ttsbot.providers import TTSCacheConfig, TTSPhraseCache
 
@@ -191,6 +193,67 @@ class TTSCacheByteEvictionTests(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit.read_bytes(), b"HELLO_AUDIO")
         self.assertEqual(c2.total_bytes, len(b"HELLO_AUDIO"))
+
+    def test_rehydrate_keeps_mtime_lru_and_cleans_orphan_part(self):
+        self.cache_dir.mkdir(parents=True)
+        files = []
+        for index, label in enumerate(("old", "middle", "new"), start=1):
+            path = self.cache_dir / f"{label}.mp3"
+            path.write_bytes(label.encode())
+            os.utime(path, (index, index))
+            files.append(path)
+        orphan = self.cache_dir / "interrupted.part"
+        orphan.write_bytes(b"partial")
+
+        real_scandir = os.scandir
+        scan_calls = 0
+        stat_calls: dict[str, int] = {}
+
+        class CountingEntry:
+            def __init__(self, entry):
+                self._entry = entry
+                self.name = entry.name
+                self.path = entry.path
+
+            def stat(self, *, follow_symlinks=True):
+                stat_calls[self.name] = stat_calls.get(self.name, 0) + 1
+                return self._entry.stat(follow_symlinks=follow_symlinks)
+
+        class CountingScandir:
+            def __init__(self, path):
+                self._inner = real_scandir(path)
+
+            def __enter__(self):
+                entries = self._inner.__enter__()
+                return (CountingEntry(entry) for entry in entries)
+
+            def __exit__(self, *args):
+                return self._inner.__exit__(*args)
+
+        def counting_scandir(path):
+            nonlocal scan_calls
+            scan_calls += 1
+            return CountingScandir(path)
+
+        with mock.patch("ttsbot.providers.os.scandir", side_effect=counting_scandir):
+            cache = TTSPhraseCache(
+                TTSCacheConfig(
+                    enabled=True,
+                    max_bytes=10_000,
+                    max_entries=2,
+                    cache_dir=self.cache_dir,
+                )
+            )
+
+        self.assertEqual(scan_calls, 1)
+        self.assertEqual(
+            stat_calls,
+            {f"{label}.mp3": 1 for label in ("old", "middle", "new")},
+        )
+        self.assertFalse(orphan.exists())
+        self.assertFalse(files[0].exists())
+        self.assertEqual(list(cache._entries), ["middle", "new"])
+        self.assertEqual(cache.total_bytes, len(b"middle") + len(b"new"))
 
     def test_commit_file_registers_streaming_output(self):
         cache = self._cache(max_bytes=10_000)

@@ -12,6 +12,7 @@ import logging
 import queue as thread_queue
 import struct
 import threading
+from collections import OrderedDict
 from pathlib import Path
 
 import discord
@@ -25,6 +26,8 @@ PCM_CHANNELS = 2
 PCM_SAMPLE_WIDTH = 2
 PCM_FRAME_MS = 20
 PCM_FRAME_BYTES = int(PCM_SAMPLE_RATE * PCM_FRAME_MS / 1000) * PCM_CHANNELS * PCM_SAMPLE_WIDTH
+_PCM_CACHE_KEY = tuple[str, tuple[object, ...]]
+_PCM_CACHE_ENTRY = tuple[tuple[int, int, int], tuple[bytes, ...], int]
 
 
 def load_opus() -> bool:
@@ -198,6 +201,95 @@ def build_idle_pcm_frame(mode: str, volume_db: float) -> bytes:
         seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
         samples.append((seed % (amplitude * 2 + 1)) - amplitude)
     return struct.pack("<" + "h" * len(samples), *samples)
+
+
+class DecodedPCMCache:
+    """Bounded in-memory LRU for PCM frames decoded from persistent files.
+
+    The on-disk phrase cache avoids provider calls, but a hit still used to
+    spawn ffmpeg and decode the same MP3 again.  This second-level cache keeps
+    only hot decoded clips and validates each entry against the source file's
+    mtime/size so external eviction or replacement cannot serve stale PCM.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max(0, int(max_bytes))
+        self._entries: "OrderedDict[_PCM_CACHE_KEY, _PCM_CACHE_ENTRY]" = OrderedDict()
+        self._total_bytes = 0
+        self._hits = 0
+        self._misses = 0
+
+    @staticmethod
+    def _fingerprint(source: Path) -> tuple[int, int, int] | None:
+        try:
+            info = source.stat()
+        except OSError:
+            return None
+        return (info.st_ino, info.st_mtime_ns, info.st_size)
+
+    def _drop(self, key: _PCM_CACHE_KEY) -> None:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._total_bytes -= entry[2]
+
+    def lookup(self, source: Path, settings: tuple[object, ...]) -> list[bytes] | None:
+        if self.max_bytes <= 0:
+            return None
+        key = (str(source), settings)
+        entry = self._entries.get(key)
+        fingerprint = self._fingerprint(source)
+        if entry is None or fingerprint is None:
+            if entry is not None:
+                self._drop(key)
+            self._misses += 1
+            return None
+        if entry[0] != fingerprint:
+            self._drop(key)
+            self._misses += 1
+            return None
+        self._entries.move_to_end(key)
+        self._hits += 1
+        # Return a fresh container so callers may slice/reorder without
+        # mutating the cached tuple.  Frame bytes themselves are immutable.
+        return list(entry[1])
+
+    def store(
+        self,
+        source: Path,
+        settings: tuple[object, ...],
+        frames: list[bytes],
+    ) -> None:
+        if self.max_bytes <= 0 or not frames:
+            return
+        fingerprint = self._fingerprint(source)
+        if fingerprint is None:
+            return
+        size = sum(len(frame) for frame in frames)
+        if size > self.max_bytes:
+            return
+        key = (str(source), settings)
+        self._drop(key)
+        self._entries[key] = (fingerprint, tuple(frames), size)
+        self._total_bytes += size
+        while self._entries and self._total_bytes > self.max_bytes:
+            _old_key, (_fingerprint, _frames, old_size) = self._entries.popitem(last=False)
+            self._total_bytes -= old_size
+
+    @property
+    def size(self) -> int:
+        return len(self._entries)
+
+    @property
+    def total_bytes(self) -> int:
+        return self._total_bytes
+
+    @property
+    def hits(self) -> int:
+        return self._hits
+
+    @property
+    def misses(self) -> int:
+        return self._misses
 
 
 class ContinuousTTSAudioSource(discord.AudioSource):

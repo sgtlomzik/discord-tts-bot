@@ -77,6 +77,21 @@ class MergeBufferState:
         return sum(item.effective_length for item in self.items)
 
 
+def speech_text_from_message(
+    raw_text: str,
+    aliases: dict[str, str] | None = None,
+    mentions: dict[str, str] | None = None,
+) -> str:
+    """Return only the normalized speech text needed by non-merge callers.
+
+    Full merge analysis derives several structural flags and counters.  The
+    ``off`` policy does not use any of them, so expose the shared speech-text
+    conversion as a small public boundary instead of constructing a throwaway
+    :class:`ParsedMessage` on every incoming message.
+    """
+    return _strip_discord_tokens_for_speech(raw_text or "", aliases, mentions)
+
+
 def analyze_message_for_merge(
     raw_text: str,
     aliases: dict[str, str] | None = None,
@@ -84,7 +99,7 @@ def analyze_message_for_merge(
 ) -> ParsedMessage:
     raw_text = raw_text or ""
     raw_length = len(raw_text)
-    spoken_text = _strip_discord_tokens_for_speech(raw_text, aliases, mentions)
+    spoken_text = speech_text_from_message(raw_text, aliases, mentions)
     custom_tokens = list(CUSTOM_EMOJI_RE.finditer(raw_text))
     mention_tokens = list(MENTION_RE.finditer(raw_text))
     url_tokens = list(URL_RE.finditer(raw_text))

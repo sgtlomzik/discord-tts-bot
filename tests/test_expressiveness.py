@@ -99,7 +99,15 @@ class BuildBodyEmotionTests(unittest.TestCase):
 
 class VoiceCacheKeyTests(unittest.TestCase):
     def _mm_voice(self, **overrides):
-        params = dict(speed=1.0, vol=1.0, pitch=0, emotion="", model="speech-2.8-hd")
+        params = dict(
+            voice_id="voice-a",
+            speed=1.0,
+            vol=1.0,
+            pitch=0,
+            emotion="",
+            model="speech-2.8-hd",
+            language_boost="Russian",
+        )
         params.update(overrides)
         return types.SimpleNamespace(
             name="bussshy", provider="minimax", minimax=types.SimpleNamespace(**params)
@@ -123,6 +131,30 @@ class VoiceCacheKeyTests(unittest.TestCase):
             voice_cache_key(self._mm_voice(speed=1.0)),
             voice_cache_key(self._mm_voice(speed=1.5)),
         )
+
+    def test_minimax_voice_id_and_language_change_key(self):
+        self.assertNotEqual(
+            voice_cache_key(self._mm_voice(voice_id="voice-a")),
+            voice_cache_key(self._mm_voice(voice_id="voice-b")),
+        )
+        self.assertNotEqual(
+            voice_cache_key(self._mm_voice(language_boost="Russian")),
+            voice_cache_key(self._mm_voice(language_boost="English")),
+        )
+
+    def test_minimax_missing_new_params_uses_stable_defaults(self):
+        legacy = types.SimpleNamespace(
+            name="legacy",
+            provider="minimax",
+            minimax=types.SimpleNamespace(
+                speed=1.0,
+                vol=1.0,
+                pitch=0,
+                emotion="",
+                model="speech-2.8-hd",
+            ),
+        )
+        self.assertEqual(voice_cache_key(legacy), voice_cache_key(legacy))
 
     def test_minimax_same_params_stable(self):
         self.assertEqual(

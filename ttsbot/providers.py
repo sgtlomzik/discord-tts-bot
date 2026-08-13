@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -298,6 +299,7 @@ class MiniMaxConfig:
     base_url: str = "https://api.minimax.io"
     language_boost: str = "Russian"
     timeout_seconds: float = 2.5
+    keepalive_expiry_seconds: float = 60.0
     sample_rate: int = 32000
     bitrate: int = 128000
 
@@ -366,25 +368,38 @@ class TTSPhraseCache:
         cache_dir = self._config.cache_dir
         if not cache_dir.exists():
             return
+        files: list[tuple[float, Path, int]] = []
         try:
-            files = [p for p in cache_dir.glob("*.mp3") if p.is_file()]
+            # One directory scan and one stat per MP3 keeps startup bounded
+            # even when the persistent cache contains thousands of phrases.
+            # Capture mtime and size together so sorting/accounting do not
+            # issue two additional filesystem calls for every entry.
+            with os.scandir(cache_dir) as entries:
+                for entry in entries:
+                    if entry.name.endswith(".part"):
+                        # Remove orphan partial streams left by an interrupted
+                        # write, preserving the previous best-effort cleanup.
+                        try:
+                            os.unlink(entry.path)
+                        except OSError:
+                            pass
+                        continue
+                    if not entry.name.endswith(".mp3"):
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=True)
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    files.append((info.st_mtime, Path(entry.path), info.st_size))
         except OSError:
             log.warning("TTS cache: failed to scan %s", cache_dir, exc_info=True)
             return
-        # Remove orphan ".part" files left by an interrupted streaming write.
-        for part in cache_dir.glob("*.part"):
-            try:
-                part.unlink()
-            except OSError:
-                pass
         # Oldest first so LRU order roughly reflects last use across restarts.
-        files.sort(key=lambda p: p.stat().st_mtime)
-        for path in files:
+        files.sort(key=lambda item: item[0])
+        for _mtime, path, size in files:
             key = path.stem
-            try:
-                size = path.stat().st_size
-            except OSError:
-                continue
             self._entries[key] = path
             self._sizes[key] = size
             self._total_bytes += size
@@ -559,6 +574,9 @@ def load_minimax_config_from_env() -> MiniMaxConfig:
         base_url=base_url,
         language_boost=lang,
         timeout_seconds=float(os.getenv("TTS_REQUEST_TIMEOUT", "2.5")),
+        keepalive_expiry_seconds=max(
+            0.0, float(os.getenv("MINIMAX_KEEPALIVE_EXPIRY_SECONDS", "60"))
+        ),
         sample_rate=int(os.getenv("MINIMAX_SAMPLE_RATE", "32000")),
         bitrate=int(os.getenv("MINIMAX_BITRATE", "128000")),
     )
@@ -605,10 +623,11 @@ def voice_cache_key(voice) -> str:
     """Cache key fragment for a voice record.
 
     A piper voice is keyed by name. A MiniMax voice also folds in the params
-    that change the audio (speed/vol/pitch/emotion/model) so that re-tuning a
-    voice produces a fresh key — the old entry is no longer served and evicts
-    by LRU. ``emotion="auto"`` is a constant here; the concrete emotion is
-    derived from the text, which is already part of the full cache key.
+    that change the audio (voice id, speed/vol/pitch/emotion/model/language)
+    so that replacing or re-tuning a voice produces a fresh key — the old entry
+    is no longer served and evicts by LRU. ``emotion="auto"`` is a constant
+    here; the concrete emotion is derived from the text, which is already part
+    of the full cache key.
     """
     if voice is None:
         return ""
@@ -616,7 +635,16 @@ def voice_cache_key(voice) -> str:
     mm = getattr(voice, "minimax", None)
     if getattr(voice, "provider", None) == "minimax" and mm is not None:
         return "|".join(
-            str(x) for x in (name, mm.speed, mm.vol, mm.pitch, mm.emotion, mm.model)
+            str(x) for x in (
+                name,
+                getattr(mm, "voice_id", ""),
+                mm.speed,
+                mm.vol,
+                mm.pitch,
+                mm.emotion,
+                mm.model,
+                getattr(mm, "language_boost", ""),
+            )
         )
     return name
 
@@ -655,7 +683,11 @@ class MiniMaxProvider:
         # larger but each request is short, so 4 keep-alives is plenty.
         self._client = http_client or httpx.AsyncClient(
             timeout=httpx.Timeout(config.timeout_seconds),
-            limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
+            limits=httpx.Limits(
+                max_keepalive_connections=4,
+                max_connections=8,
+                keepalive_expiry=config.keepalive_expiry_seconds,
+            ),
         )
         # Cumulative chars billed this process lifetime. Logged on
         # every successful synthesis for quota monitoring.

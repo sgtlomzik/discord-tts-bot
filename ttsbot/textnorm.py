@@ -31,6 +31,19 @@ SHORTCODE_RE = re.compile(r"^:([A-Za-z0-9_]+):$")
 # enough that a single emoji can't smuggle a wall of text into synthesis.
 EMOJI_PRONUNCIATION_MAX = 100
 
+# Keycap emoji begin with ordinary ASCII (``1`` / ``#`` / ``*``), so putting
+# all emoji first characters in the fast-reject set would make most numbered
+# chat messages take the expensive parser path.  Keycaps are instead detected
+# by their required combining mark.  Every other installed emoji sequence is
+# represented by its first character, which makes this gate exhaustive for the
+# exact emoji-data version loaded by the process without hard-coded ranges.
+_KEYCAP_COMBINING_MARK = "\u20e3"
+_UNICODE_EMOJI_FIRST_CHARS = frozenset(
+    sequence[0]
+    for sequence in emoji.EMOJI_DATA
+    if sequence and _KEYCAP_COMBINING_MARK not in sequence
+)
+
 # Mention tokens with a capturing id group, for resolving to a spoken name.
 MENTION_ID_RE = re.compile(r"<@!?(\d+)>|<@&(\d+)>|<#(\d+)>")
 
@@ -153,6 +166,24 @@ def resolve_mentions(text: str, mention_names: dict[str, str]) -> str:
     return MENTION_ID_RE.sub(_repl, text)
 
 
+def _might_contain_unicode_emoji(text: str) -> bool:
+    """Cheap, exhaustive prefilter for the installed emoji data corpus."""
+    return bool(text) and (
+        _KEYCAP_COMBINING_MARK in text
+        or not _UNICODE_EMOJI_FIRST_CHARS.isdisjoint(text)
+    )
+
+
+@lru_cache(maxsize=512)
+def _spoken_unicode_emoji_name(char: str) -> str:
+    """Resolve one emoji sequence to a spoken name, cached across messages."""
+    name = emoji.demojize(char, language="ru", delimiters=("", ""))
+    if name == char:  # no Russian name; try English
+        name = emoji.demojize(char, language="en", delimiters=("", ""))
+    name = name.replace("_", " ").strip()
+    return name if name and name != char else ""
+
+
 @lru_cache(maxsize=2048)
 def speak_unicode_emoji(text: str) -> str:
     """Replace standard Unicode emoji with their Russian names so the bot
@@ -166,6 +197,8 @@ def speak_unicode_emoji(text: str) -> str:
     """
     if not text:
         return text
+    if not _might_contain_unicode_emoji(text):
+        return text
     matches = emoji.emoji_list(text)
     if not matches:
         return text
@@ -174,11 +207,8 @@ def speak_unicode_emoji(text: str) -> str:
     for match in matches:
         out.append(text[last : match["match_start"]])
         char = match["emoji"]
-        name = emoji.demojize(char, language="ru", delimiters=("", ""))
-        if name == char:  # no Russian name; try English
-            name = emoji.demojize(char, language="en", delimiters=("", ""))
-        name = name.replace("_", " ").strip()
-        out.append(f" {name} " if name and name != char else " ")
+        name = _spoken_unicode_emoji_name(char)
+        out.append(f" {name} " if name else " ")
         last = match["match_end"]
     out.append(text[last:])
     return "".join(out)

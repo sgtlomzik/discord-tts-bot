@@ -11,6 +11,7 @@ import asyncio
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -284,6 +285,20 @@ class MiniMaxPerCallVoiceTests(unittest.TestCase):
 class MiniMaxKeepAliveTests(unittest.TestCase):
     """Validate the keep-alive invariant: one client is reused across
     many requests, not recreated per call."""
+
+    def test_keepalive_expiry_defaults_to_sixty_seconds(self):
+        self.assertAlmostEqual(MiniMaxConfig().keepalive_expiry_seconds, 60.0)
+
+    def test_owned_client_receives_configured_keepalive_expiry(self):
+        cfg = MiniMaxConfig(
+            api_key="k", voice_id="v", keepalive_expiry_seconds=87.5
+        )
+        with patch("httpx.AsyncClient") as client_cls:
+            provider = MiniMaxProvider(cfg)
+
+        limits = client_cls.call_args.kwargs["limits"]
+        self.assertAlmostEqual(limits.keepalive_expiry, 87.5)
+        self.assertIs(provider._client, client_cls.return_value)
 
     def test_single_client_used_across_calls(self):
         cfg = MiniMaxConfig(api_key="k", voice_id="v")

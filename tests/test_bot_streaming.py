@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from ttsbot import voice_registry as vr
 from test_bot import load_bot_module
-from ttsbot.providers import TTSCacheConfig, TTSPhraseCache
+from ttsbot.providers import TTSCacheConfig, TTSPhraseCache, voice_cache_key
 from ttsbot.pipeline import _close_subprocess_stdin
 
 
@@ -119,27 +119,25 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(frames, 10)
 
     async def test_long_stream_not_truncated_by_ttfa_timeout(self):
-        # First chunk is immediate (under TTFA budget); the rest arrive
-        # slowly, well past the budget. The TTFA timeout must apply ONLY to
-        # the first chunk, so the long tail still streams to completion.
+        # Enough MP3 data for a decoded frame arrives within the TTFA budget;
+        # the remainder arrives well after it. Once audible PCM starts, the
+        # deadline must no longer truncate a legitimate slow tail.
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
-        mp3 = _MP3
+        mp3 = _make_mp3(3.0)
 
         async def _slow_tail(*a, **k):
-            third = max(1, len(mp3) // 3)
-            yield mp3[:third]                # immediate first chunk
-            await asyncio.sleep(0.25)        # gap > TTFA budget below
-            yield mp3[third:2 * third]
-            await asyncio.sleep(0.25)
-            yield mp3[2 * third:]
+            split = len(mp3) * 3 // 4
+            yield mp3[:split]                # enough for decoded PCM
+            await asyncio.sleep(1.2)         # gap > TTFA budget below
+            yield mp3[split:]
 
         cloud = MagicMock()
         cloud.stream_audio = lambda *a, **k: _slow_tail()
         tts_bot.tts_dispatcher._cloud = cloud
 
         original = bot_mod.config.TTS_STREAM_TTFA_TIMEOUT
-        bot_mod.config.TTS_STREAM_TTFA_TIMEOUT = 0.1  # tiny: would kill the tail if misapplied
+        bot_mod.config.TTS_STREAM_TTFA_TIMEOUT = 1.0
         try:
             source = FakeSource(bot_mod.PCM_FRAME_BYTES)
             status, frames = await tts_bot._stream_tts_to_source(
@@ -150,6 +148,36 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, "ok")
         self.assertGreater(frames, 10)  # full ~0.4s clip decoded despite slow tail
+
+    async def test_header_then_stall_falls_back_before_decoded_audio(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        mp3 = _MP3
+
+        async def _header_then_stall(*a, **k):
+            yield mp3[:16]
+            await asyncio.sleep(1.0)
+            yield mp3[16:]
+
+        cloud = MagicMock()
+        cloud.stream_audio = lambda *a, **k: _header_then_stall()
+        tts_bot.tts_dispatcher._cloud = cloud
+
+        original = bot_mod.config.TTS_STREAM_TTFA_TIMEOUT
+        bot_mod.config.TTS_STREAM_TTFA_TIMEOUT = 0.1
+        started = asyncio.get_running_loop().time()
+        try:
+            source = FakeSource(bot_mod.PCM_FRAME_BYTES)
+            status, frames = await tts_bot._stream_tts_to_source(
+                source, _minimax_voice(), _job(bot_mod)
+            )
+        finally:
+            bot_mod.config.TTS_STREAM_TTFA_TIMEOUT = original
+
+        self.assertEqual(status, "pre_audio")
+        self.assertEqual(frames, 0)
+        self.assertEqual(source.frames, [])
+        self.assertLess(asyncio.get_running_loop().time() - started, 0.8)
 
     def _enable_cache(self, bot_mod, tts_bot):
         d = tempfile.mkdtemp()
@@ -170,7 +198,7 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
         status, frames = await tts_bot._stream_tts_to_source(source, _minimax_voice(), job)
         self.assertEqual(status, "ok")
         # committed: a repeat would hit the cache
-        self.assertIsNotNone(cache.lookup(job.text, "bussshy01"))
+        self.assertIsNotNone(cache.lookup(job.text, voice_cache_key(_minimax_voice())))
         self.assertGreater(cache.total_bytes, 0)
 
     async def test_partial_stream_not_cached(self):
@@ -186,7 +214,7 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
         status, frames = await tts_bot._stream_tts_to_source(source, _minimax_voice(), job)
         self.assertIn(status, ("truncated", "pre_audio"))
         # partial output must NOT be cached
-        self.assertIsNone(cache.lookup(job.text, "bussshy01"))
+        self.assertIsNone(cache.lookup(job.text, voice_cache_key(_minimax_voice())))
 
     async def test_cache_hit_plays_from_file_no_api(self):
         bot_mod = load_bot_module()
@@ -196,7 +224,7 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
         # Pre-store a real MP3 for this (text, voice).
         src = Path(tempfile.mkdtemp()) / "seed.mp3"
         src.write_bytes(_MP3)
-        cache.store(job.text, src, "bussshy01")
+        cache.store(job.text, src, voice_cache_key(_minimax_voice()))
 
         cloud = MagicMock()
         cloud.stream_audio = MagicMock(side_effect=AssertionError("API hit on cache!"))

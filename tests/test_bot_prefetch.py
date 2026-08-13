@@ -17,7 +17,7 @@ from test_bot_streaming import (
     _chunks,
     _minimax_voice,
 )
-from ttsbot.providers import TTSCacheConfig, TTSPhraseCache
+from ttsbot.providers import TTSCacheConfig, TTSPhraseCache, voice_cache_key
 
 
 def _job(bot_mod, text="привет", gid=1):
@@ -64,7 +64,9 @@ class StreamToChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, "ok")
         self.assertGreater(frames, 0)
         self.assertEqual(sum(len(b) for b in batches), frames)
-        self.assertIsNotNone(cache.lookup(job.text, "bussshy01"))  # committed
+        self.assertIsNotNone(
+            cache.lookup(job.text, voice_cache_key(_minimax_voice()))
+        )  # committed
 
     async def test_cancelled_before_audio_yields_no_frames(self):
         bot_mod = load_bot_module()
@@ -78,6 +80,35 @@ class StreamToChannelTests(unittest.IsolatedAsyncioTestCase):
         _drain_nowait(prepared)
         self.assertEqual(status, "cancelled")
         self.assertEqual(frames, 0)
+
+    async def test_header_then_stall_hits_decoded_audio_deadline(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+
+        async def _header_then_stall(*a, **k):
+            yield _MP3[:16]
+            await asyncio.sleep(1.0)
+            yield _MP3[16:]
+
+        cloud = MagicMock()
+        cloud.stream_audio = lambda *a, **k: _header_then_stall()
+        tts_bot.tts_dispatcher._cloud = cloud
+        prepared = bot_mod.PreparedAudio(job=_job(bot_mod), channel=asyncio.Queue())
+
+        original = bot_mod.config.TTS_STREAM_TTFA_TIMEOUT
+        bot_mod.config.TTS_STREAM_TTFA_TIMEOUT = 0.1
+        started = asyncio.get_running_loop().time()
+        try:
+            status, frames = await tts_bot._stream_to_channel(
+                prepared, _minimax_voice()
+            )
+        finally:
+            bot_mod.config.TTS_STREAM_TTFA_TIMEOUT = original
+
+        self.assertEqual(status, "pre_audio")
+        self.assertEqual(frames, 0)
+        self.assertEqual(_drain_nowait(prepared), [])
+        self.assertLess(asyncio.get_running_loop().time() - started, 0.8)
 
 
 @unittest.skipUnless(_MP3, "ffmpeg required")
@@ -94,7 +125,7 @@ class PrepareIntoTests(unittest.IsolatedAsyncioTestCase):
         job = _job(bot_mod)
         seed = Path(tempfile.mkdtemp()) / "s.mp3"
         seed.write_bytes(_MP3)
-        cache.store(job.text, seed, "bussshy01")
+        cache.store(job.text, seed, voice_cache_key(_minimax_voice()))
 
         cloud = MagicMock()
         cloud.stream_audio = MagicMock(side_effect=AssertionError("API on cache hit!"))

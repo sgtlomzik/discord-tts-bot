@@ -50,6 +50,7 @@ def reload() -> None:
     global TTS_CONTINUOUS_STREAM, TTS_STREAMING_ENABLED, TTS_STREAM_TTFA_TIMEOUT
     global TTS_PREFETCH_ENABLED, TTS_PREFETCH_LOOKAHEAD
     global TTS_IDLE_FRAME_MODE, TTS_IDLE_VOLUME_DB, TTS_STREAM_TAIL_MS
+    global TTS_DECODED_PCM_CACHE_MAX_BYTES
     global TTS_MAX_CONTINUOUS_IDLE_SECONDS, IDLE_DISCONNECT_SECONDS
     global TTS_AUTO_CONNECT_ENABLED, AUTO_CONNECT_SUPPRESS_SECONDS
     global TTS_TRIM_SILENCE, FFMPEG_LOW_DELAY
@@ -97,8 +98,8 @@ def reload() -> None:
     # whole clip is generated (cuts Time-To-First-Audio). Requires the
     # continuous stream. Feature-flagged for instant revert without a redeploy.
     TTS_STREAMING_ENABLED = _flag("TTS_STREAMING_ENABLED", "1")
-    # Budget for the FIRST audio chunk only. After the first chunk the stream
-    # lives as long as it needs (long messages legitimately stream for seconds).
+    # Budget to the first decoded/audible PCM frame. After playback begins the
+    # stream lives as long as needed (long messages legitimately take seconds).
     TTS_STREAM_TTFA_TIMEOUT = float(
         os.getenv("TTS_STREAM_TTFA_TIMEOUT", os.getenv("TTS_REQUEST_TIMEOUT", "2.5"))
     )
@@ -112,6 +113,11 @@ def reload() -> None:
     TTS_IDLE_FRAME_MODE = os.getenv("TTS_IDLE_FRAME_MODE", "silence").strip().lower()
     TTS_IDLE_VOLUME_DB = float(os.getenv("TTS_IDLE_VOLUME_DB", "-60"))
     TTS_STREAM_TAIL_MS = int(os.getenv("TTS_STREAM_TAIL_MS", "200"))
+    # Second-level cache for decoded frames from persistent phrase-cache MP3s.
+    # Set to 0 for an instant rollback to per-hit ffmpeg decoding.
+    TTS_DECODED_PCM_CACHE_MAX_BYTES = max(
+        0, int(os.getenv("TTS_DECODED_PCM_CACHE_MAX_BYTES", str(32 * 1024 * 1024)))
+    )
     TTS_MAX_CONTINUOUS_IDLE_SECONDS = int(os.getenv("TTS_MAX_CONTINUOUS_IDLE_SECONDS", "900"))
     IDLE_DISCONNECT_SECONDS = int(os.getenv("TTS_IDLE_DISCONNECT_SECONDS", "60"))
     TTS_AUTO_CONNECT_ENABLED = _flag("TTS_AUTO_CONNECT_ENABLED", "1")

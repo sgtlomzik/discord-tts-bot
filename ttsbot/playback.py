@@ -126,7 +126,22 @@ class PlaybackMixin:
             )
         return source
 
-    async def prepare_tts_pcm_frames(self, source: Path) -> list[bytes]:
+    async def prepare_tts_pcm_frames(
+        self, source: Path, *, cache_decoded: bool = False
+    ) -> list[bytes]:
+        decoded_cache = self.decoded_pcm_cache if cache_decoded else None
+        cache_settings = (config.TTS_STREAM_TAIL_MS, config.TTS_TRIM_SILENCE)
+        if decoded_cache is not None:
+            cached_frames = decoded_cache.lookup(source, cache_settings)
+            if cached_frames is not None:
+                log.info(
+                    "Decoded PCM cache HIT frames=%s bytes=%s source=%s",
+                    len(cached_frames),
+                    len(cached_frames) * len(cached_frames[0]),
+                    source,
+                )
+                return cached_frames
+
         started = time.perf_counter()
         cmd = build_tts_pcm_command(source)
         proc = await asyncio.create_subprocess_exec(
@@ -142,6 +157,9 @@ class PlaybackMixin:
         frames = split_pcm_frames(stdout, config.TTS_STREAM_TAIL_MS)
         if not frames:
             raise RuntimeError("ffmpeg PCM preparation produced no audio frames")
+
+        if decoded_cache is not None:
+            decoded_cache.store(source, cache_settings, frames)
 
         log.info(
             "PCM preparation took=%.3fs source_size=%s pcm_bytes=%s frames=%s tail_ms=%s",

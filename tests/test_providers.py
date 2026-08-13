@@ -24,6 +24,7 @@ from ttsbot.providers import (
     TTSDispatcher,
     load_circuit_breaker_from_env,
     load_dispatcher_config_from_env,
+    load_minimax_config_from_env,
 )
 
 
@@ -397,6 +398,18 @@ class EnvConfigTests(unittest.TestCase):
             cb = load_circuit_breaker_from_env()
         self.assertEqual(cb._config.failure_threshold, 5)
         self.assertAlmostEqual(cb._config.cooldown_seconds, 30.0)
+
+    def test_minimax_keepalive_expiry_default_and_env_override(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MINIMAX_KEEPALIVE_EXPIRY_SECONDS", None)
+            default_cfg = load_minimax_config_from_env()
+        self.assertAlmostEqual(default_cfg.keepalive_expiry_seconds, 60.0)
+
+        with mock.patch.dict(
+            os.environ, {"MINIMAX_KEEPALIVE_EXPIRY_SECONDS": "123.5"}
+        ):
+            overridden_cfg = load_minimax_config_from_env()
+        self.assertAlmostEqual(overridden_cfg.keepalive_expiry_seconds, 123.5)
 
 
 if __name__ == "__main__":

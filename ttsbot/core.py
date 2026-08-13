@@ -25,7 +25,7 @@ from ttsbot.providers import (
     load_minimax_config_from_env,
 )
 from ttsbot import config
-from ttsbot.audio import ContinuousTTSAudioSource
+from ttsbot.audio import ContinuousTTSAudioSource, DecodedPCMCache
 from ttsbot.merge import MergeQueueMixin
 from ttsbot.messages import MergeBufferState
 from ttsbot.models import PreparedAudio, TTSJob, VOICE_PROFILES
@@ -94,6 +94,7 @@ class TTSBot(
         # and 6 respectively.
         cache_cfg = load_cache_config_from_env()
         self.tts_cache = TTSPhraseCache(cache_cfg) if cache_cfg.enabled else None
+        self.decoded_pcm_cache = DecodedPCMCache(config.TTS_DECODED_PCM_CACHE_MAX_BYTES)
         # Wrap generate_piper_file so the dispatcher's piper callback
         # signature (str | None profile name) matches what
         # generate_piper_file expects (VoiceProfile object).

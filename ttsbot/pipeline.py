@@ -27,6 +27,7 @@ from ttsbot.providers import (
     MiniMaxProvider,
     MiniMaxVoiceNotFoundError,
     load_minimax_config_from_env,
+    voice_cache_key,
 )
 from ttsbot import config
 from ttsbot.audio import (
@@ -359,12 +360,13 @@ class SynthesisPipelineMixin:
         # Cache hit: play the stored audio from disk, no API call, no breaker
         # probe consumed. (Cache key already includes the voice.)
         cache = self.tts_dispatcher.cache
+        stream_voice_key = voice_cache_key(voice)
         if cache is not None:
-            cached = cache.lookup(job.text, voice.name)
+            cached = cache.lookup(job.text, stream_voice_key)
             if cached is not None:
                 source = self.ensure_continuous_player(vc)
                 try:
-                    frames = await self.prepare_tts_pcm_frames(cached)
+                    frames = await self.prepare_tts_pcm_frames(cached, cache_decoded=True)
                 except Exception:
                     log.exception("Cached audio decode failed; streaming instead")
                     frames = []
@@ -436,11 +438,14 @@ class SynthesisPipelineMixin:
             vol=mm.vol, pitch=mm.pitch, emotion=mm.emotion,
             language_boost=mm.language_boost,
         )
-        # 1. First chunk under the TTFA budget; any failure here => clean
-        #    fallback to Piper (no audio has played yet).
+        # The budget covers the first *decodable PCM frame*, not merely the
+        # first upstream chunk. MiniMax can send a tiny MP3 header promptly and
+        # then stall; treating that header as audio caused multi-second silence.
+        ttfa_deadline = time.perf_counter() + max(config.TTS_STREAM_TTFA_TIMEOUT, 0.001)
         try:
             first_chunk = await asyncio.wait_for(
-                agen.__anext__(), timeout=config.TTS_STREAM_TTFA_TIMEOUT
+                agen.__anext__(),
+                timeout=max(ttfa_deadline - time.perf_counter(), 0.001),
             )
         except StopAsyncIteration:
             await agen.aclose()
@@ -474,11 +479,12 @@ class SynthesisPipelineMixin:
         # of this (voice, text) plays from disk without hitting the API. Only
         # committed on a clean finish — partial streams are never cached.
         cache = self.tts_dispatcher.cache
+        stream_voice_key = voice_cache_key(voice)
         cache_final: Path | None = None
         cache_part = None
         if cache is not None:
             try:
-                cache_final = cache.cache_path_for(job.text, voice.name)
+                cache_final = cache.cache_path_for(job.text, stream_voice_key)
                 cache_final.parent.mkdir(parents=True, exist_ok=True)
                 cache_part = open(str(cache_final) + ".part", "wb")
             except OSError:
@@ -515,11 +521,20 @@ class SynthesisPipelineMixin:
         frame_limit = playback_frame_limit(job.text, voice)
         frames_enqueued = 0
         limit_hit = False
+        ttfa_expired = False
         first_frame_ts: float | None = None
         leftover = b""
         try:
             while True:
-                data = await proc.stdout.read(PCM_FRAME_BYTES * 16)
+                if frames_enqueued == 0:
+                    remaining = ttfa_deadline - time.perf_counter()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    data = await asyncio.wait_for(
+                        proc.stdout.read(PCM_FRAME_BYTES * 16), timeout=remaining
+                    )
+                else:
+                    data = await proc.stdout.read(PCM_FRAME_BYTES * 16)
                 if not data:
                     break
                 buf = leftover + data
@@ -555,6 +570,17 @@ class SynthesisPipelineMixin:
                             pass
                         break
                 leftover = buf[n:]
+        except asyncio.TimeoutError:
+            ttfa_expired = True
+            feeder.cancel()
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            log.warning(
+                "Stream decoded-audio TTFA exceeded %.2fs; falling back to Piper",
+                config.TTS_STREAM_TTFA_TIMEOUT,
+            )
         except BaseException:
             feeder.cancel()
             try:
@@ -563,8 +589,8 @@ class SynthesisPipelineMixin:
                 pass
             raise
         finally:
-            await _finish_feeder(feeder, cancel=limit_hit)
-            if leftover and not limit_hit:
+            await _finish_feeder(feeder, cancel=limit_hit or ttfa_expired)
+            if leftover and not limit_hit and not ttfa_expired:
                 source.enqueue_frames(
                     [leftover + b"\x00" * (PCM_FRAME_BYTES - len(leftover))]
                 )
@@ -583,6 +609,9 @@ class SynthesisPipelineMixin:
                 except OSError:
                     pass
 
+        if ttfa_expired:
+            _discard_cache()
+            return ("pre_audio", 0)
         if limit_hit:
             _discard_cache()  # a stutter loop must never be cached
             return ("truncated", frames_enqueued)
@@ -600,7 +629,7 @@ class SynthesisPipelineMixin:
         if cache is not None and cache_final is not None and part_path:
             try:
                 os.replace(part_path, cache_final)
-                cache.commit_file(job.text, cache_final, voice.name)
+                cache.commit_file(job.text, cache_final, stream_voice_key)
             except OSError:
                 _discard_cache()
         return ("ok", frames_enqueued)
@@ -648,9 +677,11 @@ class SynthesisPipelineMixin:
             # Always terminate the channel so the consumer never hangs.
             await prepared.channel.put(None)
 
-    async def _safe_pcm_frames(self, path: Path) -> list[bytes]:
+    async def _safe_pcm_frames(
+        self, path: Path, *, cache_decoded: bool = False
+    ) -> list[bytes]:
         try:
-            return await self.prepare_tts_pcm_frames(path)
+            return await self.prepare_tts_pcm_frames(path, cache_decoded=cache_decoded)
         except Exception:
             log.exception("PCM decode failed for %s", path)
             return []
@@ -659,10 +690,13 @@ class SynthesisPipelineMixin:
         job = prepared.job
         cb = self.tts_dispatcher.circuit_breaker
         cache = self.tts_dispatcher.cache
+        stream_voice_key = voice_cache_key(voice)
         if cache is not None:
-            cached = cache.lookup(job.text, voice.name)
+            cached = cache.lookup(job.text, stream_voice_key)
             if cached is not None:
-                frames = limit_pcm_frames(await self._safe_pcm_frames(cached), job.text, voice)
+                frames = limit_pcm_frames(
+                    await self._safe_pcm_frames(cached, cache_decoded=True), job.text, voice
+                )
                 if frames and not prepared.cancelled:
                     await prepared.channel.put(frames)
                     prepared.provider = "cache"
@@ -723,9 +757,11 @@ class SynthesisPipelineMixin:
             job.text, voice_id=mm.voice_id, model=mm.model, speed=mm.speed,
             vol=mm.vol, pitch=mm.pitch, emotion=mm.emotion, language_boost=mm.language_boost,
         )
+        ttfa_deadline = time.perf_counter() + max(config.TTS_STREAM_TTFA_TIMEOUT, 0.001)
         try:
             first_chunk = await asyncio.wait_for(
-                agen.__anext__(), timeout=config.TTS_STREAM_TTFA_TIMEOUT
+                agen.__anext__(),
+                timeout=max(ttfa_deadline - time.perf_counter(), 0.001),
             )
         except StopAsyncIteration:
             await agen.aclose()
@@ -752,11 +788,12 @@ class SynthesisPipelineMixin:
         )
         mid_error: list[BaseException] = []
         cache = self.tts_dispatcher.cache
+        stream_voice_key = voice_cache_key(voice)
         cache_final: Path | None = None
         cache_part = None
         if cache is not None:
             try:
-                cache_final = cache.cache_path_for(job.text, voice.name)
+                cache_final = cache.cache_path_for(job.text, stream_voice_key)
                 cache_final.parent.mkdir(parents=True, exist_ok=True)
                 cache_part = open(str(cache_final) + ".part", "wb")
             except OSError:
@@ -794,10 +831,19 @@ class SynthesisPipelineMixin:
         frame_limit = playback_frame_limit(job.text, voice)
         frames_count = 0
         limit_hit = False
+        ttfa_expired = False
         leftover = b""
         try:
             while True:
-                data = await proc.stdout.read(PCM_FRAME_BYTES * 16)
+                if frames_count == 0:
+                    remaining = ttfa_deadline - time.perf_counter()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    data = await asyncio.wait_for(
+                        proc.stdout.read(PCM_FRAME_BYTES * 16), timeout=remaining
+                    )
+                else:
+                    data = await proc.stdout.read(PCM_FRAME_BYTES * 16)
                 if not data:
                     break
                 buf = leftover + data
@@ -824,6 +870,17 @@ class SynthesisPipelineMixin:
                             pass
                         break
                 leftover = buf[n:]
+        except asyncio.TimeoutError:
+            ttfa_expired = True
+            feeder.cancel()
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            log.warning(
+                "Stream decoded-audio TTFA exceeded %.2fs; Piper fallback",
+                config.TTS_STREAM_TTFA_TIMEOUT,
+            )
         except BaseException:
             feeder.cancel()
             try:
@@ -832,8 +889,10 @@ class SynthesisPipelineMixin:
                 pass
             raise
         finally:
-            await _finish_feeder(feeder, cancel=limit_hit or prepared.cancelled)
-            if leftover and not prepared.cancelled and not limit_hit:
+            await _finish_feeder(
+                feeder, cancel=limit_hit or prepared.cancelled or ttfa_expired
+            )
+            if leftover and not prepared.cancelled and not limit_hit and not ttfa_expired:
                 await prepared.channel.put(
                     [leftover + b"\x00" * (PCM_FRAME_BYTES - len(leftover))]
                 )
@@ -852,6 +911,9 @@ class SynthesisPipelineMixin:
                 except OSError:
                     pass
 
+        if ttfa_expired:
+            _discard()
+            return ("pre_audio", 0)
         if prepared.cancelled:
             _discard()
             return ("cancelled", frames_count)
@@ -869,7 +931,7 @@ class SynthesisPipelineMixin:
         if cache is not None and cache_final is not None and part_path:
             try:
                 os.replace(part_path, cache_final)
-                cache.commit_file(job.text, cache_final, voice.name)
+                cache.commit_file(job.text, cache_final, stream_voice_key)
             except OSError:
                 _discard()
         return ("ok", frames_count)

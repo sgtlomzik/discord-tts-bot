@@ -54,6 +54,27 @@ class TTSBotTests(unittest.TestCase):
         self.assertEqual(parsed.spoken_text, "")
         self.assertTrue(parsed.is_url_only)
 
+    def test_public_speech_text_wrapper_matches_merge_analyzer(self):
+        bot = load_bot_module()
+        from ttsbot.messages import speech_text_from_message
+
+        aliases = {"1035577866370416721": "кек"}
+        mentions = {"123": "Вася"}
+        corpus = (
+            "обычное сообщение",
+            "да <:Kekis:1035577866370416721>",
+            "привет 😂 <@123>",
+            "https://example.com/path",
+            "строка один\nстрока два",
+            "",
+        )
+        for raw in corpus:
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    speech_text_from_message(raw, aliases, mentions),
+                    bot.analyze_message_for_merge(raw, aliases, mentions).spoken_text,
+                )
+
     def test_selective_hold_default_separator_is_comma(self):
         bot = load_bot_module()
         self.assertEqual(bot.config.TTS_SELECTIVE_HOLD_JOIN_SEPARATOR, ", ")
@@ -994,6 +1015,91 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         job = await tts_bot.message_queue.get()
         self.assertEqual(job.voice_profile, "piper-ruslan")
+
+    async def test_enqueue_tts_non_full_queue_skips_wait_for(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.config_store = temp_config_store(bot_mod)
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+
+        with patch("ttsbot.merge.asyncio.wait_for", new_callable=AsyncMock) as wait_for:
+            ok = await tts_bot.enqueue_tts("hello", voice_channel, 300, 400)
+
+        self.assertTrue(ok)
+        wait_for.assert_not_awaited()
+        job = tts_bot.message_queue.get_nowait()
+        self.assertEqual(job.text, "hello")
+        tts_bot.message_queue.task_done()
+
+    async def test_enqueue_tts_full_queue_waits_and_preserves_fifo(self):
+        bot_mod = load_bot_module()
+        bot_mod.config.TTS_QUEUE_PUT_TIMEOUT_MS = 250
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.config_store = temp_config_store(bot_mod)
+        tts_bot.message_queue = asyncio.Queue(maxsize=1)
+        blocker = object()
+        tts_bot.message_queue.put_nowait(blocker)
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+
+        enqueue = asyncio.create_task(
+            tts_bot.enqueue_tts("after", voice_channel, 300, 400)
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(enqueue.done())
+        self.assertIs(tts_bot.message_queue.get_nowait(), blocker)
+        tts_bot.message_queue.task_done()
+
+        self.assertTrue(await asyncio.wait_for(enqueue, timeout=1))
+        job = tts_bot.message_queue.get_nowait()
+        self.assertEqual(job.text, "after")
+        tts_bot.message_queue.task_done()
+
+    async def test_enqueue_tts_full_queue_timeout_leaves_no_ghost_put(self):
+        bot_mod = load_bot_module()
+        bot_mod.config.TTS_QUEUE_PUT_TIMEOUT_MS = 1
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.config_store = temp_config_store(bot_mod)
+        tts_bot.message_queue = asyncio.Queue(maxsize=1)
+        blocker = object()
+        tts_bot.message_queue.put_nowait(blocker)
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+
+        self.assertFalse(await tts_bot.enqueue_tts("dropped", voice_channel, 300, 400))
+        await asyncio.sleep(0.01)
+
+        self.assertEqual(tts_bot.message_queue.qsize(), 1)
+        self.assertIs(tts_bot.message_queue.get_nowait(), blocker)
+        tts_bot.message_queue.task_done()
+
+    async def test_merge_off_uses_speech_only_path_without_merge_state(self):
+        bot_mod = load_bot_module()
+        bot_mod.config.TTS_MERGE_ALGORITHM = "off"
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.config_store = temp_config_store(bot_mod)
+        tts_bot.config_store.set_emoji_alias(
+            "1035577866370416721", "Kekis", "кек"
+        )
+        guild = types.SimpleNamespace(id=100)
+        voice_channel = types.SimpleNamespace(id=200, guild=guild)
+
+        await tts_bot.queue_or_merge_message(
+            "привет <:Kekis:1035577866370416721> <@123> https://example.com",
+            voice_channel,
+            300,
+            400,
+            mentions={"123": "Вася"},
+        )
+
+        job = tts_bot.message_queue.get_nowait()
+        self.assertEqual(job.text, "привет кек Вася")
+        tts_bot.message_queue.task_done()
+        self.assertEqual(tts_bot.last_user_message_ts, {})
+        self.assertEqual(tts_bot.merge_buffers, {})
+        self.assertEqual(tts_bot.merge_locks, {})
+        self.assertEqual(tts_bot.merge_generations, {})
 
     async def test_slash_tts_test_responds_before_enqueueing_audio(self):
         bot_mod = load_bot_module()

@@ -13,7 +13,13 @@ import time
 import discord
 
 from ttsbot import config
-from ttsbot.messages import MergeBufferState, ParsedMessage, analyze_message_for_merge, is_reaction_like
+from ttsbot.messages import (
+    MergeBufferState,
+    ParsedMessage,
+    analyze_message_for_merge,
+    is_reaction_like,
+    speech_text_from_message,
+)
 from ttsbot.models import TTSJob
 from ttsbot.textnorm import normalize_for_tts
 
@@ -70,10 +76,16 @@ class MergeQueueMixin:
                 voice_profile=voice_profile,
                 message_ts=message_ts or now,
             )
-            await asyncio.wait_for(
-                self.message_queue.put(job),
-                timeout=max(config.TTS_QUEUE_PUT_TIMEOUT_MS, 1) / 1000.0,
-            )
+            try:
+                # The queue is almost always below capacity.  Avoid creating a
+                # wait_for task/timer for that common case, while retaining the
+                # existing bounded wait and backpressure when it is full.
+                self.message_queue.put_nowait(job)
+            except asyncio.QueueFull:
+                await asyncio.wait_for(
+                    self.message_queue.put(job),
+                    timeout=max(config.TTS_QUEUE_PUT_TIMEOUT_MS, 1) / 1000.0,
+                )
             log.info(
                 "Queued TTS guild=%s text_channel=%s voice_channel=%s author=%s queue=%s chars=%s voice=%s",
                 voice_channel.guild.id,
@@ -188,22 +200,25 @@ class MergeQueueMixin:
         text_channel_id: int,
         mentions: dict[str, str] | None = None,
     ) -> None:
-        key = (author_id, voice_channel.id)
         now = time.perf_counter()
+        aliases = self.config_store.emoji_say_map()
+
+        if config.TTS_MERGE_ALGORITHM == "off":
+            spoken_text = speech_text_from_message(text, aliases, mentions)
+            if spoken_text:
+                await self.enqueue_tts(
+                    spoken_text, voice_channel, author_id, text_channel_id,
+                    message_ts=now, normalized=True,
+                )
+            return
+
+        key = (author_id, voice_channel.id)
         parsed = analyze_message_for_merge(
-            text, self.config_store.emoji_say_map(), mentions
+            text, aliases, mentions
         )
         previous_ts = self.last_user_message_ts.get(key)
         gap_prev_ms = None if previous_ts is None else round((now - previous_ts) * 1000)
         self.last_user_message_ts[key] = now
-
-        if config.TTS_MERGE_ALGORITHM == "off":
-            if parsed.spoken_text:
-                await self.enqueue_tts(
-                    parsed.spoken_text, voice_channel, author_id, text_channel_id,
-                    message_ts=now, normalized=True,
-                )
-            return
 
         selective_enabled_for_author = (
             config.TTS_MERGE_ALGORITHM == "selective_hold_v2"
