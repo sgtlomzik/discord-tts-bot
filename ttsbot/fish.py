@@ -1,0 +1,181 @@
+"""Fish Audio HTTP TTS with a shared keep-alive client and in-flight dedup."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import AsyncIterator
+
+import httpx
+
+log = logging.getLogger("tts_bot")
+
+
+@dataclass(frozen=True)
+class FishConfig:
+    api_key: str
+    reference_id: str = ""
+    model: str = "s2.1-pro-free"
+    format: str = "opus"
+    latency: str = "low"
+    chunk_length: int = 150
+    opus_bitrate: int = 48000
+    sample_rate: int = 48000
+    normalize: bool = True
+    base_url: str = "https://api.fish.audio"
+
+    @classmethod
+    def from_env(cls) -> "FishConfig":
+        cfg = cls(
+            api_key=os.getenv("FISH_API_KEY", "").strip(),
+            reference_id=os.getenv("FISH_REFERENCE_ID", "").strip(),
+            model=os.getenv("FISH_MODEL", "s2.1-pro-free").strip(),
+            format=os.getenv("FISH_FORMAT", "opus").strip().lower(),
+            latency=os.getenv("FISH_LATENCY", "low").strip().lower(),
+            chunk_length=int(os.getenv("FISH_CHUNK_LENGTH", "150")),
+            opus_bitrate=int(os.getenv("FISH_OPUS_BITRATE", "48000")),
+            base_url=os.getenv("FISH_BASE_URL", "https://api.fish.audio").strip(),
+        )
+        if cfg.format != "opus" or cfg.latency not in {"low", "balanced", "normal"}:
+            raise ValueError("Fish requires opus format and a supported latency mode")
+        if not 100 <= cfg.chunk_length <= 300:
+            raise ValueError("FISH_CHUNK_LENGTH must be between 100 and 300")
+        if cfg.opus_bitrate not in {24000, 32000, 48000, 64000}:
+            raise ValueError("FISH_OPUS_BITRATE must be 24000, 32000, 48000, or 64000")
+        return cfg
+
+    def cache_key(self, reference_id: str) -> str:
+        """Include every Fish setting that can change the resulting audio."""
+        data = {
+            "provider": "fish", "reference_id": reference_id, "model": self.model,
+            "format": self.format, "latency": self.latency,
+            "chunk_length": self.chunk_length, "opus_bitrate": self.opus_bitrate,
+            "sample_rate": self.sample_rate, "normalize": self.normalize,
+        }
+        return "fish:" + hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+
+class FishError(RuntimeError):
+    pass
+
+
+@dataclass
+class _Flight:
+    chunks: list[bytes] = field(default_factory=list)
+    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    listeners: int = 0
+    done: bool = False
+    error: BaseException | None = None
+    task: asyncio.Task | None = None
+
+
+class FishProvider:
+    name = "fish"
+
+    def __init__(self, config: FishConfig, client: httpx.AsyncClient | None = None) -> None:
+        self.config = config
+        self._owns_client = client is None
+        self._client = client or httpx.AsyncClient(
+            base_url=config.base_url,
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
+        self._flights: dict[str, _Flight] = {}
+        self._flight_lock = asyncio.Lock()
+
+    async def aclose(self) -> None:
+        async with self._flight_lock:
+            tasks = [flight.task for flight in self._flights.values() if flight.task]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def _produce(self, flight: _Flight, text: str, reference_id: str) -> None:
+        cfg = self.config
+        body = {
+            "text": text,
+            "reference_id": reference_id,
+            "format": cfg.format,
+            "latency": cfg.latency,
+            "chunk_length": cfg.chunk_length,
+            "opus_bitrate": cfg.opus_bitrate,
+            "sample_rate": cfg.sample_rate,
+            "normalize": cfg.normalize,
+        }
+        try:
+            async with self._client.stream(
+                "POST", "/v1/tts", json=body,
+                headers={
+                    "Authorization": f"Bearer {cfg.api_key}",
+                    "Content-Type": "application/json",
+                    "model": cfg.model,
+                },
+            ) as response:
+                if response.status_code != 200:
+                    detail = (await response.aread())[:300].decode("utf-8", "replace")
+                    raise FishError(f"Fish HTTP {response.status_code}: {detail}")
+                async for chunk in response.aiter_bytes():
+                    if chunk:
+                        async with flight.condition:
+                            flight.chunks.append(chunk)
+                            flight.condition.notify_all()
+            if not flight.chunks:
+                raise FishError("Fish returned no audio")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            flight.error = exc
+        finally:
+            async with flight.condition:
+                flight.done = True
+                flight.condition.notify_all()
+
+    async def stream_audio(self, text: str, *, reference_id: str = "") -> AsyncIterator[bytes]:
+        reference_id = reference_id or self.config.reference_id
+        if not self.config.api_key or not reference_id:
+            raise FishError("FISH_API_KEY and reference_id are required")
+        key = hashlib.sha256(
+            (self.config.cache_key(reference_id) + "\0" + text).encode("utf-8")
+        ).hexdigest()
+        async with self._flight_lock:
+            flight = self._flights.get(key)
+            if flight is None:
+                flight = _Flight()
+                self._flights[key] = flight
+                flight.task = asyncio.create_task(self._produce(flight, text, reference_id))
+            flight.listeners += 1
+        index = 0
+        try:
+            while True:
+                async with flight.condition:
+                    await flight.condition.wait_for(
+                        lambda: index < len(flight.chunks) or flight.done
+                    )
+                    if index < len(flight.chunks):
+                        chunk = flight.chunks[index]
+                        index += 1
+                    elif flight.error:
+                        raise flight.error
+                    else:
+                        return
+                yield chunk
+        finally:
+            async with self._flight_lock:
+                flight.listeners -= 1
+                if flight.listeners == 0:
+                    if not flight.done and flight.task:
+                        flight.task.cancel()
+                    self._flights.pop(key, None)
+
+    async def synthesize(self, text: str, filename: Path, *, reference_id: str = "") -> None:
+        with filename.open("wb") as output:
+            async for chunk in self.stream_audio(text, reference_id=reference_id):
+                output.write(chunk)

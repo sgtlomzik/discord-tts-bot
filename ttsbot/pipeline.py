@@ -1,6 +1,6 @@
 """Synthesis pipeline for TTSBot: providers, streaming and workers.
 
-Covers Piper file generation, the MiniMax streaming fast path with its
+Covers Piper file generation, the MiniMax and Fish streaming paths with their
 cache/circuit-breaker interplay, the prefetch generation worker and the
 legacy single worker. Playback details live in ttsbot.playback.
 """
@@ -305,8 +305,10 @@ class SynthesisPipelineMixin:
             config.TTS_STREAMING_ENABLED
             and config.TTS_CONTINUOUS_STREAM
             and voice is not None
-            and getattr(voice, "is_minimax", False)
-            and self.tts_dispatcher.cloud is not None
+            and (
+                (getattr(voice, "is_minimax", False) and self.tts_dispatcher.cloud is not None)
+                or (getattr(voice, "is_fish", False) and self.tts_dispatcher.fish is not None)
+            )
         )
 
     async def _run_streaming_job(self, job: TTSJob, voice, worker_started: float) -> str:
@@ -606,6 +608,11 @@ class SynthesisPipelineMixin:
         try:
             if prepared.cancelled:
                 return
+            if getattr(voice, "is_fish", False) and self._should_attempt_stream(voice):
+                status = await self._generate_fish_stream_into(prepared, voice)
+                if status != "pre_audio":
+                    return
+                voice = self.voice_registry.fallback_record()
             if self._should_attempt_stream(voice):
                 status = await self._generate_stream_into(prepared, voice)
                 if status != "pre_audio":
@@ -656,6 +663,34 @@ class SynthesisPipelineMixin:
         cb.record_success() if status == "ok" else cb.record_failure()
         return status
 
+    async def _generate_fish_stream_into(self, prepared: PreparedAudio, voice) -> str:
+        job = prepared.job
+        fish = self.tts_dispatcher.fish
+        cb = self.tts_dispatcher.fish_circuit_breaker
+        cache = self.tts_dispatcher.cache
+        cache_key = fish.config.cache_key(voice.fish.reference_id)
+        if cache is not None:
+            cached = cache.lookup(job.text, cache_key)
+            if cached is not None:
+                frames = limit_pcm_frames(await self._safe_pcm_frames(cached), job.text, voice)
+                if frames and not prepared.cancelled:
+                    await prepared.channel.put(frames)
+                    prepared.provider = "cache"
+                    return "cache"
+        if prepared.cancelled:
+            return "cancelled"
+        if not cb.allow_request():
+            return "pre_audio"
+        prepared.provider = "fish"
+        status, _ = await self._stream_fish_to_channel(prepared, voice, cache_key)
+        if status == "pre_audio":
+            cb.record_failure()
+        elif status == "ok":
+            cb.record_success()
+        elif status != "cancelled":
+            cb.record_failure()
+        return status
+
     async def _generate_file_into(self, prepared: PreparedAudio, voice) -> None:
         if prepared.cancelled:
             return
@@ -678,19 +713,32 @@ class SynthesisPipelineMixin:
                     log.exception("Failed to remove temp file: %s", filename)
 
     async def _stream_to_channel(self, prepared: PreparedAudio, voice) -> tuple[str, int]:
-        """Stream MiniMax -> ffmpeg -> frame batches into ``prepared.channel``.
+        """Stream MiniMax MP3 into the shared incremental decoder."""
+        mm = voice.minimax
+        agen = self.tts_dispatcher.cloud.stream_audio(
+            prepared.job.text, voice_id=mm.voice_id, model=mm.model, speed=mm.speed,
+            vol=mm.vol, pitch=mm.pitch, emotion=mm.emotion, language_boost=mm.language_boost,
+        )
+        return await self._decode_stream_to_channel(prepared, voice, agen, "mp3", voice.name, "mp3")
+
+    async def _stream_fish_to_channel(self, prepared: PreparedAudio, voice, cache_key: str) -> tuple[str, int]:
+        """Stream Fish Ogg/Opus into the shared incremental decoder."""
+        agen = self.tts_dispatcher.fish.stream_audio(
+            prepared.job.text, reference_id=voice.fish.reference_id,
+        )
+        return await self._decode_stream_to_channel(prepared, voice, agen, "ogg", cache_key, "opus")
+
+    async def _decode_stream_to_channel(
+        self, prepared: PreparedAudio, voice, agen, input_format: str,
+        cache_key: str, cache_suffix: str,
+    ) -> tuple[str, int]:
+        """Tee compressed audio to an atomic cache file and ffmpeg stdin.
 
         Like _stream_tts_to_source but writes to the prefetch channel (not the
         live player) and honors cancellation. Returns (status, frames) with
         status in ok/truncated/pre_audio/cancelled.
         """
         job = prepared.job
-        cloud = self.tts_dispatcher.cloud
-        mm = voice.minimax
-        agen = cloud.stream_audio(
-            job.text, voice_id=mm.voice_id, model=mm.model, speed=mm.speed,
-            vol=mm.vol, pitch=mm.pitch, emotion=mm.emotion, language_boost=mm.language_boost,
-        )
         try:
             first_chunk = await asyncio.wait_for(
                 agen.__anext__(), timeout=config.TTS_STREAM_TTFA_TIMEOUT
@@ -712,24 +760,32 @@ class SynthesisPipelineMixin:
             await agen.aclose()
             return ("cancelled", 0)
 
-        proc = await asyncio.create_subprocess_exec(
-            *build_tts_stream_pcm_command(),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *build_tts_stream_pcm_command(input_format),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except OSError:
+            await agen.aclose()
+            log.exception("Could not start ffmpeg for %s stream; Piper fallback", input_format)
+            return ("pre_audio", 0)
         mid_error: list[BaseException] = []
         cache = self.tts_dispatcher.cache
         cache_final: Path | None = None
         cache_part = None
+        part_path: Path | None = None
         if cache is not None:
             try:
-                cache_final = cache.cache_path_for(job.text, voice.name)
+                cache_final = cache.cache_path_for(job.text, cache_key, cache_suffix)
                 cache_final.parent.mkdir(parents=True, exist_ok=True)
-                cache_part = open(str(cache_final) + ".part", "wb")
+                part_path = cache_final.parent / f"{cache_final.stem}.{uuid.uuid4().hex}.tmp"
+                cache_part = part_path.open("wb")
             except OSError:
                 cache_final = None
                 cache_part = None
+                part_path = None
 
         async def _feed() -> None:
             try:
@@ -806,12 +862,10 @@ class SynthesisPipelineMixin:
             except Exception:
                 pass
 
-        part_path = (str(cache_final) + ".part") if cache_final is not None else None
-
         def _discard() -> None:
             if part_path:
                 try:
-                    os.unlink(part_path)
+                    part_path.unlink()
                 except OSError:
                     pass
 
@@ -826,13 +880,17 @@ class SynthesisPipelineMixin:
             log.warning("Stream failed mid-stream after %d frames (%s); truncated",
                         frames_count, mid_error[0])
             return ("truncated", frames_count)
+        if proc.returncode != 0:
+            _discard()
+            log.warning("ffmpeg stream decode failed rc=%s format=%s", proc.returncode, input_format)
+            return ("truncated" if frames_count else "pre_audio", frames_count)
         if frames_count == 0:
             _discard()
             return ("pre_audio", 0)
         if cache is not None and cache_final is not None and part_path:
             try:
                 os.replace(part_path, cache_final)
-                cache.commit_file(job.text, cache_final, voice.name)
+                cache.commit_file(job.text, cache_final, cache_key)
             except OSError:
                 _discard()
         return ("ok", frames_count)
@@ -853,12 +911,29 @@ class SynthesisPipelineMixin:
                     or self.voice_registry.fallback_record()
                 )
 
+                # The legacy single-worker mode still streams Fish audio.
+                # Reuse the same producer/consumer path as prefetch, without
+                # changing the continuous Discord player.
+                if getattr(voice, "is_fish", False) and self._should_attempt_stream(voice):
+                    prepared = PreparedAudio(job=job, channel=asyncio.Queue())
+                    self.active_prepared.add(prepared)
+                    generator = asyncio.create_task(self._prepare_into(prepared))
+                    try:
+                        await self._play_prepared(prepared)
+                        await generator
+                    finally:
+                        if not generator.done():
+                            generator.cancel()
+                            await asyncio.gather(generator, return_exceptions=True)
+                        self.active_prepared.discard(prepared)
+                    continue
+
                 # Streaming fast path: a MiniMax voice over the continuous
                 # stream plays chunks as they arrive (lower Time-To-First-
                 # Audio). On a pre-audio failure or an open breaker it returns
                 # "fallback" and we drop to the Piper file path below.
                 file_voice_name = job.voice_profile
-                if self._should_attempt_stream(voice):
+                if getattr(voice, "is_minimax", False) and self._should_attempt_stream(voice):
                     outcome = await self._run_streaming_job(job, voice, worker_started)
                     if outcome == "done":
                         continue

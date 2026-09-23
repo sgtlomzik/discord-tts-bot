@@ -12,8 +12,8 @@ The bot is a single-process Discord service that:
 3. normalizes and classifies message text;
 4. optionally merges short messages into a buffer;
 5. queues TTS jobs;
-6. synthesizes speech with Piper;
-7. converts the generated WAV into PCM frames;
+6. synthesizes speech with the selected Fish, MiniMax or Piper voice;
+7. converts the streaming audio or generated file into PCM frames;
 8. plays the frames into a Discord voice channel;
 9. disconnects when the voice channel goes idle.
 
@@ -50,13 +50,15 @@ The active runtime pieces are:
     recovery, idle disconnect, auto-connect policy.
   - `merge.py` - the enqueue boundary and legacy/selective-hold merge
     decisions.
-  - `pipeline.py` - Piper/MiniMax synthesis, the streaming fast path,
+  - `pipeline.py` - Piper/MiniMax/Fish synthesis, the streaming fast path,
     the prefetch generation worker and the legacy single worker.
   - `playback.py` - PCM preparation and the continuous player feed.
   - `commands.py` - `build_commands(bot)` creates the /voicebot group
     bound to a bot instance; `events.py` - `register_events(bot)`.
 - `ttsbot/providers.py` - provider abstraction: dispatcher, MiniMax
   client, phrase cache, circuit breaker.
+- `ttsbot/fish.py` - Fish HTTP client, request configuration and in-flight
+  deduplication.
 - `ttsbot/voice_registry.py` - the unified voice catalog
   (data/voices.json).
 - `tests/` - unit and async integration-style tests.
@@ -249,11 +251,23 @@ Important behavior:
 
 This is the part to preserve if a new TTS engine is introduced. The engine can change, but the worker contract should stay stable.
 
-## 7. Piper Synthesis Path
+## 7. Synthesis Paths
 
-Piper is the only active engine in production right now.
+The Fish cache-miss path starts playback before the HTTP response completes:
 
-The synthesis path is:
+```text
+Discord text -> Fish POST /v1/tts (Ogg/Opus chunks)
+             -> cache .tmp file -> atomic rename on success
+             -> ffmpeg stdin -> PCM 48 kHz stereo frames
+             -> ContinuousTTSAudioSource -> Discord
+```
+
+The same cache key includes the text, reference_id, model, and output/tuning
+settings. Cache hits decode the local `.opus` file through ffmpeg. Identical
+concurrent requests share one HTTP stream. A pre-audio Fish failure falls
+back to Piper. MiniMax remains selectable from the voice registry.
+
+The local fallback path is:
 
 ```text
 text
@@ -270,7 +284,8 @@ The key runtime objects are:
 - `PiperVoice` - loaded lazily and cached by model path;
 - `SynthesisConfig` - used for speaker and length-scale tuning when needed.
 
-This is the main extension point for a new engine. The outer worker and playback path do not need to change if the new engine can produce compatible audio.
+The output of every engine is converted to the same PCM frame format; the
+Discord playback source and voice lifecycle are shared.
 
 ## 8. Playback Path
 
@@ -284,7 +299,7 @@ There are two playback modes:
 The default path uses the continuous stream source:
 
 ```text
-WAV
+WAV, MP3 or Ogg/Opus
   -> ffmpeg PCM frames
   -> ContinuousTTSAudioSource
   -> Discord voice client
@@ -369,6 +384,10 @@ Main groups:
 
 The important current engine-specific values are:
 
+- `FISH_MODEL=s2.1-pro-free`
+- `FISH_FORMAT=opus`, `FISH_LATENCY=low`, `FISH_CHUNK_LENGTH=150`
+- `FISH_OPUS_BITRATE=48000`
+- `FISH_API_KEY` and `FISH_REFERENCE_ID` supplied from the untracked `.env`
 - `TTS_DEFAULT_VOICE_PROFILE=piper-ruslan`
 - `PIPER_MODEL_PATH=/app/models/ru_RU-ruslan-medium.onnx`
 - `PIPER_CONFIG_PATH=/app/models/ru_RU-ruslan-medium.onnx.json`

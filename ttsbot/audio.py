@@ -145,20 +145,22 @@ def build_tts_pcm_command(source: Path) -> list[str]:
     ]
 
 
-def build_tts_stream_pcm_command() -> list[str]:
-    """ffmpeg: decode an MP3 byte stream on stdin to s16le 48k stereo on stdout.
+def build_tts_stream_pcm_command(input_format: str = "mp3") -> list[str]:
+    """Decode streaming MP3 or Ogg/Opus on stdin to s16le 48k stereo.
 
-    Used by the streaming path: MiniMax MP3 chunks are written to stdin and
+    Used by the streaming path: compressed chunks are written to stdin and
     decoded PCM is read from stdout incrementally. No silence trimming — that
     needs the whole clip, and the continuous player already handles idle.
     """
+    if input_format not in {"mp3", "ogg"}:
+        raise ValueError(f"Unsupported streaming input format: {input_format}")
     return [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "warning",
         "-f",
-        "mp3",
+        input_format,
         "-i",
         "pipe:0",
         "-vn",
