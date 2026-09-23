@@ -109,6 +109,11 @@ python bot.py
 `/voicebot voice-clear`. Кэш Fish хранит `.opus`, ключ включает текст,
 `reference_id`, модель и настройки генерации.
 
+`/voicebot voice-clone` теперь создаёт приватный голос Fish из приложенного
+аудиофайла (WAV/MP3/M4A/Opus). Бот дожидается готовности модели, проверяет
+короткую генерацию и сохраняет новый `reference_id` в `data/voices.json`.
+Созданный профиль можно назначить через `voice-set` или `voice-user`.
+
 ## Команды
 
 Группа `/voicebot`: `on`, `off`, `allow`, `deny`, `voices`, `voice-set`,

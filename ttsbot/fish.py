@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+from mimetypes import guess_type
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator
@@ -179,3 +180,58 @@ class FishProvider:
         with filename.open("wb") as output:
             async for chunk in self.stream_audio(text, reference_id=reference_id):
                 output.write(chunk)
+
+    async def clone_voice(
+        self, sample: bytes, *, title: str, filename: str, description: str = "",
+    ) -> str:
+        """Create a private, reusable Fish voice and return its reference_id."""
+        if not sample:
+            raise FishError("Voice sample is empty")
+        safe_name = Path(filename).name or "sample.wav"
+        content_type = guess_type(safe_name)[0] or "application/octet-stream"
+        response = await self._client.post(
+            "/model",
+            headers={"Authorization": f"Bearer {self.config.api_key}"},
+            data={
+                "type": "tts",
+                "title": title,
+                "train_mode": "fast",
+                "visibility": "private",
+                "description": description,
+                "enhance_audio_quality": "true",
+                "generate_sample": "false",
+            },
+            files={"voices": (safe_name, sample, content_type)},
+            timeout=90.0,
+        )
+        if response.status_code != 201:
+            raise FishError(f"Fish clone HTTP {response.status_code}: {response.text[:300]}")
+        try:
+            payload = response.json()
+            reference_id = payload["_id"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise FishError("Fish clone response has no _id") from exc
+        if not isinstance(payload, dict) or not isinstance(reference_id, str) or not reference_id:
+            raise FishError("Fish clone response has an invalid _id")
+        state = payload.get("state")
+        for attempt in range(30):
+            if state == "trained":
+                return reference_id
+            if state == "failed":
+                raise FishError(f"Fish clone {reference_id} training failed")
+            if attempt:
+                await asyncio.sleep(2)
+            model = await self._client.get(
+                f"/model/{reference_id}",
+                headers={"Authorization": f"Bearer {self.config.api_key}"},
+                timeout=15.0,
+            )
+            if model.status_code != 200:
+                raise FishError(
+                    f"Fish clone {reference_id} state HTTP {model.status_code}: {model.text[:300]}"
+                )
+            try:
+                state = model.json()["state"]
+            except (ValueError, KeyError, TypeError) as exc:
+                raise FishError(f"Fish clone {reference_id} state response is invalid") from exc
+        raise FishError(f"Fish clone {reference_id} is still {state} after 60 seconds")

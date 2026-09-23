@@ -54,19 +54,12 @@ async def require_guild_manager(interaction: discord.Interaction) -> bool:
 
 
 def _derive_minimax_voice_id(name: str) -> str:
-    """Build a MiniMax-valid voice_id from a kebab-case profile name.
-
-    MiniMax requires a voice_id of >=8 chars containing at least one letter
-    AND one digit, and rejects dashes (2013 invalid params). We strip the
-    name to alphanumerics (no dashes), make sure it starts with a letter,
-    then append digits derived from a uuid — guaranteeing both a digit and
-    uniqueness so a re-clone never silently overwrites a previous voice.
-    """
+    """Compatibility helper retained for imports from bot.py."""
     base = re.sub(r"[^a-z0-9]", "", name.lower())
     if not base or not base[0].isalpha():
         base = "voice" + base
     base = base[:16]
-    suffix = str(uuid.uuid4().int)[:4]  # always digits
+    suffix = str(uuid.uuid4().int)[:4]
     vid = base + suffix
     if len(vid) < 8:
         vid = (vid + "00000000")[:8]
@@ -379,10 +372,10 @@ def build_commands(bot):
         )
 
 
-    @tts_group.command(name="voice-clone", description="Клонировать голос из аудиофайла")
+    @tts_group.command(name="voice-clone", description="Клонировать голос в Fish Audio из аудиофайла")
     @app_commands.describe(
         name="Имя профиля (kebab-case: a-z, 0-9, дефис)",
-        sample="Аудиосэмпл (mp3/m4a/wav, 10 сек–5 мин, до 20 МБ)",
+        sample="Аудиосэмпл (mp3/m4a/wav/opus, от 10 сек, до 20 МБ)",
         description="Описание (необязательно)",
     )
     async def slash_tts_voice_clone(
@@ -408,24 +401,23 @@ def build_commands(bot):
             return
         if sample.size > 20 * 1024 * 1024:
             await interaction.response.send_message(
-                f"Файл {sample.size / 1024 / 1024:.1f} МБ — лимит MiniMax 20 МБ.",
+                f"Файл {sample.size / 1024 / 1024:.1f} МБ — лимит загрузки бота 20 МБ.",
                 ephemeral=True,
             )
             return
-        ctype = (sample.content_type or "").lower()
         fname = sample.filename.lower()
-        if not (ctype.startswith("audio") or fname.endswith((".mp3", ".m4a", ".wav", ".ogg"))):
+        if not fname.endswith((".mp3", ".m4a", ".wav", ".opus")):
             await interaction.response.send_message(
-                "Нужен аудиофайл (mp3/m4a/wav/ogg).", ephemeral=True
+                "Нужен аудиофайл (mp3/m4a/wav/opus).", ephemeral=True
             )
             return
-        if bot.tts_dispatcher.cloud is None:
+        if bot.tts_dispatcher.fish is None:
             await interaction.response.send_message(
-                "MiniMax не настроен (нет MINIMAX_API_KEY) — клонирование недоступно.",
+                "Fish Audio не настроен (нет FISH_API_KEY) — клонирование недоступно.",
                 ephemeral=True,
             )
             return
-        # Download + upload + clone + probe all hit the network; defer so the
+        # Download + model creation + probe all hit the network; defer so the
         # interaction token does not expire (3s limit) before we finish.
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
@@ -435,19 +427,17 @@ def build_commands(bot):
                 f"Не удалось скачать файл: {exc}", ephemeral=True
             )
             return
-        voice_id = _derive_minimax_voice_id(name)
-        ok, err = await bot.clone_minimax_voice(
+        ok, result = await bot.clone_fish_voice(
             name=name,
-            voice_id=voice_id,
             sample=data,
             filename=sample.filename,
             description=description.strip(),
         )
         if not ok:
-            await interaction.followup.send(f"Не удалось: {err}", ephemeral=True)
+            await interaction.followup.send(f"Не удалось: {result}", ephemeral=True)
             return
         await interaction.followup.send(
-            f"Готово! Голос `{name}` создан (voice_id=`{voice_id}`).\n"
+            f"Готово! Голос `{name}` создан в Fish (reference_id=`{result}`).\n"
             f"Назначьте его: `/voicebot voice-user @user {name}` "
             f"или `/voicebot voice-set {name}`.",
             ephemeral=True,

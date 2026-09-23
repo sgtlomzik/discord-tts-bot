@@ -7,16 +7,18 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 
 from ttsbot.audio import PCM_FRAME_BYTES, build_tts_stream_pcm_command
+from ttsbot import config
 from ttsbot.fish import FishConfig, FishProvider
 from ttsbot.models import PreparedAudio, TTSJob
 from ttsbot.pipeline import SynthesisPipelineMixin
 from ttsbot.playback import PlaybackMixin
 from ttsbot.providers import CircuitBreaker, TTSCacheConfig, TTSPhraseCache
-from ttsbot.voice_registry import FishParams, VoiceRecord, registry_from_dict, registry_to_dict
+from ttsbot.voice_registry import FishParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict
 from scripts.migrate_fish_default import migrate
 
 
@@ -31,6 +33,79 @@ class _TwoChunkStream(httpx.AsyncByteStream):
 
 
 class FishProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clone_uploads_private_model_and_waits_for_training(self):
+        requests = []
+
+        def handle(request):
+            requests.append(request)
+            if request.method == "POST" and request.url.path == "/model":
+                return httpx.Response(201, json={"_id": "new-fish-id", "state": "created"})
+            if request.method == "GET" and request.url.path == "/model/new-fish-id":
+                return httpx.Response(200, json={"_id": "new-fish-id", "state": "trained"})
+            return httpx.Response(404)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="https://api.fish.audio")
+        fish = FishProvider(FishConfig(api_key="test-key"), client)
+        try:
+            voice_id = await fish.clone_voice(b"sample-data", title="new-voice", filename="sample.wav", description="test")
+            self.assertEqual(voice_id, "new-fish-id")
+            self.assertEqual(len(requests), 2)
+            create = requests[0]
+            self.assertEqual(create.headers["Authorization"], "Bearer test-key")
+            self.assertIn("multipart/form-data", create.headers["Content-Type"])
+            for value in (b'name="voices"', b"sample-data", b'name="train_mode"', b"fast",
+                          b'name="visibility"', b"private", b'name="title"', b"new-voice"):
+                self.assertIn(value, create.content)
+        finally:
+            await fish.aclose()
+            await client.aclose()
+
+    async def test_clone_rejects_failed_training(self):
+        def handle(request):
+            return httpx.Response(201, json={"_id": "failed-id", "state": "failed"})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="https://api.fish.audio")
+        fish = FishProvider(FishConfig(api_key="test-key"), client)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "training failed"):
+                await fish.clone_voice(b"sample-data", title="new-voice", filename="sample.wav")
+        finally:
+            await fish.aclose()
+            await client.aclose()
+
+    async def test_clone_registers_only_after_ogg_probe(self):
+        calls = []
+
+        def handle(request):
+            calls.append(request.url.path)
+            if request.url.path == "/model":
+                return httpx.Response(201, json={"_id": "new-fish-id", "state": "trained"})
+            if request.url.path == "/v1/tts":
+                return httpx.Response(200, content=b"OggS-probe-audio")
+            return httpx.Response(404)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="https://api.fish.audio")
+        fish = FishProvider(FishConfig(api_key="test-key"), client)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "TMP_DIR", Path(tmp)):
+            pipeline = SynthesisPipelineMixin()
+            pipeline.tts_dispatcher = SimpleNamespace(fish=fish)
+            pipeline.voice_registry = VoiceRegistry(fallback_profile="piper-ruslan")
+            saved = []
+            pipeline.persist_voice_registry = lambda: saved.append(True)
+            try:
+                ok, reference_id = await pipeline.clone_fish_voice(
+                    name="new-voice", sample=b"sample-data", filename="sample.wav", description="test",
+                )
+                self.assertTrue(ok)
+                self.assertEqual(reference_id, "new-fish-id")
+                self.assertEqual(pipeline.voice_registry.get("new-voice").fish.reference_id, reference_id)
+                self.assertEqual(saved, [True])
+                self.assertEqual(calls, ["/model", "/v1/tts"])
+                self.assertEqual(list(Path(tmp).iterdir()), [])
+            finally:
+                await fish.aclose()
+                await client.aclose()
+
     async def test_request_and_inflight_dedup(self):
         release = asyncio.Event()
         requests = []

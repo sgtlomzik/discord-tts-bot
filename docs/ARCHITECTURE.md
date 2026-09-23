@@ -267,6 +267,10 @@ settings. Cache hits decode the local `.opus` file through ffmpeg. Identical
 concurrent requests share one HTTP stream. A pre-audio Fish failure falls
 back to Piper. MiniMax remains selectable from the voice registry.
 
+`/voicebot voice-clone` uploads a sample to Fish `POST /model` as multipart,
+waits for `GET /model/{id}` to report `trained`, probes the new `reference_id`
+through `/v1/tts`, and only then saves a Fish voice record in `voices.json`.
+
 The local fallback path is:
 
 ```text
