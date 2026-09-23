@@ -233,6 +233,54 @@ class SynthesisPipelineMixin:
             return False, f"Голос создан, но не сохранён на диск: {exc}"
         return True, ""
 
+    async def clone_fish_voice(
+        self, *, name: str, sample: bytes, filename: str, description: str,
+    ) -> tuple[bool, str]:
+        """Create, probe, and register a Fish voice for /voicebot voice-clone.
+
+        On success the second tuple member is the new reference_id. On a
+        post-creation failure the error includes the id so it can be recovered.
+        """
+        fish = getattr(self.tts_dispatcher, "fish", None)
+        if fish is None:
+            return False, "Fish Audio не настроен (нет FISH_API_KEY)."
+        try:
+            reference_id = await fish.clone_voice(
+                sample, title=name, filename=filename, description=description,
+            )
+        except Exception as exc:
+            return False, f"Не удалось клонировать в Fish: {type(exc).__name__}: {exc}"
+
+        probe = config.TMP_DIR / f"fish_clone_{uuid.uuid4().hex}.opus"
+        try:
+            await fish.synthesize("Проверка голоса.", probe, reference_id=reference_id)
+            with probe.open("rb") as audio:
+                if audio.read(4) != b"OggS":
+                    raise ValueError("Fish returned no Ogg/Opus audio")
+        except Exception as exc:
+            return False, (
+                f"Клон создан (reference_id=`{reference_id}`), но проверка озвучки не прошла: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        finally:
+            probe.unlink(missing_ok=True)
+
+        record = voice_registry.VoiceRecord(
+            name=name,
+            label=f"{name} (Fish клон)",
+            description=description,
+            provider=voice_registry.PROVIDER_FISH,
+            fish=voice_registry.FishParams(reference_id=reference_id),
+        )
+        self.voice_registry.add(record)
+        try:
+            self.persist_voice_registry()
+        except OSError as exc:
+            self.voice_registry.voices.pop(name, None)
+            log.exception("Failed to persist voices.json after Fish voice-clone")
+            return False, f"Клон создан (reference_id=`{reference_id}`), но не сохранён: {exc}"
+        return True, reference_id
+
     async def generate_piper_file(self, text: str, filename: Path, profile: VoiceProfile) -> None:
         if PiperVoice is None:
             raise RuntimeError("piper-tts is not installed")

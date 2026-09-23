@@ -105,6 +105,11 @@ For Fish, put `FISH_API_KEY` and `FISH_REFERENCE_ID` in `.env`, then select
 voice assignments must be changed or cleared separately. Fish cache files
 use `.opus`; cache keys include the text, `reference_id`, model, and TTS settings.
 
+`/voicebot voice-clone` now creates a private Fish voice from an attached
+WAV/MP3/M4A/Opus sample. The bot waits for training, checks a short TTS
+generation, then saves its `reference_id` in `data/voices.json`. Assign it
+with `voice-set` or `voice-user`.
+
 ## Commands
 
 `/voicebot` group: `on`, `off`, `allow`, `deny`, `voices`, `voice-set`,
