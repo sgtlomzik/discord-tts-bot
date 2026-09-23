@@ -39,6 +39,7 @@ _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 PROVIDER_PIPER = "piper"
 PROVIDER_MINIMAX = "minimax"
+PROVIDER_FISH = "fish"
 
 
 def valid_voice_name(name: str) -> bool:
@@ -66,13 +67,19 @@ class MiniMaxParams:
 
 
 @dataclass(frozen=True)
+class FishParams:
+    reference_id: str = ""
+
+
+@dataclass(frozen=True)
 class VoiceRecord:
     name: str
     label: str
     description: str
-    provider: str  # PROVIDER_PIPER | PROVIDER_MINIMAX
+    provider: str  # PROVIDER_PIPER | PROVIDER_MINIMAX | PROVIDER_FISH
     piper: Optional[PiperParams] = None
     minimax: Optional[MiniMaxParams] = None
+    fish: Optional[FishParams] = None
 
     @property
     def is_minimax(self) -> bool:
@@ -81,6 +88,10 @@ class VoiceRecord:
     @property
     def is_piper(self) -> bool:
         return self.provider == PROVIDER_PIPER
+
+    @property
+    def is_fish(self) -> bool:
+        return self.provider == PROVIDER_FISH
 
 
 @dataclass
@@ -145,6 +156,8 @@ def _record_to_dict(r: VoiceRecord) -> dict:
         out["piper"] = _piper_to_dict(r.piper)
     if r.minimax is not None:
         out["minimax"] = _minimax_to_dict(r.minimax)
+    if r.fish is not None:
+        out["fish"] = {"reference_id": r.fish.reference_id}
     return out
 
 
@@ -197,7 +210,7 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
     if not isinstance(d, dict):
         return None
     provider = str(d.get("provider", "")).strip().lower()
-    if provider not in (PROVIDER_PIPER, PROVIDER_MINIMAX):
+    if provider not in (PROVIDER_PIPER, PROVIDER_MINIMAX, PROVIDER_FISH):
         log.warning("voices.json: skipping %r with unknown provider %r", name, provider)
         return None
     label = str(d.get("label", name) or name)
@@ -206,8 +219,15 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
     minimax = (
         _minimax_from_dict(d.get("minimax", {})) if provider == PROVIDER_MINIMAX else None
     )
+    fish_data = d.get("fish") or {}
+    if not isinstance(fish_data, dict):
+        fish_data = {}
+    fish = FishParams(reference_id=str(fish_data.get("reference_id", "") or "")) if provider == PROVIDER_FISH else None
     if provider == PROVIDER_MINIMAX and not (minimax and minimax.voice_id):
         log.warning("voices.json: skipping minimax voice %r with no voice_id", name)
+        return None
+    if provider == PROVIDER_FISH and not (fish and fish.reference_id):
+        log.warning("voices.json: skipping fish voice %r with no reference_id", name)
         return None
     return VoiceRecord(
         name=name,
@@ -216,6 +236,7 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
         provider=provider,
         piper=piper,
         minimax=minimax,
+        fish=fish,
     )
 
 

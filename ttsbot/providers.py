@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import shutil
+import uuid
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -44,6 +45,8 @@ from typing import (
     Optional,
     Protocol,
 )
+
+from ttsbot.fish import FishProvider
 
 if TYPE_CHECKING:  # pragma: no cover
     import httpx
@@ -253,6 +256,7 @@ def load_circuit_breaker_from_env() -> CircuitBreaker:
 class PrimaryProvider(str, Enum):
     LOCAL = "local"
     MINIMAX = "minimax"
+    FISH = "fish"
 
 
 @dataclass
@@ -367,12 +371,12 @@ class TTSPhraseCache:
         if not cache_dir.exists():
             return
         try:
-            files = [p for p in cache_dir.glob("*.mp3") if p.is_file()]
+            files = [p for suffix in ("mp3", "opus") for p in cache_dir.glob(f"*.{suffix}") if p.is_file()]
         except OSError:
             log.warning("TTS cache: failed to scan %s", cache_dir, exc_info=True)
             return
         # Remove orphan ".part" files left by an interrupted streaming write.
-        for part in cache_dir.glob("*.part"):
+        for part in list(cache_dir.glob("*.part")) + list(cache_dir.glob("*.tmp")):
             try:
                 part.unlink()
             except OSError:
@@ -475,21 +479,24 @@ class TTSPhraseCache:
         self._record(True)
         return cached
 
-    def store(self, text: str, source_path: Path, voice_name: str = "") -> Path:
+    def store(self, text: str, source_path: Path, voice_name: str = "", suffix: str | None = None) -> Path:
         """Copy ``source_path`` into the cache and return the cache path."""
         if not self._config.enabled:
             return source_path
         if not source_path.exists():
             raise FileNotFoundError(source_path)
-        return self._store_key(self.hash_text(text, voice_name), source_path)
+        suffix = suffix or ("opus" if source_path.suffix == ".opus" else "mp3")
+        return self._store_key(self.hash_text(text, voice_name), source_path, suffix)
 
-    def cache_path_for(self, text: str, voice_name: str = "") -> Path:
+    def cache_path_for(self, text: str, voice_name: str = "", suffix: str = "mp3") -> Path:
         """Return the on-disk path a (voice, text) pair would cache to.
 
         Used by the streaming path to write chunks directly to the final
         cache file (then ``commit_file`` registers it).
         """
-        return self._config.cache_dir / f"{self.hash_text(text, voice_name)}.mp3"
+        if suffix not in {"mp3", "opus"}:
+            raise ValueError(f"Unsupported cache suffix: {suffix}")
+        return self._config.cache_dir / f"{self.hash_text(text, voice_name)}.{suffix}"
 
     def commit_file(self, text: str, cache_file: Path, voice_name: str = "") -> Optional[Path]:
         """Register an already-written cache file (e.g. from streaming).
@@ -505,11 +512,16 @@ class TTSPhraseCache:
         key = self.hash_text(text, voice_name)
         return self._register(key, cache_file)
 
-    def _store_key(self, key: str, source_path: Path) -> Path:
-        target = self._config.cache_dir / f"{key}.mp3"
+    def _store_key(self, key: str, source_path: Path, suffix: str = "mp3") -> Path:
+        target = self._config.cache_dir / f"{key}.{suffix}"
         self._config.cache_dir.mkdir(parents=True, exist_ok=True)
         if target != source_path:
-            shutil.copyfile(source_path, target)
+            temporary = self._config.cache_dir / f"{key}.{uuid.uuid4().hex}.tmp"
+            try:
+                shutil.copyfile(source_path, temporary)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
         return self._register(key, target)
 
     def _register(self, key: str, target: Path) -> Path:
@@ -1107,7 +1119,7 @@ class MiniMaxProvider:
 def load_dispatcher_config_from_env() -> DispatcherConfig:
     """Build a ``DispatcherConfig`` from the standard ``TTS_*`` env vars.
 
-    ``TTS_PRIMARY_PROVIDER`` accepts ``local`` or ``minimax``. Unknown
+    ``TTS_PRIMARY_PROVIDER`` accepts ``local``, ``minimax`` or ``fish``. Unknown
     values fall back to ``local`` so the bot never silently misroutes.
 
     Default request timeout is 2.5 seconds — see plan §11.4 for the
@@ -1149,6 +1161,7 @@ class TTSDispatcher:
         self,
         local: LocalProvider,
         cloud: Optional[TTSProvider] = None,
+        fish: Optional[FishProvider] = None,
         circuit_breaker: Optional[CircuitBreaker] = None,
         config: Optional[DispatcherConfig] = None,
         cache: Optional[TTSPhraseCache] = None,
@@ -1156,7 +1169,9 @@ class TTSDispatcher:
     ) -> None:
         self._local = local
         self._cloud = cloud  # None when MiniMax is not configured
+        self._fish = fish
         self._cb = circuit_breaker or CircuitBreaker()
+        self._fish_cb = load_circuit_breaker_from_env()
         self._config = config or DispatcherConfig()
         self._cache = cache  # None means caching disabled
         # Piper profile name to fall back to when a cloud (MiniMax) voice
@@ -1176,6 +1191,14 @@ class TTSDispatcher:
         return self._cloud
 
     @property
+    def fish(self) -> Optional[FishProvider]:
+        return self._fish
+
+    @property
+    def fish_circuit_breaker(self) -> CircuitBreaker:
+        return self._fish_cb
+
+    @property
     def cache(self) -> Optional[TTSPhraseCache]:
         return self._cache
 
@@ -1191,7 +1214,18 @@ class TTSDispatcher:
         # Cache key must include the voice so two voices never collide, plus
         # the MiniMax params so re-tuning a voice (speed/pitch/emotion/vol)
         # yields a fresh key instead of serving stale audio.
-        voice_key = voice_cache_key(voice)
+        provider = getattr(voice, "provider", None) if voice is not None else None
+        want_fish = (
+            provider == "fish" or
+            (voice is None and self._config.primary is PrimaryProvider.FISH)
+        ) and self._fish is not None
+        fish_ref = (
+            getattr(getattr(voice, "fish", None), "reference_id", "")
+            or (self._fish.config.reference_id if self._fish is not None else "")
+        )
+        voice_key = (
+            self._fish.config.cache_key(fish_ref) if want_fish else voice_cache_key(voice)
+        )
 
         # 1. Cache hit short-circuits everything.
         if self._cache is not None:
@@ -1201,7 +1235,15 @@ class TTSDispatcher:
                 log.debug("TTS cache HIT text=%d chars voice=%s", len(text), voice_key)
                 return "cache"
 
-        provider = getattr(voice, "provider", None) if voice is not None else None
+        if want_fish and self._fish_cb.allow_request():
+            try:
+                await self._fish.synthesize(text, filename, reference_id=fish_ref)
+                self._fish_cb.record_success()
+                self._maybe_cache(text, filename, voice_key, suffix="opus")
+                return "fish"
+            except Exception as exc:
+                self._fish_cb.record_failure()
+                log.warning("Fish synthesis failed (%s: %s); falling back to Piper", type(exc).__name__, exc)
 
         # 2. Cloud (MiniMax) path: when the record is a minimax voice, or
         #    (no record) the env default is minimax. Requires a configured
@@ -1243,7 +1285,7 @@ class TTSDispatcher:
         #    voice, or the registry fallback when a cloud voice was wanted.
         if provider == "piper":
             fallback_name = getattr(voice, "name", None)
-        elif provider == "minimax" or want_minimax:
+        elif provider in {"minimax", "fish"} or want_minimax or want_fish:
             fallback_name = self._fallback_profile or None
         else:
             fallback_name = None
@@ -1252,14 +1294,15 @@ class TTSDispatcher:
         # operator has opted in, and a cache hit on a repeated short
         # phrase is a win whether the underlying provider is Piper
         # or MiniMax (the local file copy is faster than even Piper).
-        self._maybe_cache(text, filename, voice_key)
+        if not want_fish:
+            self._maybe_cache(text, filename, voice_key)
         return self._local.name
 
-    def _maybe_cache(self, text: str, filename: Path, voice_key: str = "") -> None:
+    def _maybe_cache(self, text: str, filename: Path, voice_key: str = "", suffix: str | None = None) -> None:
         if self._cache is None:
             return
         try:
-            self._cache.store(text, filename, voice_key)
+            self._cache.store(text, filename, voice_key, suffix=suffix)
         except OSError as exc:
             # /dev/shm full or read-only mount — log and continue.
             log.warning("TTS cache store failed: %s", exc)

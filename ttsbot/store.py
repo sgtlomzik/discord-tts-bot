@@ -42,6 +42,9 @@ class BotConfigStore:
             return name in self.voice_registry
         return name in VOICE_PROFILES
 
+    def _default_voice(self) -> str:
+        return "fish-default" if self.voice_registry is not None and "fish-default" in self.voice_registry else config.DEFAULT_VOICE_PROFILE
+
     def load(self) -> None:
         if not self.path.exists():
             return
@@ -70,9 +73,9 @@ class BotConfigStore:
                 for user_id, voice in raw_config.get("user_voices", {}).items()
                 if str(user_id).isdigit() and self._is_valid_voice(voice)
             }
-            default_voice = raw_config.get("default_voice", config.DEFAULT_VOICE_PROFILE)
+            default_voice = raw_config.get("default_voice", self._default_voice())
             if not self._is_valid_voice(default_voice):
-                default_voice = config.DEFAULT_VOICE_PROFILE
+                default_voice = self._default_voice()
             user_fixed_phrases = {
                 int(user_id): phrase
                 for user_id, phrase in raw_config.get("user_fixed_phrases", {}).items()
@@ -165,7 +168,7 @@ class BotConfigStore:
     def get_guild(self, guild_id: int) -> GuildConfig:
         config = self.guilds.get(guild_id)
         if config is None:
-            config = GuildConfig(allowed_users=set(self.fallback_users))
+            config = GuildConfig(allowed_users=set(self.fallback_users), default_voice=self._default_voice())
             self.guilds[guild_id] = config
         return config
 

@@ -15,6 +15,7 @@ import discord
 from discord.ext import commands
 
 from ttsbot import voice_registry
+from ttsbot.fish import FishConfig, FishProvider
 from ttsbot.providers import (
     LocalProvider,
     TTSDispatcher,
@@ -84,6 +85,17 @@ class TTSBot(
             minimax_model=_mm_seed.model,
             minimax_language_boost=_mm_seed.language_boost,
         )
+        fish_cfg = FishConfig.from_env()
+        self.fish_provider = FishProvider(fish_cfg) if fish_cfg.api_key else None
+        if fish_cfg.reference_id:
+            fish_record = voice_registry.VoiceRecord(
+                name="fish-default", label="Fish Audio", description="Fish Audio reference voice",
+                provider=voice_registry.PROVIDER_FISH,
+                fish=voice_registry.FishParams(reference_id=fish_cfg.reference_id),
+            )
+            if self.voice_registry.get("fish-default") != fish_record:
+                self.voice_registry.add(fish_record)
+                voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
         self.config_store = BotConfigStore(
             config.BOT_CONFIG_PATH, config.WHITELIST_USERS, voice_registry=self.voice_registry
         )
@@ -104,6 +116,7 @@ class TTSBot(
         self.tts_dispatcher = TTSDispatcher(
             local=LocalProvider(_piper_synthesize),
             cloud=self._build_cloud_provider(),
+            fish=self.fish_provider,
             config=load_dispatcher_config_from_env(),
             circuit_breaker=load_circuit_breaker_from_env(),
             cache=self.tts_cache,
@@ -158,5 +171,8 @@ class TTSBot(
                 await cloud.aclose()
             except Exception:
                 log.exception("Failed to close cloud TTS provider cleanly")
+
+        if self.fish_provider is not None:
+            await self.fish_provider.aclose()
 
         await super().close()

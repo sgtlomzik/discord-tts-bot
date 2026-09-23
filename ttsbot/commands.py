@@ -310,7 +310,7 @@ def build_commands(bot):
             rec = reg.get(name)
             if rec is None:
                 continue
-            tag = "MiniMax" if rec.is_minimax else "Piper"
+            tag = "Fish Audio" if rec.is_fish else "MiniMax" if rec.is_minimax else "Piper"
             fb = " (fallback)" if name == reg.fallback_profile else ""
             desc = f" — {rec.description}" if rec.description else ""
             lines.append(f"`{name}` [{tag}]{fb} - {rec.label}{desc}")
@@ -738,12 +738,14 @@ def build_commands(bot):
             rec = reg.get(name)
             if rec is None:
                 continue
-            tag = "MiniMax" if rec.is_minimax else "Piper"
+            tag = "Fish Audio" if rec.is_fish else "MiniMax" if rec.is_minimax else "Piper"
             extra = ""
             if rec.is_minimax and rec.minimax is not None:
                 extra = f" · {rec.minimax.model}"
                 if rec.minimax.emotion:
                     extra += f" · {rec.minimax.emotion}"
+            elif rec.is_fish and bot.tts_dispatcher.fish is not None:
+                extra = f" · {bot.tts_dispatcher.fish.config.model}"
             lines.append(f"`{name}` [{tag}]{extra}")
         if lines:
             embed.add_field(name="Список", value="\n".join(lines)[:1000], inline=False)

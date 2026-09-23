@@ -3,9 +3,9 @@
 **English** | [Русский](README.ru.md)
 
 A self-hosted Discord bot that reads chat messages aloud in a voice channel.
-Built for Russian-speaking communities: local [Piper](https://github.com/OHF-Voice/piper1-gpl)
-voices work fully offline, and [MiniMax](https://www.minimax.io/) cloud voices
-(including voice cloning) can be layered on top with automatic fallback to Piper.
+Fish Audio streams Ogg/Opus speech for low-latency playback. Local
+[Piper](https://github.com/OHF-Voice/piper1-gpl) voices work offline, and
+MiniMax voices remain available. Cloud failures fall back to Piper.
 
 [![CI](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/ci.yml)
 [![Docker](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/docker.yml/badge.svg)](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/docker.yml)
@@ -15,13 +15,11 @@ voices work fully offline, and [MiniMax](https://www.minimax.io/) cloud voices
 - **Reads chat into voice** — whitelisted users' messages are synthesized and
   played in their current voice channel; the bot auto-connects and
   auto-disconnects when idle.
-- **Two TTS engines** — local Piper (offline, free) and MiniMax cloud voices
-  with per-voice tuning (emotion, speed, pitch, model) and **voice cloning**
-  from an audio sample. Cloud failures fall back to Piper via a circuit
-  breaker; repeated phrases are served from an on-disk cache.
-- **Low latency** — MiniMax audio is streamed chunk-by-chunk into the voice
-  connection (low time-to-first-audio), and the next message is synthesized
-  while the previous one is still playing.
+- **Three TTS engines** — Fish Audio, MiniMax, and local Piper. Cloud failures
+  fall back to Piper; repeated phrases use an on-disk LRU cache.
+- **Low latency** — Fish streams Ogg/Opus over HTTP into ffmpeg and the
+  existing PCM player before generation finishes. A keep-alive HTTP client
+  is reused, and the next message is synthesized while the previous plays.
 - **Smart message merging** — short bursts of messages from one user are
   merged into a single natural phrase (`selective_hold_v2`), while reactions,
   emoji and questions play immediately.
@@ -96,8 +94,16 @@ Everything is configured through environment variables — see
 | `WHITELIST_USERS` | Comma-separated Discord user IDs allowed to use TTS |
 | `TTS_DEFAULT_VOICE_PROFILE` | Default voice (`piper-ruslan`, `piper-irina`, …) |
 | `MINIMAX_API_KEY` | Enables MiniMax cloud voices (optional) |
-| `TTS_PRIMARY_PROVIDER` | `local` or `minimax` |
+| `FISH_API_KEY` | Fish Audio key; keep it in `.env` only |
+| `FISH_REFERENCE_ID` | Fish voice ID; seeds the `fish-default` profile |
+| `TTS_PRIMARY_PROVIDER` | `local`, `minimax`, or `fish` |
 | `TTS_MERGE_ALGORITHM` | `selective_hold_v2`, `legacy` or `off` |
+
+For Fish, put `FISH_API_KEY` and `FISH_REFERENCE_ID` in `.env`, then select
+`/voicebot voice-set voice:fish-default`. Defaults are `s2.1-pro-free`,
+`opus`, `low`, `chunk_length=150`, and `opus_bitrate=48000`. Existing per-user
+voice assignments must be changed or cleared separately. Fish cache files
+use `.opus`; cache keys include the text, `reference_id`, model, and TTS settings.
 
 ## Commands
 
