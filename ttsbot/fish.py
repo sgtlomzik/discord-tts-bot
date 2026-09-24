@@ -51,7 +51,11 @@ class FishConfig:
         return cfg
 
     def cache_key(self, reference_id: str, params: object | None = None) -> str:
-        """Include every Fish setting that can change the resulting audio."""
+        """Include every Fish setting that can change the audio Fish returns.
+
+        Pitch is applied locally by ffmpeg after the request, so it is left
+        out: retuning pitch reuses the cached Fish audio.
+        """
         data = {
             "provider": "fish", "reference_id": reference_id,
             "model": getattr(params, "model", "") or self.model,
@@ -60,7 +64,6 @@ class FishConfig:
             "sample_rate": self.sample_rate, "normalize": self.normalize,
             "speed": getattr(params, "speed", 1.0),
             "volume_db": getattr(params, "volume_db", 0.0),
-            "pitch": getattr(params, "pitch", 0),
             "emotion": getattr(params, "emotion", ""),
             "temperature": getattr(params, "temperature", 0.7),
             "top_p": getattr(params, "top_p", 0.7),

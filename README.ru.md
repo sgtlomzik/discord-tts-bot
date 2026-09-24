@@ -99,6 +99,8 @@ python bot.py
 | `MINIMAX_API_KEY` | Включает облачные голоса MiniMax (опционально) |
 | `FISH_API_KEY` | Ключ Fish Audio; хранить только в `.env` |
 | `FISH_REFERENCE_ID` | ID голоса Fish; создаёт профиль `fish-default` |
+| `FISH_TTFA_TIMEOUT` | Сколько секунд ждать первый звук от Fish до перехода на Piper (по умолчанию 5) |
+| `MINIMAX_QUOTA_COOLDOWN_SECONDS` | Пауза для MiniMax после ошибки лимита или баланса (по умолчанию 1800) |
 | `TTS_PRIMARY_PROVIDER` | `local`, `minimax` или `fish` |
 | `TTS_MERGE_ALGORITHM` | `selective_hold_v2`, `legacy` или `off` |
 

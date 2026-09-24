@@ -127,8 +127,9 @@ def _pitch_filters(pitch: int) -> list[str]:
     if not pitch:
         return []
     factor = 2 ** (pitch / 12)
+    # Input is already 48 kHz (aformat runs first): asetrate shifts pitch and
+    # speed, then resample back and undo the speed change with atempo.
     return [
-        "aresample=48000",
         f"asetrate={round(48000 * factor)}",
         "aresample=48000",
         f"atempo={1 / factor:.8f}",
@@ -223,11 +224,19 @@ def build_idle_pcm_frame(mode: str, volume_db: float) -> bytes:
 
 
 class ContinuousTTSAudioSource(discord.AudioSource):
+    """Endless 20 ms frame stream: queued speech, idle frames in between.
+
+    In ``opus`` mode discord.py receives raw Opus packets. The source still
+    accepts 20 ms PCM frames (Piper, MiniMax, PCM cache; a PCM frame is 3840
+    bytes, an Opus packet at most 1275) and encodes them itself, so Fish and
+    PCM voices share one player instead of restarting it on every switch.
+    """
+
     def __init__(self, idle_frame: bytes, *, opus: bool = False) -> None:
-        self.idle_frame = idle_frame
         self._opus = opus
-        if opus:
-            require_discord_frame(idle_frame)
+        self._encoder: discord.opus.Encoder | None = None
+        self._check_frame(idle_frame)
+        self.idle_frame = idle_frame
         self.frames: thread_queue.Queue[bytes] = thread_queue.Queue()
         self._stopped = threading.Event()
         self._drained = threading.Event()
@@ -242,13 +251,30 @@ class ContinuousTTSAudioSource(discord.AudioSource):
         try:
             frame = self.frames.get_nowait()
         except thread_queue.Empty:
+            if self._opus and len(self.idle_frame) == PCM_FRAME_BYTES:
+                self.idle_frame = self._encode(self.idle_frame)  # encode once, reuse
             return self.idle_frame
 
         with self._lock:
             self._pending_frames = max(0, self._pending_frames - 1)
             if self._pending_frames == 0:
                 self._drained.set()
+        if self._opus and len(frame) == PCM_FRAME_BYTES:
+            return self._encode(frame)
         return frame
+
+    def _encode(self, pcm: bytes) -> bytes:
+        # Created lazily on the player thread; Fish-only playback never needs it.
+        if self._encoder is None:
+            self._encoder = discord.opus.Encoder()
+        return self._encoder.encode(pcm, discord.opus.Encoder.SAMPLES_PER_FRAME)
+
+    def _check_frame(self, frame: bytes) -> None:
+        if len(frame) == PCM_FRAME_BYTES:
+            return
+        if not self._opus:
+            raise ValueError(f"PCM frame must be {PCM_FRAME_BYTES} bytes, got {len(frame)}")
+        require_discord_frame(frame)
 
     def is_opus(self) -> bool:
         return self._opus
@@ -257,10 +283,7 @@ class ContinuousTTSAudioSource(discord.AudioSource):
         if not frames:
             return
         for frame in frames:
-            if self._opus:
-                require_discord_frame(frame)
-            elif len(frame) != PCM_FRAME_BYTES:
-                raise ValueError(f"PCM frame must be {PCM_FRAME_BYTES} bytes, got {len(frame)}")
+            self._check_frame(frame)
         with self._lock:
             self._pending_frames += len(frames)
             self._drained.clear()

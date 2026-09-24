@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -14,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 
 from ttsbot.audio import (
-    PCM_FRAME_BYTES, OPUS_SILENCE_FRAME, ContinuousTTSAudioSource,
+    PCM_FRAME_BYTES, OPUS_SILENCE_FRAME, ContinuousTTSAudioSource, load_opus,
     build_playback_filter_complex, build_tts_stream_pcm_command,
 )
 from ttsbot.ogg_opus import OggOpusDemuxer, UnsupportedOpusStream, opus_packet_samples, read_frame_cache
@@ -289,6 +290,13 @@ class FishCacheTests(unittest.TestCase):
         self.assertNotEqual(cfg.cache_key("voice-a"), FishConfig(api_key="ignored", opus_bitrate=64000).cache_key("voice-a"))
         self.assertNotEqual(cfg.cache_key("voice-a"), replace(cfg, latency="balanced").cache_key("voice-a"))
 
+    def test_cache_key_ignores_local_pitch_shift(self):
+        cfg = FishConfig(api_key="ignored")
+        self.assertEqual(
+            cfg.cache_key("voice-a", FishParams("voice-a")),
+            cfg.cache_key("voice-a", FishParams("voice-a", pitch=5)),
+        )
+
     def test_opus_cache_rehydrates_and_evicts_by_lru(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache_dir = Path(tmp) / "cache"
@@ -372,7 +380,31 @@ class FishLatencyCommandTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
 class FishDirectOpusTests(unittest.TestCase):
-    def test_player_switches_pcm_to_opus(self):
+    def test_player_mixes_opus_and_pcm_without_restart(self):
+        player = SimpleNamespace(
+            continuous_sources={}, cancel_continuous_idle_stop=MagicMock(),
+        )
+        playing = MagicMock(return_value=False)
+        vc = SimpleNamespace(
+            guild=SimpleNamespace(id=123), is_playing=playing,
+            is_paused=MagicMock(return_value=False), stop=MagicMock(), play=MagicMock(),
+        )
+        source = PlaybackMixin.ensure_continuous_player(
+            player, vc, initial_frames=[OPUS_SILENCE_FRAME],
+        )
+        playing.return_value = True
+        self.assertTrue(source.is_opus())
+        again = PlaybackMixin.ensure_continuous_player(
+            player, vc, initial_frames=[b"\x00" * PCM_FRAME_BYTES],
+        )
+        self.assertIs(again, source)
+        self.assertFalse(source.stopped)
+        vc.stop.assert_not_called()
+        vc.play.assert_called_once_with(source)
+        self.assertEqual(source.read(), OPUS_SILENCE_FRAME)
+        source.stop()
+
+    def test_player_replaces_legacy_pcm_source(self):
         player = SimpleNamespace(
             continuous_sources={}, cancel_continuous_idle_stop=MagicMock(),
         )
@@ -380,21 +412,29 @@ class FishDirectOpusTests(unittest.TestCase):
             guild=SimpleNamespace(id=123), is_playing=MagicMock(return_value=True),
             is_paused=MagicMock(return_value=False), stop=MagicMock(), play=MagicMock(),
         )
-        pcm = PlaybackMixin.ensure_continuous_player(player, vc)
-        opus = PlaybackMixin.ensure_continuous_player(
-            player, vc, opus=True, initial_frames=[OPUS_SILENCE_FRAME],
+        legacy = ContinuousTTSAudioSource(b"\x00" * PCM_FRAME_BYTES)
+        player.continuous_sources[123] = legacy
+        source = PlaybackMixin.ensure_continuous_player(player, vc)
+        self.assertTrue(legacy.stopped)
+        self.assertTrue(source.is_opus())
+        vc.stop.assert_called_once()
+
+    @unittest.skipUnless(load_opus(), "libopus required")
+    def test_opus_player_encodes_pcm_frames(self):
+        source = ContinuousTTSAudioSource(OPUS_SILENCE_FRAME, opus=True)
+        tone = b"".join(
+            int(8000 * math.sin(2 * math.pi * 440 * i / 48000)).to_bytes(2, "little", signed=True) * 2
+            for i in range(960)
         )
-        self.assertTrue(pcm.stopped)
-        self.assertFalse(opus.stopped)
-        self.assertTrue(opus.is_opus())
-        self.assertEqual(opus.read(), OPUS_SILENCE_FRAME)
-        pcm_again = PlaybackMixin.ensure_continuous_player(
-            player, vc, initial_frames=[b"\x00" * PCM_FRAME_BYTES],
-        )
-        self.assertTrue(opus.stopped)
-        self.assertFalse(pcm_again.is_opus())
-        self.assertEqual(pcm_again.read(), b"\x00" * PCM_FRAME_BYTES)
-        self.assertEqual(vc.stop.call_count, 3)
+        source.enqueue_frames([tone, OPUS_SILENCE_FRAME])
+        packet = source.read()
+        self.assertLess(len(packet), PCM_FRAME_BYTES)
+        self.assertEqual(opus_packet_samples(packet), 960)
+        self.assertEqual(source.read(), OPUS_SILENCE_FRAME)
+        self.assertEqual(source.read(), OPUS_SILENCE_FRAME)  # idle
+        self.assertTrue(source.is_drained)
+        with self.assertRaises(ValueError):
+            source.enqueue_frames([b"\x00" * 100])
 
     def test_incremental_ogg_demux_emits_discord_frames(self):
         import subprocess

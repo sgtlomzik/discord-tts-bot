@@ -164,6 +164,9 @@ class CircuitBreaker:
         self._consecutive_failures: int = 0
         self._opened_at: Optional[float] = None
         self._probe_outstanding: bool = False
+        # Set by trip(): a one-off cooldown (e.g. an exhausted quota) that
+        # replaces the configured one until the next success.
+        self._cooldown_override: Optional[float] = None
         # Clock injection point so tests can fast-forward through the
         # cooldown without sleeping the real wall clock.
         self._clock = clock or time.perf_counter
@@ -182,7 +185,11 @@ class CircuitBreaker:
         if self._state is not CircuitState.OPEN or self._opened_at is None:
             return 0.0
         elapsed = self._clock() - self._opened_at
-        return max(0.0, self._config.cooldown_seconds - elapsed)
+        cooldown = (
+            self._config.cooldown_seconds
+            if self._cooldown_override is None else self._cooldown_override
+        )
+        return max(0.0, cooldown - elapsed)
 
     def allow_request(self) -> bool:
         """Return True if a primary call should be attempted right now.
@@ -221,9 +228,21 @@ class CircuitBreaker:
         self._state = CircuitState.CLOSED
         self._opened_at = None
         self._probe_outstanding = False
+        self._cooldown_override = None
+
+    def trip(self, cooldown_seconds: float) -> None:
+        """Open immediately for ``cooldown_seconds`` (quota exhausted)."""
+        self._consecutive_failures += 1
+        self._state = CircuitState.OPEN
+        self._opened_at = self._clock()
+        self._probe_outstanding = False
+        self._cooldown_override = max(0.0, cooldown_seconds)
 
     def record_failure(self) -> None:
         self._consecutive_failures += 1
+        if self._state is CircuitState.OPEN and self._cooldown_override is not None:
+            return  # keep the longer trip() cooldown already in force
+        self._cooldown_override = None
         if self._state is CircuitState.HALF_OPEN:
             # The probe failed — back to OPEN with a fresh cooldown.
             self._state = CircuitState.OPEN
@@ -263,6 +282,8 @@ class PrimaryProvider(str, Enum):
 class DispatcherConfig:
     primary: PrimaryProvider = PrimaryProvider.LOCAL
     request_timeout_seconds: float = 2.5
+    # How long to stop calling MiniMax after a quota/balance error.
+    quota_cooldown_seconds: float = 1800.0
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +304,15 @@ class MiniMaxAuthError(MiniMaxError):
 
 class MiniMaxQuotaError(MiniMaxError):
     """HTTP 429 (rate-limited) or explicit quota status_code."""
+
+
+class MiniMaxQuotaExhaustedError(MiniMaxQuotaError):
+    """Balance or plan exhausted: retrying soon is pointless."""
+
+
+# 1008 insufficient balance, 2056 Token Plan usage limit.
+MINIMAX_EXHAUSTED_STATUS_CODES = frozenset({1008, 2056})
+MINIMAX_RATE_LIMIT_STATUS_CODES = frozenset({1039})
 
 
 class MiniMaxTimeoutError(MiniMaxError):
@@ -818,13 +848,7 @@ class MiniMaxProvider:
                 raise MiniMaxAuthError(
                     f"MiniMax auth failed (status_code={status_code}): {status_msg}"
                 )
-            if status_code == 2054:
-                raise MiniMaxVoiceNotFoundError(
-                    f"MiniMax voice id not exist (status_code=2054): {status_msg}"
-                )
-            raise MiniMaxError(
-                f"MiniMax status_code={status_code}: {status_msg}"
-            )
+            self._raise_for_status_code(status_code, status_msg)
 
         data = payload.get("data") or {}
         audio_hex = data.get("audio")
@@ -988,6 +1012,14 @@ class MiniMaxProvider:
             raise MiniMaxVoiceNotFoundError(
                 f"MiniMax voice id not exist (status_code=2054): {status_msg}"
             )
+        if status_code in MINIMAX_EXHAUSTED_STATUS_CODES:
+            raise MiniMaxQuotaExhaustedError(
+                f"MiniMax quota exhausted (status_code={status_code}): {status_msg}"
+            )
+        if status_code in MINIMAX_RATE_LIMIT_STATUS_CODES:
+            raise MiniMaxQuotaError(
+                f"MiniMax rate-limited (status_code={status_code}): {status_msg}"
+            )
         raise MiniMaxError(f"MiniMax status_code={status_code}: {status_msg}")
 
     async def stream_audio(
@@ -1069,6 +1101,21 @@ class MiniMaxProvider:
                     raise MiniMaxError(
                         f"MiniMax HTTP {response.status_code}: {excerpt}"
                     )
+                if response.headers.get("content-type", "").startswith("application/json"):
+                    # Errors (quota, auth, bad voice) come as one JSON body, not SSE.
+                    raw = await response.aread()
+                    try:
+                        base_resp = json.loads(raw).get("base_resp") or {}
+                    except (ValueError, AttributeError) as exc:
+                        raise MiniMaxError(
+                            f"MiniMax returned non-SSE body: {raw[:200]!r}"
+                        ) from exc
+                    status_code = int(base_resp.get("status_code", -1))
+                    if status_code != 0:
+                        self._raise_for_status_code(
+                            status_code, base_resp.get("status_msg", "") or "",
+                        )
+                    raise MiniMaxError("MiniMax returned JSON instead of an audio stream")
                 async for line in response.aiter_lines():
                     if not line or not line.startswith("data:"):
                         continue
@@ -1136,6 +1183,7 @@ def load_dispatcher_config_from_env() -> DispatcherConfig:
     return DispatcherConfig(
         primary=primary,
         request_timeout_seconds=max(0.1, timeout),
+        quota_cooldown_seconds=max(0.0, float(os.getenv("MINIMAX_QUOTA_COOLDOWN_SECONDS", "1800"))),
     )
 
 
@@ -1185,6 +1233,15 @@ class TTSDispatcher:
     @property
     def circuit_breaker(self) -> CircuitBreaker:
         return self._cb
+
+    def record_cloud_failure(self, exc: BaseException | None = None) -> None:
+        """Count a MiniMax failure; an exhausted quota opens the breaker long."""
+        if isinstance(exc, MiniMaxQuotaExhaustedError):
+            cooldown = self._config.quota_cooldown_seconds
+            log.warning("MiniMax quota exhausted; pausing MiniMax for %.0fs: %s", cooldown, exc)
+            self._cb.trip(cooldown)
+        else:
+            self._cb.record_failure()
 
     @property
     def cloud(self) -> Optional[TTSProvider]:
@@ -1279,7 +1336,7 @@ class TTSDispatcher:
                         "TTS provider %s failed (%s: %s); falling back to %s",
                         self._cloud.name, type(exc).__name__, exc, self._local.name,
                     )
-                    self._cb.record_failure()
+                    self.record_cloud_failure(exc)
             else:
                 log.debug(
                     "Circuit breaker open; skipping %s, using fallback Piper",
