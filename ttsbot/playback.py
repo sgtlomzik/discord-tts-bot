@@ -1,6 +1,6 @@
-"""Playback path for TTSBot: PCM preparation and the continuous player.
+"""Playback path for TTSBot: PCM or direct Opus into the continuous player.
 
-Turns prepared audio into 20ms frames and feeds the per-guild
+Feeds prepared 20 ms audio frames to the per-guild
 ContinuousTTSAudioSource (or the non-continuous FFmpeg file path when the
 continuous stream is disabled).
 """
@@ -16,6 +16,7 @@ import discord
 from ttsbot import config
 from ttsbot.audio import (
     ContinuousTTSAudioSource,
+    OPUS_SILENCE_FRAME,
     build_idle_pcm_frame,
     build_playback_prepare_command,
     build_tts_pcm_command,
@@ -27,7 +28,7 @@ log = logging.getLogger("tts_bot")
 
 
 class PlaybackMixin:
-    """PCM prep + continuous/file playback; mixed into TTSBot."""
+    """Continuous/file playback for PCM and Opus; mixed into TTSBot."""
 
     async def _playback_worker(self) -> None:
         await self.wait_until_ready()
@@ -70,7 +71,7 @@ class PlaybackMixin:
             await self._drain_channel(prepared)
             return
 
-        source = self.ensure_continuous_player(vc)
+        source: ContinuousTTSAudioSource | None = None
         first_ts: float | None = None
         total = 0
         while True:
@@ -79,7 +80,12 @@ class PlaybackMixin:
                 break
             if prepared.cancelled:
                 continue  # stop feeding but drain to the sentinel
-            source.enqueue_frames(batch)
+            if source is None:
+                source = self.ensure_continuous_player(
+                    vc, opus=prepared.codec == "opus", initial_frames=batch,
+                )
+            else:
+                source.enqueue_frames(batch)
             total += len(batch)
             if first_ts is None:
                 first_ts = time.perf_counter()
@@ -90,7 +96,7 @@ class PlaybackMixin:
                     prepared.provider or "?", pickup_ts - job.queued_at,
                     first_ts - job.message_ts, first_ts - job.queued_at,
                 )
-        if total == 0:
+        if total == 0 or source is None:
             return
         await source.wait_until_drained()
         log.info(
@@ -101,15 +107,26 @@ class PlaybackMixin:
         self.schedule_continuous_idle_stop(job.voice_channel.guild)
         self.schedule_idle_disconnect(job.voice_channel.guild)
 
-    def ensure_continuous_player(self, vc: discord.VoiceClient) -> ContinuousTTSAudioSource:
+    def ensure_continuous_player(
+        self, vc: discord.VoiceClient, *, opus: bool = False,
+        initial_frames: list[bytes] | None = None,
+    ) -> ContinuousTTSAudioSource:
         guild_id = vc.guild.id
         self.cancel_continuous_idle_stop(guild_id)
         source = self.continuous_sources.get(guild_id)
         source_created = False
-        if source is None or source.stopped:
-            source = ContinuousTTSAudioSource(build_idle_pcm_frame(config.TTS_IDLE_FRAME_MODE, config.TTS_IDLE_VOLUME_DB))
+        if source is None or source.stopped or source.is_opus() != opus:
+            if source is not None:
+                source.stop()
+            idle = OPUS_SILENCE_FRAME if opus else build_idle_pcm_frame(
+                config.TTS_IDLE_FRAME_MODE, config.TTS_IDLE_VOLUME_DB,
+            )
+            source = ContinuousTTSAudioSource(idle, opus=opus)
             self.continuous_sources[guild_id] = source
             source_created = True
+
+        if initial_frames:
+            source.enqueue_frames(initial_frames)
 
         if source_created and (vc.is_playing() or vc.is_paused()):
             log.warning("Stopping previous voice source before continuous stream guild=%s", guild_id)
@@ -118,17 +135,18 @@ class PlaybackMixin:
         if source_created or (not vc.is_playing() and not vc.is_paused()):
             vc.play(source)
             log.info(
-                "Continuous TTS stream started guild=%s mode=%s idle_volume_db=%s max_idle_seconds=%s",
+                "Continuous TTS stream started guild=%s codec=%s mode=%s idle_volume_db=%s max_idle_seconds=%s",
                 guild_id,
+                "opus" if opus else "pcm",
                 config.TTS_IDLE_FRAME_MODE,
                 config.TTS_IDLE_VOLUME_DB,
                 config.TTS_MAX_CONTINUOUS_IDLE_SECONDS,
             )
         return source
 
-    async def prepare_tts_pcm_frames(self, source: Path) -> list[bytes]:
+    async def prepare_tts_pcm_frames(self, source: Path, pitch: int = 0) -> list[bytes]:
         started = time.perf_counter()
-        cmd = build_tts_pcm_command(source)
+        cmd = build_tts_pcm_command(source, pitch)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -153,9 +171,9 @@ class PlaybackMixin:
         )
         return frames
 
-    async def prepare_playback_file(self, source: Path, prepared: Path) -> Path:
+    async def prepare_playback_file(self, source: Path, prepared: Path, pitch: int = 0) -> Path:
         started = time.perf_counter()
-        cmd = build_playback_prepare_command(source, prepared)
+        cmd = build_playback_prepare_command(source, prepared, pitch)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -185,7 +203,7 @@ class PlaybackMixin:
         )
         return prepared
 
-    async def play_file(self, vc: discord.VoiceClient, filename: Path) -> None:
+    async def play_file(self, vc: discord.VoiceClient, filename: Path, pitch: int = 0) -> None:
         if vc.is_playing() or vc.is_paused():
             log.warning("Voice client was already playing; stopping previous source")
             vc.stop()
@@ -210,7 +228,7 @@ class PlaybackMixin:
         playback_file = filename
         try:
             try:
-                playback_file = await self.prepare_playback_file(filename, prepared)
+                playback_file = await self.prepare_playback_file(filename, prepared, pitch)
             except Exception:
                 log.exception("Playback preparation failed; using source file")
 

@@ -69,6 +69,13 @@ class MiniMaxParams:
 @dataclass(frozen=True)
 class FishParams:
     reference_id: str = ""
+    model: str = ""  # empty: use the configured Fish model
+    speed: float = 1.0
+    volume_db: float = 0.0
+    pitch: int = 0
+    emotion: str = ""
+    temperature: float = 0.7
+    top_p: float = 0.7
 
 
 @dataclass(frozen=True)
@@ -157,7 +164,12 @@ def _record_to_dict(r: VoiceRecord) -> dict:
     if r.minimax is not None:
         out["minimax"] = _minimax_to_dict(r.minimax)
     if r.fish is not None:
-        out["fish"] = {"reference_id": r.fish.reference_id}
+        out["fish"] = {
+            "reference_id": r.fish.reference_id, "model": r.fish.model,
+            "speed": r.fish.speed, "volume_db": r.fish.volume_db,
+            "pitch": r.fish.pitch, "emotion": r.fish.emotion,
+            "temperature": r.fish.temperature, "top_p": r.fish.top_p,
+        }
     return out
 
 
@@ -206,6 +218,33 @@ def _minimax_from_dict(d: dict) -> MiniMaxParams:
     )
 
 
+def _fish_from_dict(d: dict) -> FishParams:
+    if not isinstance(d, dict):
+        d = {}
+    defaults = FishParams()
+
+    def number(key: str, default: float) -> float:
+        try:
+            return float(d[key]) if d.get(key) is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    try:
+        pitch = int(d.get("pitch", defaults.pitch))
+    except (TypeError, ValueError):
+        pitch = defaults.pitch
+    return FishParams(
+        reference_id=str(d.get("reference_id", "") or ""),
+        model=str(d.get("model", "") or ""),
+        speed=number("speed", defaults.speed),
+        volume_db=number("volume_db", defaults.volume_db),
+        pitch=pitch,
+        emotion=str(d.get("emotion", "") or ""),
+        temperature=number("temperature", defaults.temperature),
+        top_p=number("top_p", defaults.top_p),
+    )
+
+
 def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
     if not isinstance(d, dict):
         return None
@@ -219,10 +258,7 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
     minimax = (
         _minimax_from_dict(d.get("minimax", {})) if provider == PROVIDER_MINIMAX else None
     )
-    fish_data = d.get("fish") or {}
-    if not isinstance(fish_data, dict):
-        fish_data = {}
-    fish = FishParams(reference_id=str(fish_data.get("reference_id", "") or "")) if provider == PROVIDER_FISH else None
+    fish = _fish_from_dict(d.get("fish") or {}) if provider == PROVIDER_FISH else None
     if provider == PROVIDER_MINIMAX and not (minimax and minimax.voice_id):
         log.warning("voices.json: skipping minimax voice %r with no voice_id", name)
         return None

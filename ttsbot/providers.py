@@ -371,7 +371,7 @@ class TTSPhraseCache:
         if not cache_dir.exists():
             return
         try:
-            files = [p for suffix in ("mp3", "opus") for p in cache_dir.glob(f"*.{suffix}") if p.is_file()]
+            files = [p for suffix in ("mp3", "opus", "dopus") for p in cache_dir.glob(f"*.{suffix}") if p.is_file()]
         except OSError:
             log.warning("TTS cache: failed to scan %s", cache_dir, exc_info=True)
             return
@@ -494,7 +494,7 @@ class TTSPhraseCache:
         Used by the streaming path to write chunks directly to the final
         cache file (then ``commit_file`` registers it).
         """
-        if suffix not in {"mp3", "opus"}:
+        if suffix not in {"mp3", "opus", "dopus"}:
             raise ValueError(f"Unsupported cache suffix: {suffix}")
         return self._config.cache_dir / f"{self.hash_text(text, voice_name)}.{suffix}"
 
@@ -1223,8 +1223,10 @@ class TTSDispatcher:
             getattr(getattr(voice, "fish", None), "reference_id", "")
             or (self._fish.config.reference_id if self._fish is not None else "")
         )
+        fish_cfg = self._fish.config if want_fish else None
         voice_key = (
-            self._fish.config.cache_key(fish_ref) if want_fish else voice_cache_key(voice)
+            fish_cfg.cache_key(fish_ref, getattr(voice, "fish", None))
+            if want_fish else voice_cache_key(voice)
         )
 
         # 1. Cache hit short-circuits everything.
@@ -1237,7 +1239,10 @@ class TTSDispatcher:
 
         if want_fish and self._fish_cb.allow_request():
             try:
-                await self._fish.synthesize(text, filename, reference_id=fish_ref)
+                await self._fish.synthesize(
+                    text, filename, reference_id=fish_ref, params=getattr(voice, "fish", None),
+                    request_config=fish_cfg,
+                )
                 self._fish_cb.record_success()
                 self._maybe_cache(text, filename, voice_key, suffix="opus")
                 return "fish"

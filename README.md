@@ -17,9 +17,10 @@ MiniMax voices remain available. Cloud failures fall back to Piper.
   auto-disconnects when idle.
 - **Three TTS engines** — Fish Audio, MiniMax, and local Piper. Cloud failures
   fall back to Piper; repeated phrases use an on-disk LRU cache.
-- **Low latency** — Fish streams Ogg/Opus over HTTP into ffmpeg and the
-  existing PCM player before generation finishes. A keep-alive HTTP client
-  is reused, and the next message is synthesized while the previous plays.
+- **Low latency** — Fish streams Ogg/Opus over HTTP; the bot extracts 20 ms
+  Opus packets and sends them straight to Discord without decoding or
+  re-encoding. A keep-alive HTTP client is reused, and the next message is
+  synthesized while the previous plays.
 - **Smart message merging** — short bursts of messages from one user are
   merged into a single natural phrase (`selective_hold_v2`), while reactions,
   emoji and questions play immediately.
@@ -102,18 +103,35 @@ Everything is configured through environment variables — see
 For Fish, put `FISH_API_KEY` and `FISH_REFERENCE_ID` in `.env`, then select
 `/voicebot voice-set voice:fish-default`. Defaults are `s2.1-pro-free`,
 `opus`, `low`, `chunk_length=150`, and `opus_bitrate=48000`. Existing per-user
-voice assignments must be changed or cleared separately. Fish cache files
-use `.opus`; cache keys include the text, `reference_id`, model, and TTS settings.
+voice assignments must be changed or cleared separately. The direct playback
+cache stores Discord-ready packets in `.dopus`; older `.opus` files are
+converted on read without ffmpeg. Cache keys include the text, `reference_id`,
+model, and TTS settings.
 
 `/voicebot voice-clone` now creates a private Fish voice from an attached
 WAV/MP3/M4A/Opus sample. The bot waits for training, checks a short TTS
 generation, then saves its `reference_id` in `data/voices.json`. Assign it
 with `voice-set` or `voice-user`.
+Import a library voice with `/voicebot voice-fish-add name:my-voice
+reference_id:YOUR_ID`, then assign it with `/voicebot voice-user`.
+`/voicebot voice-fish-tune` configures speed, volume in dB, emotion,
+pitch, model, temperature, and top_p for each Fish voice. Set the global
+Fish latency mode in Discord with `/voicebot fish-latency mode:balanced`
+(`low`, `balanced`, or `normal`). Omit `mode` to show the current setting.
+The default is `low`; a Discord selection persists in `data/config.json`
+across restarts and overrides `FISH_LATENCY` from `.env`. The mode is included
+in TTS cache keys. Pitch is applied
+locally by ffmpeg and disables direct Opus playback for that profile. Packets
+with a non-20 ms duration also fall back to ffmpeg. The other controls use
+Fish TTS parameters. Voice tuning survives restarts and changes the cache key.
+`/voicebot stats` reports successful Fish requests and input characters for
+the current session; this is not Fish billing usage.
 
 ## Commands
 
 `/voicebot` group: `on`, `off`, `allow`, `deny`, `voices`, `voice-set`,
-`voice-user`, `voice-clear`, `voice-add`, `voice-clone`, `voice-tune`,
+`voice-user`, `voice-clear`, `voice-add`, `voice-fish-add`, `voice-clone`,
+`voice-tune`, `voice-fish-tune`, `fish-latency`,
 `voice-describe`, `voice-say-set`, `voice-say-clear`, `emoji-alias`,
 `emoji-aliases`, `emoji-alias-remove`, `status`, `stats`, `test`,
 `limit`, `queue-clear` — plus legacy `!tts join` / `!tts stop` text commands.

@@ -36,6 +36,14 @@ from ttsbot.audio import (
     build_tts_stream_pcm_command,
 )
 from ttsbot.models import PreparedAudio, TTSJob, VOICE_PROFILES, VoiceProfile
+from ttsbot.ogg_opus import (
+    FRAME_CACHE_MAGIC,
+    OggOpusDemuxer,
+    UnsupportedOpusStream,
+    read_frame_cache,
+    read_ogg_frames,
+    write_frame,
+)
 
 log = logging.getLogger("tts_bot")
 
@@ -51,6 +59,9 @@ def _voice_speed_factor(voice) -> float:
     mm = getattr(voice, "minimax", None)
     if getattr(voice, "is_minimax", False) and mm is not None:
         return max(float(getattr(mm, "speed", 1.0) or 1.0), 0.1)
+    fish = getattr(voice, "fish", None)
+    if getattr(voice, "is_fish", False) and fish is not None:
+        return max(float(getattr(fish, "speed", 1.0) or 1.0), 0.1)
     piper = getattr(voice, "piper", None)
     if piper is not None:
         length_scale = float(getattr(piper, "length_scale", 1.0) or 1.0)
@@ -671,9 +682,9 @@ class SynthesisPipelineMixin:
             # Always terminate the channel so the consumer never hangs.
             await prepared.channel.put(None)
 
-    async def _safe_pcm_frames(self, path: Path) -> list[bytes]:
+    async def _safe_pcm_frames(self, path: Path, pitch: int = 0) -> list[bytes]:
         try:
-            return await self.prepare_tts_pcm_frames(path)
+            return await self.prepare_tts_pcm_frames(path, pitch)
         except Exception:
             log.exception("PCM decode failed for %s", path)
             return []
@@ -714,23 +725,66 @@ class SynthesisPipelineMixin:
     async def _generate_fish_stream_into(self, prepared: PreparedAudio, voice) -> str:
         job = prepared.job
         fish = self.tts_dispatcher.fish
+        fish_cfg = fish.config
         cb = self.tts_dispatcher.fish_circuit_breaker
         cache = self.tts_dispatcher.cache
-        cache_key = fish.config.cache_key(voice.fish.reference_id)
+        ogg_cache_key = fish_cfg.cache_key(voice.fish.reference_id, voice.fish)
+        direct = voice.fish.pitch == 0
+        cache_key = f"{ogg_cache_key}:discord-opus-v1" if direct else ogg_cache_key
         if cache is not None:
             cached = cache.lookup(job.text, cache_key)
             if cached is not None:
-                frames = limit_pcm_frames(await self._safe_pcm_frames(cached), job.text, voice)
+                if direct:
+                    try:
+                        frames = limit_pcm_frames(list(read_frame_cache(cached)), job.text, voice)
+                    except (OSError, UnsupportedOpusStream):
+                        log.warning("Invalid Discord Opus cache file %s; regenerating", cached)
+                        frames = []
+                else:
+                    frames = limit_pcm_frames(
+                        await self._safe_pcm_frames(cached, voice.fish.pitch), job.text, voice,
+                    )
                 if frames and not prepared.cancelled:
+                    prepared.codec = "opus" if direct else "pcm"
                     await prepared.channel.put(frames)
                     prepared.provider = "cache"
                     return "cache"
+            if direct:
+                legacy = cache.lookup(job.text, ogg_cache_key)
+                if legacy is not None and legacy.suffix == ".opus":
+                    try:
+                        all_frames = read_ogg_frames(legacy)
+                    except (OSError, UnsupportedOpusStream):
+                        frames = []
+                    else:
+                        try:
+                            self._store_discord_frames(cache, job.text, cache_key, all_frames)
+                        except OSError:
+                            log.warning("Could not convert Fish cache file %s", legacy, exc_info=True)
+                        frames = limit_pcm_frames(all_frames, job.text, voice)
+                    if frames and not prepared.cancelled:
+                        prepared.codec = "opus"
+                        prepared.provider = "cache"
+                        await prepared.channel.put(frames)
+                        return "cache"
         if prepared.cancelled:
             return "cancelled"
         if not cb.allow_request():
             return "pre_audio"
         prepared.provider = "fish"
-        status, _ = await self._stream_fish_to_channel(prepared, voice, cache_key)
+        if direct:
+            status, _ = await self._stream_fish_opus_to_channel(
+                prepared, voice, cache_key, request_config=fish_cfg,
+            )
+            if status == "unsupported":
+                log.warning("Fish Opus packet incompatible with direct Discord playback; using ffmpeg")
+                status, _ = await self._stream_fish_to_channel(
+                    prepared, voice, ogg_cache_key, request_config=fish_cfg,
+                )
+        else:
+            status, _ = await self._stream_fish_to_channel(
+                prepared, voice, ogg_cache_key, request_config=fish_cfg,
+            )
         if status == "pre_audio":
             cb.record_failure()
         elif status == "ok":
@@ -738,6 +792,23 @@ class SynthesisPipelineMixin:
         elif status != "cancelled":
             cb.record_failure()
         return status
+
+    @staticmethod
+    def _store_discord_frames(cache, text: str, cache_key: str, frames: list[bytes]) -> None:
+        if not frames:
+            return
+        final = cache.cache_path_for(text, cache_key, "dopus")
+        final.parent.mkdir(parents=True, exist_ok=True)
+        part = final.parent / f"{final.stem}.{uuid.uuid4().hex}.tmp"
+        try:
+            with part.open("wb") as output:
+                output.write(FRAME_CACHE_MAGIC)
+                for packet in frames:
+                    write_frame(output, packet)
+            os.replace(part, final)
+            cache.commit_file(text, final, cache_key)
+        finally:
+            part.unlink(missing_ok=True)
 
     async def _generate_file_into(self, prepared: PreparedAudio, voice) -> None:
         if prepared.cancelled:
@@ -750,7 +821,8 @@ class SynthesisPipelineMixin:
             )
             if prepared.cancelled:
                 return
-            frames = limit_pcm_frames(await self._safe_pcm_frames(filename), job.text, voice)
+            pitch = voice.fish.pitch if getattr(voice, "is_fish", False) and prepared.provider in {"fish", "cache"} else 0
+            frames = limit_pcm_frames(await self._safe_pcm_frames(filename, pitch), job.text, voice)
             if frames:
                 await prepared.channel.put(frames)
         finally:
@@ -769,10 +841,115 @@ class SynthesisPipelineMixin:
         )
         return await self._decode_stream_to_channel(prepared, voice, agen, "mp3", voice.name, "mp3")
 
-    async def _stream_fish_to_channel(self, prepared: PreparedAudio, voice, cache_key: str) -> tuple[str, int]:
+    async def _stream_fish_opus_to_channel(
+        self, prepared: PreparedAudio, voice, cache_key: str, *, request_config=None,
+    ) -> tuple[str, int]:
+        """Demux Fish Ogg directly into Discord-ready 20 ms Opus packets."""
+        job = prepared.job
+        agen = self.tts_dispatcher.fish.stream_audio(
+            job.text, reference_id=voice.fish.reference_id, params=voice.fish,
+            request_config=request_config,
+        )
+        demuxer = OggOpusDemuxer()
+        frame_limit = playback_frame_limit(job.text, voice)
+        frames_count = 0
+        limit_hit = False
+        status = "ok"
+        cache = self.tts_dispatcher.cache
+        cache_final: Path | None = None
+        part_path: Path | None = None
+        cache_part = None
+        if cache is not None:
+            try:
+                cache_final = cache.cache_path_for(job.text, cache_key, "dopus")
+                cache_final.parent.mkdir(parents=True, exist_ok=True)
+                part_path = cache_final.parent / f"{cache_final.stem}.{uuid.uuid4().hex}.tmp"
+                cache_part = part_path.open("wb")
+                cache_part.write(FRAME_CACHE_MAGIC)
+            except OSError:
+                cache_final = part_path = cache_part = None
+
+        async def consume(chunk: bytes) -> None:
+            nonlocal frames_count, limit_hit, cache_part
+            packets = demuxer.feed(chunk)
+            if frame_limit is not None and frames_count + len(packets) > frame_limit:
+                packets = packets[:max(0, frame_limit - frames_count)]
+                limit_hit = True
+            if not packets:
+                return
+            prepared.codec = "opus"
+            if frames_count == 0:
+                log.info(
+                    "Fish direct first packet guild=%s message_to_packet_s=%.3f",
+                    job.guild_id, time.perf_counter() - job.message_ts,
+                )
+            if cache_part is not None:
+                try:
+                    for packet in packets:
+                        write_frame(cache_part, packet)
+                except OSError:
+                    cache_part.close()
+                    cache_part = None
+            await prepared.channel.put(packets)
+            frames_count += len(packets)
+
+        try:
+            try:
+                first_chunk = await asyncio.wait_for(
+                    agen.__anext__(), timeout=config.TTS_STREAM_TTFA_TIMEOUT,
+                )
+            except (StopAsyncIteration, asyncio.TimeoutError):
+                status = "pre_audio"
+            else:
+                await consume(first_chunk)
+                if not limit_hit:
+                    async for chunk in agen:
+                        if prepared.cancelled:
+                            status = "cancelled"
+                            break
+                        await consume(chunk)
+                        if limit_hit:
+                            break
+                if status == "ok" and not limit_hit:
+                    demuxer.finish()
+        except UnsupportedOpusStream as exc:
+            log.warning("Fish direct Opus stream rejected after %d packets: %s", frames_count, exc)
+            status = "truncated" if frames_count else "unsupported"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Fish direct Opus stream failed after %d packets: %s", frames_count, exc)
+            status = "truncated" if frames_count else "pre_audio"
+        finally:
+            await agen.aclose()
+            if cache_part is not None:
+                cache_part.close()
+
+        if prepared.cancelled:
+            status = "cancelled"
+        elif limit_hit:
+            status = "truncated"
+            log.warning("Fish direct audio length limit hit guild=%s frames=%d", job.guild_id, frames_count)
+        elif status == "ok" and frames_count == 0:
+            status = "pre_audio"
+        if part_path is not None:
+            if status == "ok" and cache_final is not None and cache_part is not None:
+                try:
+                    os.replace(part_path, cache_final)
+                    cache.commit_file(job.text, cache_final, cache_key)
+                except OSError:
+                    part_path.unlink(missing_ok=True)
+            else:
+                part_path.unlink(missing_ok=True)
+        return status, frames_count
+
+    async def _stream_fish_to_channel(
+        self, prepared: PreparedAudio, voice, cache_key: str, *, request_config=None,
+    ) -> tuple[str, int]:
         """Stream Fish Ogg/Opus into the shared incremental decoder."""
         agen = self.tts_dispatcher.fish.stream_audio(
-            prepared.job.text, reference_id=voice.fish.reference_id,
+            prepared.job.text, reference_id=voice.fish.reference_id, params=voice.fish,
+            request_config=request_config,
         )
         return await self._decode_stream_to_channel(prepared, voice, agen, "ogg", cache_key, "opus")
 
@@ -810,7 +987,10 @@ class SynthesisPipelineMixin:
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                *build_tts_stream_pcm_command(input_format),
+                *build_tts_stream_pcm_command(
+                    input_format,
+                    voice.fish.pitch if input_format == "ogg" and getattr(voice, "is_fish", False) else 0,
+                ),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -992,7 +1172,7 @@ class SynthesisPipelineMixin:
                 tts_task = asyncio.create_task(self.generate_tts_file(job.text, filename, file_voice_name))
 
                 try:
-                    vc, _ = await asyncio.gather(connect_task, tts_task)
+                    vc, provider_used = await asyncio.gather(connect_task, tts_task)
                 except Exception:
                     connect_error = connect_task.exception() if connect_task.done() else None
                     tts_error = tts_task.exception() if tts_task.done() else None
@@ -1023,14 +1203,19 @@ class SynthesisPipelineMixin:
                 )
 
                 try:
+                    file_voice = (
+                        self.voice_registry.get(file_voice_name)
+                        or self.voice_registry.fallback_record()
+                    )
+                    pitch = (
+                        file_voice.fish.pitch
+                        if getattr(file_voice, "is_fish", False) and provider_used in {"fish", "cache"}
+                        else 0
+                    )
                     if config.TTS_CONTINUOUS_STREAM:
                         source = self.ensure_continuous_player(vc)
-                        file_voice = (
-                            self.voice_registry.get(file_voice_name)
-                            or self.voice_registry.fallback_record()
-                        )
                         frames = limit_pcm_frames(
-                            await self.prepare_tts_pcm_frames(filename), job.text, file_voice
+                            await self.prepare_tts_pcm_frames(filename, pitch), job.text, file_voice
                         )
                         audio_enqueue_ts = time.perf_counter()
                         source.enqueue_frames(frames)
@@ -1051,7 +1236,7 @@ class SynthesisPipelineMixin:
                             playback_request_ts - job.message_ts,
                             playback_request_ts - job.queued_at,
                         )
-                        await self.play_file(vc, filename)
+                        await self.play_file(vc, filename, pitch)
                 except Exception:
                     log.exception("Playback failed; disconnecting voice")
                     await self.disconnect_guild_voice(job.voice_channel.guild)

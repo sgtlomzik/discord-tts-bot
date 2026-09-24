@@ -19,9 +19,10 @@ Self-hosted Discord-бот, который озвучивает сообщени
 - **Три TTS-движка** — Fish Audio, MiniMax и локальный Piper. При сбое
   облака circuit breaker переключает на Piper; повторяющиеся фразы берутся
   из LRU-кэша на диске.
-- **Низкая задержка** — Fish отдаёт Ogg/Opus по HTTP, ffmpeg декодирует
-  поток в PCM во время генерации, а следующее сообщение синтезируется,
-  пока играет предыдущее. Один HTTP-клиент держит соединение открытым.
+- **Низкая задержка** — Fish отдаёт Ogg/Opus по HTTP; бот извлекает 20-мс
+  Opus-пакеты и сразу передаёт их в Discord без декодирования и повторного
+  кодирования. Следующее сообщение синтезируется, пока играет предыдущее.
+  Один HTTP-клиент держит соединение открытым.
 - **Умная склейка сообщений** — серия коротких сообщений одного человека
   объединяется в одну естественную фразу (`selective_hold_v2`), а реакции,
   эмодзи и вопросы озвучиваются сразу.
@@ -106,18 +107,39 @@ python bot.py
 `s2.1-pro-free`, `opus`, `low`, `chunk_length=150`, `opus_bitrate=48000`.
 На сервере с существующими персональными назначениями голосов смените
 их отдельно через `/voicebot voice-user` или очистите через
-`/voicebot voice-clear`. Кэш Fish хранит `.opus`, ключ включает текст,
-`reference_id`, модель и настройки генерации.
+`/voicebot voice-clear`. Кэш прямого воспроизведения хранит готовые пакеты
+в `.dopus`; прежние файлы `.opus` преобразуются при чтении без ffmpeg.
+Ключ включает текст, `reference_id`, модель и настройки генерации.
 
 `/voicebot voice-clone` теперь создаёт приватный голос Fish из приложенного
 аудиофайла (WAV/MP3/M4A/Opus). Бот дожидается готовности модели, проверяет
 короткую генерацию и сохраняет новый `reference_id` в `data/voices.json`.
 Созданный профиль можно назначить через `voice-set` или `voice-user`.
+Готовый голос из библиотеки Fish можно добавить без клонирования:
+`/voicebot voice-fish-add name:my-voice reference_id:ID_ИЗ_FISH`, затем
+`/voicebot voice-user user:@пользователь voice:my-voice`.
+Для добавления и назначения нужны права управления сервером. Бот проверяет
+голос короткой озвучкой перед сохранением.
+Настройка Fish: `/voicebot voice-fish-tune name:my-voice speed:1.2
+emotion:happy pitch:2 volume_db:3`. Доступны также `model`, `temperature`
+и `top_p`. Общий для всех Fish-голосов режим задержки меняется в Discord:
+`/voicebot fish-latency mode:balanced` (варианты `low`, `balanced`, `normal`).
+Без `mode` команда показывает текущий режим. По умолчанию используется `low`;
+выбор в Discord сохраняется в `data/config.json`, переживает перезапуск и
+переопределяет `FISH_LATENCY` из `.env`. Режим учитывается в ключе TTS-кэша.
+Скорость, громкость, выразительность и режим задержки передаются в Fish API;
+высота тона меняется локально через ffmpeg и отключает прямой Opus-путь
+для этого профиля. Если Fish выдаст пакеты другой длительности, бот также
+использует ffmpeg. Автоэмоция выбирается по тексту
+сообщения. Параметры профиля сохраняются при перезапуске и учитываются в кэше.
+`/voicebot stats` показывает число успешных запросов Fish и символов в них
+за текущую сессию; это счётчик входного текста, а не биллинг Fish.
 
 ## Команды
 
 Группа `/voicebot`: `on`, `off`, `allow`, `deny`, `voices`, `voice-set`,
-`voice-user`, `voice-clear`, `voice-add`, `voice-clone`, `voice-tune`,
+`voice-user`, `voice-clear`, `voice-add`, `voice-fish-add`, `voice-clone`,
+`voice-tune`, `voice-fish-tune`, `fish-latency`,
 `voice-describe`, `voice-say-set`, `voice-say-clear`, `emoji-alias`,
 `emoji-aliases`, `emoji-alias-remove`, `status`, `stats`, `test`,
 `limit`, `queue-clear` — плюс легаси-команды `!tts join` / `!tts stop`.
