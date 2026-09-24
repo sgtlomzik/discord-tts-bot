@@ -47,8 +47,8 @@ class TTSJob:
 class PreparedAudio:
     """A job whose audio is being (or has been) generated ahead of playback.
 
-    The generation worker fills ``channel`` with batches of 20ms PCM frames
-    (``list[bytes]``) and ends it with a ``None`` sentinel. The playback
+    The generation worker fills ``channel`` with batches of 20ms PCM or Opus frames
+    (``list[bytes]`` of PCM or raw Opus) and ends it with a ``None`` sentinel. The playback
     worker drains ``channel`` into the continuous player in order. ``cancelled``
     is set by ``queue-clear`` to stop generation/playback of this item.
     """
@@ -56,6 +56,7 @@ class PreparedAudio:
     channel: asyncio.Queue
     cancelled: bool = False
     provider: str = ""
+    codec: str = "pcm"
 
 
 # Hardcoded Piper profiles. This dict is mutated IN PLACE by

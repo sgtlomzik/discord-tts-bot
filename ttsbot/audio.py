@@ -17,6 +17,7 @@ from pathlib import Path
 import discord
 
 from ttsbot import config
+from ttsbot.ogg_opus import require_discord_frame
 
 log = logging.getLogger("tts_bot")
 
@@ -25,6 +26,7 @@ PCM_CHANNELS = 2
 PCM_SAMPLE_WIDTH = 2
 PCM_FRAME_MS = 20
 PCM_FRAME_BYTES = int(PCM_SAMPLE_RATE * PCM_FRAME_MS / 1000) * PCM_CHANNELS * PCM_SAMPLE_WIDTH
+OPUS_SILENCE_FRAME = bytes((0xF8, 0xFF, 0xFE))  # 20 ms, 960 samples at 48 kHz
 
 
 def load_opus() -> bool:
@@ -57,6 +59,7 @@ def build_preroll_lavfi_source(mode: str, duration: str) -> str:
 def build_playback_filter_complex(
     trim_silence: bool,
     preroll_volume_db: float,
+    pitch: int = 0,
 ) -> str:
     speech_filters = ["aformat=sample_rates=48000:channel_layouts=stereo"]
     if trim_silence:
@@ -65,6 +68,8 @@ def build_playback_filter_complex(
             "start_periods=1:start_silence=0.03:start_threshold=-50dB:"
             "stop_periods=-1:stop_duration=0.12:stop_threshold=-50dB"
         )
+
+    speech_filters.extend(_pitch_filters(pitch))
 
     return ";".join(
         [
@@ -81,10 +86,12 @@ def build_playback_filter_complex(
     )
 
 
-def build_playback_prepare_command(source: Path, prepared: Path) -> list[str]:
+def build_playback_prepare_command(source: Path, prepared: Path, pitch: int = 0) -> list[str]:
     preroll_seconds = seconds_from_ms(config.TTS_PREROLL_MS)
     tail_seconds = seconds_from_ms(config.TTS_SILENCE_TAIL_MS)
-    filter_complex = build_playback_filter_complex(config.TTS_TRIM_SILENCE, config.TTS_PREROLL_VOLUME_DB)
+    filter_complex = build_playback_filter_complex(
+        config.TTS_TRIM_SILENCE, config.TTS_PREROLL_VOLUME_DB, pitch,
+    )
 
     return [
         "ffmpeg",
@@ -116,7 +123,19 @@ def build_playback_prepare_command(source: Path, prepared: Path) -> list[str]:
     ]
 
 
-def build_tts_pcm_command(source: Path) -> list[str]:
+def _pitch_filters(pitch: int) -> list[str]:
+    if not pitch:
+        return []
+    factor = 2 ** (pitch / 12)
+    return [
+        "aresample=48000",
+        f"asetrate={round(48000 * factor)}",
+        "aresample=48000",
+        f"atempo={1 / factor:.8f}",
+    ]
+
+
+def build_tts_pcm_command(source: Path, pitch: int = 0) -> list[str]:
     audio_filters: list[str] = ["aformat=sample_rates=48000:channel_layouts=stereo"]
     if config.TTS_TRIM_SILENCE:
         audio_filters.append(
@@ -124,6 +143,7 @@ def build_tts_pcm_command(source: Path) -> list[str]:
             "start_periods=1:start_silence=0.03:start_threshold=-50dB:"
             "stop_periods=-1:stop_duration=0.12:stop_threshold=-50dB"
         )
+    audio_filters.extend(_pitch_filters(pitch))
 
     return [
         "ffmpeg",
@@ -145,7 +165,7 @@ def build_tts_pcm_command(source: Path) -> list[str]:
     ]
 
 
-def build_tts_stream_pcm_command(input_format: str = "mp3") -> list[str]:
+def build_tts_stream_pcm_command(input_format: str = "mp3", pitch: int = 0) -> list[str]:
     """Decode streaming MP3 or Ogg/Opus on stdin to s16le 48k stereo.
 
     Used by the streaming path: compressed chunks are written to stdin and
@@ -165,7 +185,7 @@ def build_tts_stream_pcm_command(input_format: str = "mp3") -> list[str]:
         "pipe:0",
         "-vn",
         "-af",
-        "aformat=sample_rates=48000:channel_layouts=stereo",
+        ",".join(["aformat=sample_rates=48000:channel_layouts=stereo", *_pitch_filters(pitch)]),
         "-f",
         "s16le",
         "-ar",
@@ -203,8 +223,11 @@ def build_idle_pcm_frame(mode: str, volume_db: float) -> bytes:
 
 
 class ContinuousTTSAudioSource(discord.AudioSource):
-    def __init__(self, idle_frame: bytes) -> None:
+    def __init__(self, idle_frame: bytes, *, opus: bool = False) -> None:
         self.idle_frame = idle_frame
+        self._opus = opus
+        if opus:
+            require_discord_frame(idle_frame)
         self.frames: thread_queue.Queue[bytes] = thread_queue.Queue()
         self._stopped = threading.Event()
         self._drained = threading.Event()
@@ -228,17 +251,20 @@ class ContinuousTTSAudioSource(discord.AudioSource):
         return frame
 
     def is_opus(self) -> bool:
-        return False
+        return self._opus
 
     def enqueue_frames(self, frames: list[bytes]) -> None:
         if not frames:
             return
+        for frame in frames:
+            if self._opus:
+                require_discord_frame(frame)
+            elif len(frame) != PCM_FRAME_BYTES:
+                raise ValueError(f"PCM frame must be {PCM_FRAME_BYTES} bytes, got {len(frame)}")
         with self._lock:
             self._pending_frames += len(frames)
             self._drained.clear()
         for frame in frames:
-            if len(frame) != PCM_FRAME_BYTES:
-                raise ValueError(f"PCM frame must be {PCM_FRAME_BYTES} bytes, got {len(frame)}")
             self.frames.put(frame)
 
     async def wait_until_drained(self, timeout: float | None = None) -> bool:

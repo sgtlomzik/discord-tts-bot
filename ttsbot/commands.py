@@ -90,6 +90,18 @@ _MODEL_CHOICES = [
     app_commands.Choice(name="02 Turbo", value="speech-02-turbo"),
 ]
 
+_FISH_MODEL_CHOICES = [
+    app_commands.Choice(name="S2.1 Pro Free", value="s2.1-pro-free"),
+    app_commands.Choice(name="S2.1 Pro", value="s2.1-pro"),
+    app_commands.Choice(name="S2 Pro", value="s2-pro"),
+]
+
+_FISH_LATENCY_CHOICES = [
+    app_commands.Choice(name="low (минимальная задержка)", value="low"),
+    app_commands.Choice(name="balanced (баланс скорости и качества)", value="balanced"),
+    app_commands.Choice(name="normal (максимальное качество)", value="normal"),
+]
+
 
 def _render_emoji(guild: discord.Guild | None, emoji_id: str, name: str) -> str:
     """Render a stored alias's emoji: prefer the live guild emoji object (so
@@ -372,6 +384,79 @@ def build_commands(bot):
         )
 
 
+    @tts_group.command(name="voice-fish-add", description="Добавить готовый голос Fish по reference_id")
+    @app_commands.describe(
+        name="Имя профиля (строчные буквы, цифры и дефис)",
+        reference_id="ID голоса из библиотеки Fish Audio",
+        description="Описание (необязательно)",
+    )
+    async def slash_tts_voice_fish_add(
+        interaction: discord.Interaction,
+        name: str,
+        reference_id: str,
+        description: str = "",
+    ) -> None:
+        if not await require_guild_manager(interaction):
+            return
+        name = name.strip().lower()
+        reference_id = reference_id.strip()
+        if not voice_registry.valid_voice_name(name):
+            await interaction.response.send_message(
+                "Имя должно состоять из строчных букв, цифр и дефисов.", ephemeral=True,
+            )
+            return
+        if name in bot.voice_registry:
+            await interaction.response.send_message(
+                f"Голос `{name}` уже существует. Выберите другое имя.", ephemeral=True,
+            )
+            return
+        if not reference_id or len(reference_id) > 128 or any(ch.isspace() for ch in reference_id):
+            await interaction.response.send_message(
+                "Укажите Fish reference_id из библиотеки.", ephemeral=True,
+            )
+            return
+        fish = bot.tts_dispatcher.fish
+        if fish is None:
+            await interaction.response.send_message(
+                "Fish Audio не настроен (нет FISH_API_KEY).", ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        probe = config.TMP_DIR / f"fish_import_{uuid.uuid4().hex}.opus"
+        try:
+            await fish.synthesize("Проверка голоса.", probe, reference_id=reference_id)
+            with probe.open("rb") as audio:
+                if audio.read(4) != b"OggS":
+                    raise ValueError("Fish не вернул аудио Ogg/Opus")
+        except Exception as exc:
+            await interaction.followup.send(
+                f"Голос недоступен для озвучки: {type(exc).__name__}: {exc}", ephemeral=True,
+            )
+            return
+        finally:
+            probe.unlink(missing_ok=True)
+        record = voice_registry.VoiceRecord(
+            name=name,
+            label=f"{name} (Fish)",
+            description=description.strip(),
+            provider=voice_registry.PROVIDER_FISH,
+            fish=voice_registry.FishParams(reference_id=reference_id),
+        )
+        if name in bot.voice_registry:
+            await interaction.followup.send(f"Голос `{name}` уже существует.", ephemeral=True)
+            return
+        bot.voice_registry.add(record)
+        try:
+            bot.persist_voice_registry()
+        except OSError as exc:
+            bot.voice_registry.voices.pop(name, None)
+            await interaction.followup.send(f"Не удалось сохранить голос: {exc}", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"Добавлен голос `{name}` (Fish reference_id=`{reference_id}`). "
+            f"Назначьте его через `/voicebot voice-user`.", ephemeral=True,
+        )
+
     @tts_group.command(name="voice-clone", description="Клонировать голос в Fish Audio из аудиофайла")
     @app_commands.describe(
         name="Имя профиля (kebab-case: a-z, 0-9, дефис)",
@@ -472,6 +557,93 @@ def build_commands(bot):
             f"Описание `{name}` обновлено.", ephemeral=True
         )
 
+
+    @tts_group.command(name="voice-fish-tune", description="Настроить голос Fish Audio")
+    @app_commands.describe(
+        name="Имя Fish-профиля",
+        emotion="Эмоция (auto = подбор по сообщению, none = без метки)",
+        speed="Скорость речи 0.5–2.0",
+        pitch="Высота тона -12..12 полутонов (обработка ffmpeg)",
+        volume_db="Громкость в децибелах -20..20",
+        model="Модель Fish Audio",
+        temperature="Выразительность 0–1",
+        top_p="Разнообразие 0–1",
+    )
+    @app_commands.autocomplete(name=voice_profile_autocomplete)
+    @app_commands.choices(emotion=_EMOTION_CHOICES, model=_FISH_MODEL_CHOICES)
+    async def slash_tts_voice_fish_tune(
+        interaction: discord.Interaction,
+        name: str,
+        emotion: app_commands.Choice[str] | None = None,
+        speed: app_commands.Range[float, 0.5, 2.0] | None = None,
+        pitch: app_commands.Range[int, -12, 12] | None = None,
+        volume_db: app_commands.Range[float, -20.0, 20.0] | None = None,
+        model: app_commands.Choice[str] | None = None,
+        temperature: app_commands.Range[float, 0.0, 1.0] | None = None,
+        top_p: app_commands.Range[float, 0.0, 1.0] | None = None,
+    ) -> None:
+        if not await require_guild_manager(interaction):
+            return
+        name = name.strip().lower()
+        rec = bot.voice_registry.get(name)
+        if rec is None or not rec.is_fish or rec.fish is None:
+            await interaction.response.send_message(
+                f"Fish-голос `{name}` не найден. Список: `/voicebot voices`.", ephemeral=True,
+            )
+            return
+        if all(value is None for value in (emotion, speed, pitch, volume_db, model, temperature, top_p)):
+            await interaction.response.send_message(
+                "Укажите хотя бы один параметр настройки.", ephemeral=True,
+            )
+            return
+        old = rec.fish
+        tuned = replace(
+            old,
+            emotion=old.emotion if emotion is None else ("" if emotion.value == "none" else emotion.value),
+            speed=old.speed if speed is None else float(speed),
+            pitch=old.pitch if pitch is None else int(pitch),
+            volume_db=old.volume_db if volume_db is None else float(volume_db),
+            model=old.model if model is None else model.value,
+            temperature=old.temperature if temperature is None else float(temperature),
+            top_p=old.top_p if top_p is None else float(top_p),
+        )
+        bot.voice_registry.add(replace(rec, fish=tuned))
+        try:
+            bot.persist_voice_registry()
+        except OSError as exc:
+            bot.voice_registry.add(rec)
+            await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Fish-голос `{name}` настроен: эмоция `{tuned.emotion or 'без метки'}`, "
+            f"скорость `{tuned.speed}`, тон `{tuned.pitch}`, громкость `{tuned.volume_db} dB`, "
+            f"модель `{tuned.model or (bot.tts_dispatcher.fish.config.model if bot.tts_dispatcher.fish else 's2.1-pro-free')}`, "
+            f"temperature `{tuned.temperature}`, top_p `{tuned.top_p}`.",
+            ephemeral=True,
+        )
+
+    @tts_group.command(name="fish-latency", description="Сменить режим задержки Fish для всего бота")
+    @app_commands.describe(mode="low / balanced / normal; пусто — показать текущий режим")
+    @app_commands.choices(mode=_FISH_LATENCY_CHOICES)
+    async def slash_tts_fish_latency(
+        interaction: discord.Interaction,
+        mode: app_commands.Choice[str] | None = None,
+    ) -> None:
+        if not await require_guild_manager(interaction):
+            return
+        if mode is not None:
+            try:
+                bot.set_fish_latency(mode.value)
+            except (OSError, ValueError) as exc:
+                await interaction.response.send_message(
+                    f"Не удалось сохранить режим Fish: {exc}", ephemeral=True,
+                )
+                return
+        current = bot.fish_latency
+        await interaction.response.send_message(
+            f"Fish latency: `{current}` для всех Fish-голосов. "
+            "Следующие генерации используют этот режим.", ephemeral=True,
+        )
 
     @tts_group.command(
         name="voice-tune", description="Настроить выразительность голоса (MiniMax)"
@@ -657,6 +829,7 @@ def build_commands(bot):
         cache = getattr(disp, "cache", None)
         cb = getattr(disp, "circuit_breaker", None)
         cloud = getattr(disp, "cloud", None)
+        fish = getattr(disp, "fish", None)
         embed = discord.Embed(title="📊 TTS • Статистика", color=0x5865F2)
         if cache is not None:
             hits, misses = cache.hits, cache.misses
@@ -671,8 +844,15 @@ def build_commands(bot):
         else:
             embed.add_field(name="Кэш", value="выключен", inline=False)
         embed.add_field(name="Очередь", value=str(bot.message_queue.qsize()), inline=True)
-        state = cb.state.value if cb is not None else "—"
+        active_cb = getattr(disp, "fish_circuit_breaker", None) if fish is not None else cb
+        state = active_cb.state.value if active_cb is not None else "—"
         embed.add_field(name="Circuit breaker", value=f"`{state}`", inline=True)
+        if fish is not None:
+            embed.add_field(
+                name="Fish запросы / символы (сессия)",
+                value=f"{_fmt_int(fish.session_requests)} / {_fmt_int(fish.session_chars)}",
+                inline=True,
+            )
         chars = getattr(cloud, "session_chars", None)
         embed.add_field(
             name="MiniMax символы (сессия)",
@@ -698,6 +878,7 @@ def build_commands(bot):
             inline=True,
         )
         embed.add_field(name="Лимит символов", value=str(config.TTS_MAX_CHARS), inline=True)
+        embed.add_field(name="Fish latency", value=f"`{bot.fish_latency}`", inline=True)
         if config.TTS_AUDIO_LIMIT_ENABLED:
             audio_limit = (
                 f"{config.TTS_AUDIO_CHARS_PER_SECOND:g} симв/с × "
@@ -734,8 +915,11 @@ def build_commands(bot):
                 extra = f" · {rec.minimax.model}"
                 if rec.minimax.emotion:
                     extra += f" · {rec.minimax.emotion}"
-            elif rec.is_fish and bot.tts_dispatcher.fish is not None:
-                extra = f" · {bot.tts_dispatcher.fish.config.model}"
+            elif rec.is_fish and rec.fish is not None:
+                configured = bot.tts_dispatcher.fish.config.model if bot.tts_dispatcher.fish else "s2.1-pro-free"
+                extra = f" · {rec.fish.model or configured}"
+                if rec.fish.emotion:
+                    extra += f" · {rec.fish.emotion}"
             lines.append(f"`{name}` [{tag}]{extra}")
         if lines:
             embed.add_field(name="Список", value="\n".join(lines)[:1000], inline=False)

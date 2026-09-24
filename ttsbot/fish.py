@@ -50,19 +50,41 @@ class FishConfig:
             raise ValueError("FISH_OPUS_BITRATE must be 24000, 32000, 48000, or 64000")
         return cfg
 
-    def cache_key(self, reference_id: str) -> str:
+    def cache_key(self, reference_id: str, params: object | None = None) -> str:
         """Include every Fish setting that can change the resulting audio."""
         data = {
-            "provider": "fish", "reference_id": reference_id, "model": self.model,
+            "provider": "fish", "reference_id": reference_id,
+            "model": getattr(params, "model", "") or self.model,
             "format": self.format, "latency": self.latency,
             "chunk_length": self.chunk_length, "opus_bitrate": self.opus_bitrate,
             "sample_rate": self.sample_rate, "normalize": self.normalize,
+            "speed": getattr(params, "speed", 1.0),
+            "volume_db": getattr(params, "volume_db", 0.0),
+            "pitch": getattr(params, "pitch", 0),
+            "emotion": getattr(params, "emotion", ""),
+            "temperature": getattr(params, "temperature", 0.7),
+            "top_p": getattr(params, "top_p", 0.7),
         }
         return "fish:" + hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
-
 class FishError(RuntimeError):
     pass
+
+
+def fish_tts_text(text: str, emotion: str) -> str:
+    """Apply S2 emotion cues after Discord text normalization."""
+    if emotion == "auto":
+        letters = [ch for ch in text if ch.isalpha()]
+        if len(letters) >= 4 and all(ch.isupper() for ch in letters):
+            emotion = "angry"
+        elif "?!" in text or "!?" in text:
+            emotion = "surprised"
+        elif text.rstrip().endswith("!"):
+            emotion = "happy"
+        else:
+            emotion = ""
+    emotion = {"fearful": "scared", "neutral": "indifferent"}.get(emotion, emotion)
+    return f"[{emotion}] {text}" if emotion else text
 
 
 @dataclass
@@ -88,6 +110,17 @@ class FishProvider:
         )
         self._flights: dict[str, _Flight] = {}
         self._flight_lock = asyncio.Lock()
+        self._session_requests = 0
+        self._session_chars = 0
+
+    @property
+    def session_requests(self) -> int:
+        return self._session_requests
+
+    @property
+    def session_chars(self) -> int:
+        """Input characters in successful Fish requests, not billed usage."""
+        return self._session_chars
 
     async def aclose(self) -> None:
         async with self._flight_lock:
@@ -99,10 +132,12 @@ class FishProvider:
         if self._owns_client:
             await self._client.aclose()
 
-    async def _produce(self, flight: _Flight, text: str, reference_id: str) -> None:
-        cfg = self.config
+    async def _produce(
+        self, flight: _Flight, text: str, reference_id: str,
+        params: object | None, cfg: FishConfig,
+    ) -> None:
         body = {
-            "text": text,
+            "text": fish_tts_text(text, getattr(params, "emotion", "")),
             "reference_id": reference_id,
             "format": cfg.format,
             "latency": cfg.latency,
@@ -110,6 +145,13 @@ class FishProvider:
             "opus_bitrate": cfg.opus_bitrate,
             "sample_rate": cfg.sample_rate,
             "normalize": cfg.normalize,
+            "temperature": getattr(params, "temperature", 0.7),
+            "top_p": getattr(params, "top_p", 0.7),
+            "prosody": {
+                "speed": getattr(params, "speed", 1.0),
+                "volume": getattr(params, "volume_db", 0.0),
+                "normalize_loudness": True,
+            },
         }
         try:
             async with self._client.stream(
@@ -117,7 +159,7 @@ class FishProvider:
                 headers={
                     "Authorization": f"Bearer {cfg.api_key}",
                     "Content-Type": "application/json",
-                    "model": cfg.model,
+                    "model": getattr(params, "model", "") or cfg.model,
                 },
             ) as response:
                 if response.status_code != 200:
@@ -130,6 +172,8 @@ class FishProvider:
                             flight.condition.notify_all()
             if not flight.chunks:
                 raise FishError("Fish returned no audio")
+            self._session_requests += 1
+            self._session_chars += len(text)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -139,19 +183,23 @@ class FishProvider:
                 flight.done = True
                 flight.condition.notify_all()
 
-    async def stream_audio(self, text: str, *, reference_id: str = "") -> AsyncIterator[bytes]:
-        reference_id = reference_id or self.config.reference_id
-        if not self.config.api_key or not reference_id:
+    async def stream_audio(
+        self, text: str, *, reference_id: str = "", params: object | None = None,
+        request_config: FishConfig | None = None,
+    ) -> AsyncIterator[bytes]:
+        cfg = request_config or self.config
+        reference_id = reference_id or cfg.reference_id
+        if not cfg.api_key or not reference_id:
             raise FishError("FISH_API_KEY and reference_id are required")
         key = hashlib.sha256(
-            (self.config.cache_key(reference_id) + "\0" + text).encode("utf-8")
+            (cfg.cache_key(reference_id, params) + "\0" + text).encode("utf-8")
         ).hexdigest()
         async with self._flight_lock:
             flight = self._flights.get(key)
             if flight is None:
                 flight = _Flight()
                 self._flights[key] = flight
-                flight.task = asyncio.create_task(self._produce(flight, text, reference_id))
+                flight.task = asyncio.create_task(self._produce(flight, text, reference_id, params, cfg))
             flight.listeners += 1
         index = 0
         try:
@@ -176,9 +224,14 @@ class FishProvider:
                         flight.task.cancel()
                     self._flights.pop(key, None)
 
-    async def synthesize(self, text: str, filename: Path, *, reference_id: str = "") -> None:
+    async def synthesize(
+        self, text: str, filename: Path, *, reference_id: str = "", params: object | None = None,
+        request_config: FishConfig | None = None,
+    ) -> None:
         with filename.open("wb") as output:
-            async for chunk in self.stream_audio(text, reference_id=reference_id):
+            async for chunk in self.stream_audio(
+                text, reference_id=reference_id, params=params, request_config=request_config,
+            ):
                 output.write(chunk)
 
     async def clone_voice(

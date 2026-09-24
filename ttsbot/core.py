@@ -9,6 +9,7 @@ are attached from the outside by the composition root (bot.py).
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import discord
@@ -88,17 +89,25 @@ class TTSBot(
         fish_cfg = FishConfig.from_env()
         self.fish_provider = FishProvider(fish_cfg) if fish_cfg.api_key else None
         if fish_cfg.reference_id:
-            fish_record = voice_registry.VoiceRecord(
-                name="fish-default", label="Fish Audio", description="Fish Audio reference voice",
-                provider=voice_registry.PROVIDER_FISH,
-                fish=voice_registry.FishParams(reference_id=fish_cfg.reference_id),
-            )
-            if self.voice_registry.get("fish-default") != fish_record:
+            current = self.voice_registry.get("fish-default")
+            if current is not None and current.is_fish and current.fish is not None:
+                fish_record = replace(current, fish=replace(current.fish, reference_id=fish_cfg.reference_id))
+            else:
+                fish_record = voice_registry.VoiceRecord(
+                    name="fish-default", label="Fish Audio", description="Fish Audio reference voice",
+                    provider=voice_registry.PROVIDER_FISH,
+                    fish=voice_registry.FishParams(reference_id=fish_cfg.reference_id),
+                )
+            if current != fish_record:
                 self.voice_registry.add(fish_record)
                 voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
         self.config_store = BotConfigStore(
             config.BOT_CONFIG_PATH, config.WHITELIST_USERS, voice_registry=self.voice_registry
         )
+        saved_latency = self.config_store.settings.get("fish_latency")
+        self.fish_config = replace(fish_cfg, latency=saved_latency) if isinstance(saved_latency, str) else fish_cfg
+        if self.fish_provider is not None:
+            self.fish_provider.config = self.fish_config
         self.piper_voices: dict[tuple[str, str], object] = {}
         # TTS provider abstraction (see ttsbot/providers.py). Skeleton
         # behavior in this commit: dispatcher always routes to local.
@@ -127,6 +136,17 @@ class TTSBot(
         self.merge_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self.merge_generations: dict[tuple[int, int], int] = {}
         self.last_user_message_ts: dict[tuple[int, int], float] = {}
+
+    @property
+    def fish_latency(self) -> str:
+        return self.fish_config.latency
+
+    def set_fish_latency(self, mode: str) -> None:
+        """Persist the global Fish mode and apply it to future requests."""
+        self.config_store.set_fish_latency(mode)
+        self.fish_config = replace(self.fish_config, latency=mode)
+        if self.fish_provider is not None:
+            self.fish_provider.config = self.fish_config
 
     async def setup_hook(self) -> None:
         if self.tts_group is not None:

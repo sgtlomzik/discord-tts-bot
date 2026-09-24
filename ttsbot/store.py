@@ -31,10 +31,8 @@ class BotConfigStore:
         # TODO(per-guild): aliases are global for now (like voice clones);
         # key by guild_id when per-guild pronunciations are needed.
         self.emoji_aliases: dict[str, dict[str, str]] = {}
-        # Runtime-adjustable global settings that override env defaults
-        # (currently only tts_max_chars, set via /voicebot limit). Applied
-        # to the config module on load so the override survives restarts.
-        self.settings: dict[str, int] = {}
+        # Runtime-adjustable global settings that override env defaults.
+        self.settings: dict[str, int | str] = {}
         self.load()
 
     def _is_valid_voice(self, name: str) -> bool:
@@ -110,6 +108,9 @@ class BotConfigStore:
             max_chars = raw_settings.get("tts_max_chars")
             if isinstance(max_chars, int) and max_chars > 0:
                 self.settings["tts_max_chars"] = max_chars
+            fish_latency = raw_settings.get("fish_latency")
+            if isinstance(fish_latency, str) and fish_latency in {"low", "balanced", "normal"}:
+                self.settings["fish_latency"] = fish_latency
         self._apply_settings()
 
     def _apply_settings(self) -> None:
@@ -127,6 +128,20 @@ class BotConfigStore:
         self.settings["tts_max_chars"] = int(value)
         self._apply_settings()
         self.save()
+
+    def set_fish_latency(self, mode: str) -> None:
+        if mode not in {"low", "balanced", "normal"}:
+            raise ValueError("Fish latency must be low, balanced, or normal")
+        previous = self.settings.get("fish_latency")
+        self.settings["fish_latency"] = mode
+        try:
+            self.save()
+        except OSError:
+            if previous is None:
+                self.settings.pop("fish_latency", None)
+            else:
+                self.settings["fish_latency"] = previous
+            raise
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
