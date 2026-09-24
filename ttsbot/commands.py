@@ -460,7 +460,7 @@ def build_commands(bot):
     @tts_group.command(name="voice-clone", description="Клонировать голос в Fish Audio из аудиофайла")
     @app_commands.describe(
         name="Имя профиля (kebab-case: a-z, 0-9, дефис)",
-        sample="Аудиосэмпл (mp3/m4a/wav/opus, от 10 сек, до 20 МБ)",
+        sample="Аудиосэмпл (mp3/m4a/wav/ogg/opus, от 10 сек, до 20 МБ)",
         description="Описание (необязательно)",
     )
     async def slash_tts_voice_clone(
@@ -491,9 +491,10 @@ def build_commands(bot):
             )
             return
         fname = sample.filename.lower()
-        if not fname.endswith((".mp3", ".m4a", ".wav", ".opus")):
+        # .ogg is what Discord voice messages are saved as.
+        if not fname.endswith((".mp3", ".m4a", ".wav", ".ogg", ".opus")):
             await interaction.response.send_message(
-                "Нужен аудиофайл (mp3/m4a/wav/opus).", ephemeral=True
+                "Нужен аудиофайл (mp3/m4a/wav/ogg/opus).", ephemeral=True
             )
             return
         if bot.tts_dispatcher.fish is None:
@@ -844,9 +845,18 @@ def build_commands(bot):
         else:
             embed.add_field(name="Кэш", value="выключен", inline=False)
         embed.add_field(name="Очередь", value=str(bot.message_queue.qsize()), inline=True)
-        active_cb = getattr(disp, "fish_circuit_breaker", None) if fish is not None else cb
-        state = active_cb.state.value if active_cb is not None else "—"
-        embed.add_field(name="Circuit breaker", value=f"`{state}`", inline=True)
+        def _cb_state(breaker) -> str:
+            if breaker is None:
+                return "—"
+            left = breaker.cooldown_remaining
+            return f"`{breaker.state.value}`" + (f" ({left:.0f} с)" if left else "")
+
+        breakers = []
+        if fish is not None:
+            breakers.append(f"Fish {_cb_state(getattr(disp, 'fish_circuit_breaker', None))}")
+        if cloud is not None or fish is None:
+            breakers.append(f"MiniMax {_cb_state(cb)}")
+        embed.add_field(name="Circuit breaker", value=" · ".join(breakers), inline=True)
         if fish is not None:
             embed.add_field(
                 name="Fish запросы / символы (сессия)",

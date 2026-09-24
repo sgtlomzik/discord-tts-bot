@@ -48,6 +48,7 @@ def reload() -> None:
     global TOKEN, MAX_TEXT_LENGTH, TTS_MAX_CHARS, QUEUE_MAXSIZE
     global TTS_PREROLL_MS, TTS_PREROLL_MODE, TTS_PREROLL_VOLUME_DB, TTS_SILENCE_TAIL_MS
     global TTS_CONTINUOUS_STREAM, TTS_STREAMING_ENABLED, TTS_STREAM_TTFA_TIMEOUT
+    global FISH_TTFA_TIMEOUT
     global TTS_PREFETCH_ENABLED, TTS_PREFETCH_LOOKAHEAD
     global TTS_IDLE_FRAME_MODE, TTS_IDLE_VOLUME_DB, TTS_STREAM_TAIL_MS
     global TTS_MAX_CONTINUOUS_IDLE_SECONDS, IDLE_DISCONNECT_SECONDS
@@ -102,6 +103,9 @@ def reload() -> None:
     TTS_STREAM_TTFA_TIMEOUT = float(
         os.getenv("TTS_STREAM_TTFA_TIMEOUT", os.getenv("TTS_REQUEST_TIMEOUT", "2.5"))
     )
+    # Fish needs its own budget: its first byte takes 0.5-2.3 s in production,
+    # so the MiniMax-tuned 2.5 s silently dropped ~3% of Fish messages to Piper.
+    FISH_TTFA_TIMEOUT = max(0.5, float(os.getenv("FISH_TTFA_TIMEOUT", "5")))
     # Prefetch: decouple generation from playback so message N+1 is synthesized
     # while N is still playing (cuts queue_wait under bursts). Playback stays
     # strictly sequential FIFO. TTS_PREFETCH_ENABLED=0 reverts to the proven

@@ -25,6 +25,7 @@ from ttsbot import voice_registry
 from ttsbot.providers import (
     MiniMaxError,
     MiniMaxProvider,
+    MiniMaxQuotaExhaustedError,
     MiniMaxVoiceNotFoundError,
     load_minimax_config_from_env,
 )
@@ -492,6 +493,8 @@ class SynthesisPipelineMixin:
                 "Stream failed before first audio (%s: %s); Piper fallback",
                 type(exc).__name__, exc,
             )
+            if isinstance(exc, MiniMaxQuotaExhaustedError):
+                self.tts_dispatcher.record_cloud_failure(exc)
             return ("pre_audio", 0)
 
         # 2. We have audio. Decode the MP3 byte stream via ffmpeg (stdin ->
@@ -770,6 +773,7 @@ class SynthesisPipelineMixin:
         if prepared.cancelled:
             return "cancelled"
         if not cb.allow_request():
+            log.info("Fish circuit breaker open; Piper fallback guild=%s", job.guild_id)
             return "pre_audio"
         prepared.provider = "fish"
         if direct:
@@ -896,9 +900,16 @@ class SynthesisPipelineMixin:
         try:
             try:
                 first_chunk = await asyncio.wait_for(
-                    agen.__anext__(), timeout=config.TTS_STREAM_TTFA_TIMEOUT,
+                    agen.__anext__(), timeout=config.FISH_TTFA_TIMEOUT,
                 )
-            except (StopAsyncIteration, asyncio.TimeoutError):
+            except StopAsyncIteration:
+                log.warning("Fish stream produced no audio; Piper fallback guild=%s", job.guild_id)
+                status = "pre_audio"
+            except asyncio.TimeoutError:
+                log.warning(
+                    "Fish TTFA exceeded %.2fs; Piper fallback guild=%s chars=%d",
+                    config.FISH_TTFA_TIMEOUT, job.guild_id, len(job.text),
+                )
                 status = "pre_audio"
             else:
                 await consume(first_chunk)
@@ -951,11 +962,13 @@ class SynthesisPipelineMixin:
             prepared.job.text, reference_id=voice.fish.reference_id, params=voice.fish,
             request_config=request_config,
         )
-        return await self._decode_stream_to_channel(prepared, voice, agen, "ogg", cache_key, "opus")
+        return await self._decode_stream_to_channel(
+            prepared, voice, agen, "ogg", cache_key, "opus", ttfa_timeout=config.FISH_TTFA_TIMEOUT,
+        )
 
     async def _decode_stream_to_channel(
         self, prepared: PreparedAudio, voice, agen, input_format: str,
-        cache_key: str, cache_suffix: str,
+        cache_key: str, cache_suffix: str, *, ttfa_timeout: float | None = None,
     ) -> tuple[str, int]:
         """Tee compressed audio to an atomic cache file and ffmpeg stdin.
 
@@ -964,22 +977,24 @@ class SynthesisPipelineMixin:
         status in ok/truncated/pre_audio/cancelled.
         """
         job = prepared.job
+        if ttfa_timeout is None:
+            ttfa_timeout = config.TTS_STREAM_TTFA_TIMEOUT
         try:
-            first_chunk = await asyncio.wait_for(
-                agen.__anext__(), timeout=config.TTS_STREAM_TTFA_TIMEOUT
-            )
+            first_chunk = await asyncio.wait_for(agen.__anext__(), timeout=ttfa_timeout)
         except StopAsyncIteration:
             await agen.aclose()
             log.warning("Stream produced no audio; Piper fallback")
             return ("pre_audio", 0)
         except asyncio.TimeoutError:
             await agen.aclose()
-            log.warning("Stream TTFA exceeded %.2fs; Piper fallback", config.TTS_STREAM_TTFA_TIMEOUT)
+            log.warning("Stream TTFA exceeded %.2fs; Piper fallback", ttfa_timeout)
             return ("pre_audio", 0)
         except Exception as exc:
             await agen.aclose()
             log.warning("Stream failed before first audio (%s: %s); Piper fallback",
                         type(exc).__name__, exc)
+            if isinstance(exc, MiniMaxQuotaExhaustedError):
+                self.tts_dispatcher.record_cloud_failure(exc)
             return ("pre_audio", 0)
         if prepared.cancelled:
             await agen.aclose()

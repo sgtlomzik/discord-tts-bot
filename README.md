@@ -97,6 +97,8 @@ Everything is configured through environment variables — see
 | `MINIMAX_API_KEY` | Enables MiniMax cloud voices (optional) |
 | `FISH_API_KEY` | Fish Audio key; keep it in `.env` only |
 | `FISH_REFERENCE_ID` | Fish voice ID; seeds the `fish-default` profile |
+| `FISH_TTFA_TIMEOUT` | Seconds to wait for Fish's first audio before Piper (default 5) |
+| `MINIMAX_QUOTA_COOLDOWN_SECONDS` | Pause MiniMax after a quota/balance error (default 1800) |
 | `TTS_PRIMARY_PROVIDER` | `local`, `minimax`, or `fish` |
 | `TTS_MERGE_ALGORITHM` | `selective_hold_v2`, `legacy` or `off` |
 

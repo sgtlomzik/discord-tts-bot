@@ -81,19 +81,17 @@ class PlaybackMixin:
             if prepared.cancelled:
                 continue  # stop feeding but drain to the sentinel
             if source is None:
-                source = self.ensure_continuous_player(
-                    vc, opus=prepared.codec == "opus", initial_frames=batch,
-                )
+                source = self.ensure_continuous_player(vc, initial_frames=batch)
             else:
                 source.enqueue_frames(batch)
             total += len(batch)
             if first_ts is None:
                 first_ts = time.perf_counter()
                 log.info(
-                    "Audio start guild=%s channel=%s provider=%s queue_wait=%.3fs "
+                    "Audio start guild=%s channel=%s provider=%s codec=%s queue_wait=%.3fs "
                     "message_to_audio_s=%.3f queue_to_audio_s=%.3f",
                     job.voice_channel.guild.id, job.voice_channel.id,
-                    prepared.provider or "?", pickup_ts - job.queued_at,
+                    prepared.provider or "?", prepared.codec, pickup_ts - job.queued_at,
                     first_ts - job.message_ts, first_ts - job.queued_at,
                 )
         if total == 0 or source is None:
@@ -108,20 +106,24 @@ class PlaybackMixin:
         self.schedule_idle_disconnect(job.voice_channel.guild)
 
     def ensure_continuous_player(
-        self, vc: discord.VoiceClient, *, opus: bool = False,
-        initial_frames: list[bytes] | None = None,
+        self, vc: discord.VoiceClient, *, initial_frames: list[bytes] | None = None,
     ) -> ContinuousTTSAudioSource:
+        """Return the guild's Opus player, starting it if needed.
+
+        The player accepts both Opus packets and PCM frames, so it keeps
+        running across provider switches (Fish <-> Piper/MiniMax/cache).
+        """
         guild_id = vc.guild.id
         self.cancel_continuous_idle_stop(guild_id)
         source = self.continuous_sources.get(guild_id)
         source_created = False
-        if source is None or source.stopped or source.is_opus() != opus:
+        if source is None or source.stopped or not source.is_opus():
             if source is not None:
                 source.stop()
-            idle = OPUS_SILENCE_FRAME if opus else build_idle_pcm_frame(
-                config.TTS_IDLE_FRAME_MODE, config.TTS_IDLE_VOLUME_DB,
-            )
-            source = ContinuousTTSAudioSource(idle, opus=opus)
+            idle = build_idle_pcm_frame(config.TTS_IDLE_FRAME_MODE, config.TTS_IDLE_VOLUME_DB)
+            if not any(idle):
+                idle = OPUS_SILENCE_FRAME  # digital silence needs no encoder
+            source = ContinuousTTSAudioSource(idle, opus=True)
             self.continuous_sources[guild_id] = source
             source_created = True
 
@@ -135,9 +137,8 @@ class PlaybackMixin:
         if source_created or (not vc.is_playing() and not vc.is_paused()):
             vc.play(source)
             log.info(
-                "Continuous TTS stream started guild=%s codec=%s mode=%s idle_volume_db=%s max_idle_seconds=%s",
+                "Continuous TTS stream started guild=%s mode=%s idle_volume_db=%s max_idle_seconds=%s",
                 guild_id,
-                "opus" if opus else "pcm",
                 config.TTS_IDLE_FRAME_MODE,
                 config.TTS_IDLE_VOLUME_DB,
                 config.TTS_MAX_CONTINUOUS_IDLE_SECONDS,
