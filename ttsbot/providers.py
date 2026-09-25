@@ -46,6 +46,7 @@ from typing import (
     Protocol,
 )
 
+from ttsbot.errors import QuotaExhaustedError
 from ttsbot.fish import FishProvider
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -282,7 +283,7 @@ class PrimaryProvider(str, Enum):
 class DispatcherConfig:
     primary: PrimaryProvider = PrimaryProvider.LOCAL
     request_timeout_seconds: float = 2.5
-    # How long to stop calling MiniMax after a quota/balance error.
+    # How long to stop calling a provider after a balance/plan error.
     quota_cooldown_seconds: float = 1800.0
 
 
@@ -306,13 +307,29 @@ class MiniMaxQuotaError(MiniMaxError):
     """HTTP 429 (rate-limited) or explicit quota status_code."""
 
 
-class MiniMaxQuotaExhaustedError(MiniMaxQuotaError):
+class MiniMaxQuotaExhaustedError(MiniMaxQuotaError, QuotaExhaustedError):
     """Balance or plan exhausted: retrying soon is pointless."""
 
 
 # 1008 insufficient balance, 2056 Token Plan usage limit.
 MINIMAX_EXHAUSTED_STATUS_CODES = frozenset({1008, 2056})
 MINIMAX_RATE_LIMIT_STATUS_CODES = frozenset({1039})
+
+
+def _base_resp_status(payload: object, missing: int = -1) -> tuple[int, str]:
+    """Return ``(status_code, status_msg)`` from a MiniMax JSON body.
+
+    ``missing`` is used when there is no ``base_resp``/``status_code`` at all
+    (streamed audio events omit it); a malformed code maps to -1.
+    """
+    base_resp = payload.get("base_resp") if isinstance(payload, dict) else None
+    if not isinstance(base_resp, dict) or base_resp.get("status_code") is None:
+        return missing, ""
+    try:
+        code = int(base_resp["status_code"])
+    except (TypeError, ValueError):
+        code = -1
+    return code, str(base_resp.get("status_msg") or "")
 
 
 class MiniMaxTimeoutError(MiniMaxError):
@@ -837,9 +854,7 @@ class MiniMaxProvider:
                 f"MiniMax returned non-JSON body: {response.text[:200]}"
             ) from exc
 
-        base_resp = payload.get("base_resp") or {}
-        status_code = int(base_resp.get("status_code", -1))
-        status_msg = base_resp.get("status_msg", "") or ""
+        status_code, status_msg = _base_resp_status(payload)
         if status_code != 0:
             # 'invalid api key' is the canonical case for adding
             # GroupId per MiniMax docs. Distinct exception type so the
@@ -953,12 +968,9 @@ class MiniMaxProvider:
             raise MiniMaxError(
                 f"MiniMax upload returned non-JSON: {resp.text[:200]}"
             ) from exc
-        base_resp = payload.get("base_resp") or {}
-        status_code = int(base_resp.get("status_code", 0) or 0)
+        status_code, status_msg = _base_resp_status(payload, missing=0)
         if status_code != 0:
-            self._raise_for_status_code(
-                status_code, base_resp.get("status_msg", "") or ""
-            )
+            self._raise_for_status_code(status_code, status_msg)
         file_id = (payload.get("file") or {}).get("file_id") or payload.get("file_id")
         if not file_id:
             raise MiniMaxError(f"MiniMax upload missing file_id: {payload}")
@@ -991,12 +1003,9 @@ class MiniMaxProvider:
             raise MiniMaxError(
                 f"MiniMax voice_clone returned non-JSON: {resp.text[:200]}"
             ) from exc
-        base_resp = payload.get("base_resp") or {}
-        status_code = int(base_resp.get("status_code", -1))
+        status_code, status_msg = _base_resp_status(payload)
         if status_code != 0:
-            self._raise_for_status_code(
-                status_code, base_resp.get("status_msg", "") or ""
-            )
+            self._raise_for_status_code(status_code, status_msg)
         log.info(
             "MiniMax voice cloned voice_id=%s model=%s file_id=%s sample_bytes=%d",
             voice_id, model, file_id, len(sample),
@@ -1101,23 +1110,14 @@ class MiniMaxProvider:
                     raise MiniMaxError(
                         f"MiniMax HTTP {response.status_code}: {excerpt}"
                     )
-                if response.headers.get("content-type", "").startswith("application/json"):
-                    # Errors (quota, auth, bad voice) come as one JSON body, not SSE.
-                    raw = await response.aread()
-                    try:
-                        base_resp = json.loads(raw).get("base_resp") or {}
-                    except (ValueError, AttributeError) as exc:
-                        raise MiniMaxError(
-                            f"MiniMax returned non-SSE body: {raw[:200]!r}"
-                        ) from exc
-                    status_code = int(base_resp.get("status_code", -1))
-                    if status_code != 0:
-                        self._raise_for_status_code(
-                            status_code, base_resp.get("status_msg", "") or "",
-                        )
-                    raise MiniMaxError("MiniMax returned JSON instead of an audio stream")
+                # Errors (quota, auth, bad voice) arrive as a plain JSON body,
+                # possibly pretty-printed, instead of SSE events. Collect such
+                # lines rather than trusting the Content-Type header.
+                body_lines: list[str] = []
                 async for line in response.aiter_lines():
-                    if not line or not line.startswith("data:"):
+                    if not line.startswith("data:"):
+                        if line.strip() and not line.startswith((":", "event:", "id:", "retry:")):
+                            body_lines.append(line)
                         continue
                     payload_str = line[len("data:"):].strip()
                     if not payload_str:
@@ -1126,12 +1126,11 @@ class MiniMaxProvider:
                         payload = json.loads(payload_str)
                     except ValueError:
                         continue
-                    base_resp = payload.get("base_resp") or {}
-                    sc = int(base_resp.get("status_code", 0) or 0)
+                    if not isinstance(payload, dict):
+                        continue
+                    sc, status_msg = _base_resp_status(payload, missing=0)
                     if sc != 0:
-                        self._raise_for_status_code(
-                            sc, base_resp.get("status_msg", "") or ""
-                        )
+                        self._raise_for_status_code(sc, status_msg)
                     extra = payload.get("extra_info") or {}
                     if isinstance(extra, dict) and extra.get("usage_characters"):
                         try:
@@ -1148,6 +1147,18 @@ class MiniMaxProvider:
                         if chunk:
                             chunks += 1
                             yield chunk
+                if not chunks and body_lines:
+                    raw = "\n".join(body_lines)
+                    try:
+                        payload = json.loads(raw)
+                    except ValueError as exc:
+                        raise MiniMaxError(
+                            f"MiniMax returned non-SSE body: {raw[:200]!r}"
+                        ) from exc
+                    sc, status_msg = _base_resp_status(payload)
+                    if sc != 0:
+                        self._raise_for_status_code(sc, status_msg)
+                    raise MiniMaxError("MiniMax returned JSON instead of an audio stream")
         except httpx.TimeoutException as exc:
             raise MiniMaxTimeoutError(
                 f"MiniMax stream timed out after {cfg.timeout_seconds}s"
@@ -1183,7 +1194,9 @@ def load_dispatcher_config_from_env() -> DispatcherConfig:
     return DispatcherConfig(
         primary=primary,
         request_timeout_seconds=max(0.1, timeout),
-        quota_cooldown_seconds=max(0.0, float(os.getenv("MINIMAX_QUOTA_COOLDOWN_SECONDS", "1800"))),
+        quota_cooldown_seconds=max(0.0, float(os.getenv(
+            "TTS_QUOTA_COOLDOWN_SECONDS", os.getenv("MINIMAX_QUOTA_COOLDOWN_SECONDS", "1800"),
+        ))),
     )
 
 
@@ -1234,14 +1247,19 @@ class TTSDispatcher:
     def circuit_breaker(self) -> CircuitBreaker:
         return self._cb
 
-    def record_cloud_failure(self, exc: BaseException | None = None) -> None:
-        """Count a MiniMax failure; an exhausted quota opens the breaker long."""
-        if isinstance(exc, MiniMaxQuotaExhaustedError):
+    def record_failure(
+        self, breaker: CircuitBreaker, exc: BaseException | None = None,
+    ) -> None:
+        """Count a provider failure; an exhausted balance/plan pauses it longer."""
+        if isinstance(exc, QuotaExhaustedError):
             cooldown = self._config.quota_cooldown_seconds
-            log.warning("MiniMax quota exhausted; pausing MiniMax for %.0fs: %s", cooldown, exc)
-            self._cb.trip(cooldown)
+            log.warning(
+                "Quota exhausted (%s); pausing the provider for %.0fs: %s",
+                type(exc).__name__, cooldown, exc,
+            )
+            breaker.trip(cooldown)
         else:
-            self._cb.record_failure()
+            breaker.record_failure()
 
     @property
     def cloud(self) -> Optional[TTSProvider]:
@@ -1294,7 +1312,9 @@ class TTSDispatcher:
                 log.debug("TTS cache HIT text=%d chars voice=%s", len(text), voice_key)
                 return "cache"
 
-        if want_fish and self._fish_cb.allow_request():
+        if want_fish and not self._fish_cb.allow_request():
+            log.info("Fish circuit breaker open; using fallback Piper")
+        elif want_fish:
             try:
                 await self._fish.synthesize(
                     text, filename, reference_id=fish_ref, params=getattr(voice, "fish", None),
@@ -1304,7 +1324,7 @@ class TTSDispatcher:
                 self._maybe_cache(text, filename, voice_key, suffix="opus")
                 return "fish"
             except Exception as exc:
-                self._fish_cb.record_failure()
+                self.record_failure(self._fish_cb, exc)
                 log.warning("Fish synthesis failed (%s: %s); falling back to Piper", type(exc).__name__, exc)
 
         # 2. Cloud (MiniMax) path: when the record is a minimax voice, or
@@ -1336,7 +1356,7 @@ class TTSDispatcher:
                         "TTS provider %s failed (%s: %s); falling back to %s",
                         self._cloud.name, type(exc).__name__, exc, self._local.name,
                     )
-                    self.record_cloud_failure(exc)
+                    self.record_failure(self._cb, exc)
             else:
                 log.debug(
                     "Circuit breaker open; skipping %s, using fallback Piper",

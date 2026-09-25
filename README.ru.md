@@ -95,40 +95,44 @@ python bot.py
 |---|---|
 | `DISCORD_TOKEN` | Токен бота (**обязательно**) |
 | `WHITELIST_USERS` | ID пользователей Discord через запятую, чьи сообщения озвучиваются |
-| `TTS_DEFAULT_VOICE_PROFILE` | Голос по умолчанию (`piper-ruslan`, `piper-irina`, …) |
+| `TTS_DEFAULT_VOICE_PROFILE` | Голос по умолчанию для новых серверов (`piper-ruslan`, `fish-default`, …) |
 | `MINIMAX_API_KEY` | Включает облачные голоса MiniMax (опционально) |
 | `FISH_API_KEY` | Ключ Fish Audio; хранить только в `.env` |
 | `FISH_REFERENCE_ID` | ID голоса Fish; создаёт профиль `fish-default` |
-| `FISH_TTFA_TIMEOUT` | Сколько секунд ждать первый звук от Fish до перехода на Piper (по умолчанию 5) |
-| `MINIMAX_QUOTA_COOLDOWN_SECONDS` | Пауза для MiniMax после ошибки лимита или баланса (по умолчанию 1800) |
+| `FISH_TTFA_TIMEOUT` | Сколько секунд ждать первый аудиопакет от Fish до перехода на Piper (по умолчанию 5) |
+| `TTS_QUOTA_COOLDOWN_SECONDS` | Пауза для Fish или MiniMax, когда закончился баланс или лимит тарифа (по умолчанию 1800) |
 | `TTS_PRIMARY_PROVIDER` | `local`, `minimax` или `fish` |
 | `TTS_MERGE_ALGORITHM` | `selective_hold_v2`, `legacy` или `off` |
 
 Для Fish укажите в `.env` `FISH_API_KEY` и `FISH_REFERENCE_ID`, затем
-выберите `/voicebot voice-set voice:fish-default`. Настройки по умолчанию:
+выберите `/voicebot voice-set voice:fish-default` или задайте
+`TTS_DEFAULT_VOICE_PROFILE=fish-default`, чтобы новые серверы сразу
+получали Fish. Сам бот голос по умолчанию на Fish не меняет. Настройки по умолчанию:
 `s2.1-pro-free`, `opus`, `low`, `chunk_length=150`, `opus_bitrate=48000`.
 На сервере с существующими персональными назначениями голосов смените
 их отдельно через `/voicebot voice-user` или очистите через
 `/voicebot voice-clear`. Кэш прямого воспроизведения хранит готовые пакеты
-в `.dopus`; прежние файлы `.opus` преобразуются при чтении без ffmpeg.
+в `.dopus`; для голосов со сдвигом тона хранится исходный Ogg в `.opus`.
 Ключ включает текст, `reference_id`, модель и параметры, которые уходят в
 Fish (высота тона в ключ не входит).
 
-Если Fish не прислал звук за `FISH_TTFA_TIMEOUT` секунд, сообщение
-озвучивается резервным голосом Piper, а в лог пишется предупреждение
-`Fish TTFA exceeded`. После нескольких сбоев подряд Fish или MiniMax
-отключаются на `CB_COOLDOWN_SECONDS`. Если у MiniMax закончился баланс или
-лимит тарифа (коды 1008 и 2056), он отключается на
-`MINIMAX_QUOTA_COOLDOWN_SECONDS`; ограничение частоты запросов (HTTP 429,
-код 1039) считается обычным сбоем.
+Если Fish не прислал ни одного аудиопакета за `FISH_TTFA_TIMEOUT` секунд
+(одни заголовки ответа не считаются), сообщение озвучивается резервным
+голосом Piper, а в лог пишется предупреждение `Fish first audio exceeded`.
+После нескольких сбоев подряд Fish или MiniMax отключаются на
+`CB_COOLDOWN_SECONDS`. Если закончился баланс или лимит тарифа (Fish
+HTTP 402, MiniMax коды 1008 и 2056), этот сервис отключается на
+`TTS_QUOTA_COOLDOWN_SECONDS`; ограничение частоты запросов (HTTP 429,
+MiniMax код 1039) считается обычным сбоем.
 
 Чтобы разом перевести существующую установку на Fish, остановите бота и
 выполните `python scripts/migrate_fish_default.py data/config.json`. Скрипт
 ставит всем серверам голос `fish-default`, сбрасывает персональные голоса
 и сохраняет резервную копию рядом с `config.json`.
 
-`/voicebot voice-clone` теперь создаёт приватный голос Fish из приложенного
-аудиофайла (WAV/MP3/M4A/OGG/Opus; OGG — это голосовые сообщения Discord). Бот дожидается готовности модели, проверяет
+`/voicebot voice-clone` создаёт приватный голос Fish из приложенного
+аудиофайла (любой файл с типом `audio/*` или WAV/MP3/M4A/OGG/Opus/FLAC по
+расширению; OGG — это голосовые сообщения Discord). Бот дожидается готовности модели, проверяет
 короткую генерацию и сохраняет новый `reference_id` в `data/voices.json`.
 Созданный профиль можно назначить через `voice-set` или `voice-user`.
 Готовый голос из библиотеки Fish можно добавить без клонирования:
@@ -145,8 +149,8 @@ emotion:happy pitch:2 volume_db:3`. Доступны также `model`, `temper
 переопределяет `FISH_LATENCY` из `.env`. Режим учитывается в ключе TTS-кэша.
 Скорость, громкость, выразительность и режим задержки передаются в Fish API;
 высота тона меняется локально через ffmpeg: её смена не требует новых
-запросов к Fish, но отключает прямой Opus-путь для этого профиля. Если Fish выдаст пакеты другой длительности, бот также
-использует ffmpeg. Автоэмоция выбирается по тексту
+запросов к Fish, но отключает прямой Opus-путь для этого профиля. Если Fish выдаст пакеты другой длительности, бот тоже
+использует ffmpeg и доигрывает уже полученные данные без второго запроса. Автоэмоция выбирается по тексту
 сообщения. Параметры профиля сохраняются при перезапуске; все, кроме высоты тона,
 учитываются в ключе кэша.
 `/voicebot stats` показывает число успешных запросов Fish и символов в них
@@ -167,7 +171,7 @@ emotion:happy pitch:2 volume_db:3`. Доступны также `model`, `temper
 ```bash
 python3.11 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -p 'test_*.py'  # ~340 тестов, сеть не нужна
+python -m unittest discover -s tests -p 'test_*.py'  # ~360 тестов, сеть не нужна
 ```
 
 Код приложения — в пакете `ttsbot/`; `bot.py` — точка входа и composition

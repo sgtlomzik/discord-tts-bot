@@ -22,12 +22,14 @@ except Exception:  # pragma: no cover - optional dependency
     SynthesisConfig = None
 
 from ttsbot import voice_registry
+from ttsbot.errors import QuotaExhaustedError
+from ttsbot.fish import FishError
 from ttsbot.providers import (
     MiniMaxError,
     MiniMaxProvider,
-    MiniMaxQuotaExhaustedError,
     MiniMaxVoiceNotFoundError,
     load_minimax_config_from_env,
+    voice_cache_key,
 )
 from ttsbot import config
 from ttsbot.audio import (
@@ -42,11 +44,14 @@ from ttsbot.ogg_opus import (
     OggOpusDemuxer,
     UnsupportedOpusStream,
     read_frame_cache,
-    read_ogg_frames,
     write_frame,
 )
 
 log = logging.getLogger("tts_bot")
+
+# Appended to a Fish cache key for Discord-ready .dopus frame files, so they
+# never collide with the raw Ogg (.opus) entry of the same request.
+DISCORD_OPUS_CACHE_SUFFIX = ":discord-opus-v1"
 
 
 def _voice_speed_factor(voice) -> float:
@@ -196,54 +201,42 @@ class SynthesisPipelineMixin:
             except OSError:
                 pass
 
-    async def clone_minimax_voice(
-        self,
-        *,
-        name: str,
-        voice_id: str,
-        sample: bytes,
-        filename: str,
-        description: str,
-    ) -> tuple[bool, str]:
-        """Clone ``sample`` on MiniMax, then register + persist the voice.
+    async def register_fish_voice(
+        self, *, name: str, reference_id: str, label: str, description: str,
+    ) -> str:
+        """Probe a Fish ``reference_id`` and save it as voice ``name``.
 
-        Wraps the provider's upload+clone, confirms the fresh clone actually
-        synthesizes (a clone that 'succeeds' but won't speak is useless), then
-        adds the record to the registry and saves data/voices.json. Returns
-        (ok, error_message); on ok the voice ``name`` is ready for
-        voice-set/voice-user. Used by /voicebot voice-clone.
+        Returns "" on success or a short reason (lowercase, for a message
+        prefix). The name is re-checked after the probe because clone/add
+        take long enough for another command to claim it meanwhile.
         """
-        cloud = getattr(self.tts_dispatcher, "cloud", None)
-        if cloud is None:
-            return False, "MiniMax не настроен (нет MINIMAX_API_KEY)."
-        clone = getattr(cloud, "clone_voice", None)
-        if clone is None:
-            return False, "Провайдер не поддерживает клонирование."
+        fish = self.tts_dispatcher.fish
+        probe = config.TMP_DIR / f"fish_probe_{uuid.uuid4().hex}.opus"
         try:
-            await clone(sample, voice_id=voice_id, filename=filename)
-        except MiniMaxError as exc:
-            return False, f"Ошибка клонирования: {exc}"
-        except Exception as exc:  # network/timeout/decode/etc
-            return False, f"Не удалось клонировать: {type(exc).__name__}: {exc}"
-        # A clone can report success but not yet be usable; confirm it speaks
-        # before we register it so we never persist a dead voice.
-        ok, err = await self.validate_minimax_voice(voice_id)
-        if not ok:
-            return False, f"Клон создан, но не воспроизводится: {err}"
-        record = voice_registry.VoiceRecord(
+            await fish.synthesize("Проверка голоса.", probe, reference_id=reference_id)
+            with probe.open("rb") as audio:
+                if audio.read(4) != b"OggS":
+                    raise FishError("Fish returned no Ogg/Opus audio")
+        except Exception as exc:
+            return f"проверка озвучки не прошла: {type(exc).__name__}: {exc}"
+        finally:
+            probe.unlink(missing_ok=True)
+        if name in self.voice_registry:
+            return f"голос `{name}` уже существует"
+        self.voice_registry.add(voice_registry.VoiceRecord(
             name=name,
-            label=f"{name} (клон)",
+            label=label,
             description=description,
-            provider=voice_registry.PROVIDER_MINIMAX,
-            minimax=voice_registry.MiniMaxParams(voice_id=voice_id),
-        )
-        self.voice_registry.add(record)
+            provider=voice_registry.PROVIDER_FISH,
+            fish=voice_registry.FishParams(reference_id=reference_id),
+        ))
         try:
             self.persist_voice_registry()
         except OSError as exc:
-            log.exception("Failed to persist voices.json after voice-clone")
-            return False, f"Голос создан, но не сохранён на диск: {exc}"
-        return True, ""
+            self.voice_registry.voices.pop(name, None)
+            log.exception("Failed to persist voices.json after adding Fish voice %s", name)
+            return f"не удалось сохранить: {exc}"
+        return ""
 
     async def clone_fish_voice(
         self, *, name: str, sample: bytes, filename: str, description: str,
@@ -262,35 +255,12 @@ class SynthesisPipelineMixin:
             )
         except Exception as exc:
             return False, f"Не удалось клонировать в Fish: {type(exc).__name__}: {exc}"
-
-        probe = config.TMP_DIR / f"fish_clone_{uuid.uuid4().hex}.opus"
-        try:
-            await fish.synthesize("Проверка голоса.", probe, reference_id=reference_id)
-            with probe.open("rb") as audio:
-                if audio.read(4) != b"OggS":
-                    raise ValueError("Fish returned no Ogg/Opus audio")
-        except Exception as exc:
-            return False, (
-                f"Клон создан (reference_id=`{reference_id}`), но проверка озвучки не прошла: "
-                f"{type(exc).__name__}: {exc}"
-            )
-        finally:
-            probe.unlink(missing_ok=True)
-
-        record = voice_registry.VoiceRecord(
-            name=name,
-            label=f"{name} (Fish клон)",
-            description=description,
-            provider=voice_registry.PROVIDER_FISH,
-            fish=voice_registry.FishParams(reference_id=reference_id),
+        error = await self.register_fish_voice(
+            name=name, reference_id=reference_id,
+            label=f"{name} (Fish клон)", description=description,
         )
-        self.voice_registry.add(record)
-        try:
-            self.persist_voice_registry()
-        except OSError as exc:
-            self.voice_registry.voices.pop(name, None)
-            log.exception("Failed to persist voices.json after Fish voice-clone")
-            return False, f"Клон создан (reference_id=`{reference_id}`), но не сохранён: {exc}"
+        if error:
+            return False, f"Клон создан (reference_id=`{reference_id}`), но {error}"
         return True, reference_id
 
     async def generate_piper_file(self, text: str, filename: Path, profile: VoiceProfile) -> None:
@@ -395,7 +365,7 @@ class SynthesisPipelineMixin:
         # probe consumed. (Cache key already includes the voice.)
         cache = self.tts_dispatcher.cache
         if cache is not None:
-            cached = cache.lookup(job.text, voice.name)
+            cached = cache.lookup(job.text, voice_cache_key(voice))
             if cached is not None:
                 source = self.ensure_continuous_player(vc)
                 try:
@@ -493,8 +463,9 @@ class SynthesisPipelineMixin:
                 "Stream failed before first audio (%s: %s); Piper fallback",
                 type(exc).__name__, exc,
             )
-            if isinstance(exc, MiniMaxQuotaExhaustedError):
-                self.tts_dispatcher.record_cloud_failure(exc)
+            if isinstance(exc, QuotaExhaustedError):
+                # The caller only sees "pre_audio"; trip the long pause here.
+                self.tts_dispatcher.record_failure(self.tts_dispatcher.circuit_breaker, exc)
             return ("pre_audio", 0)
 
         # 2. We have audio. Decode the MP3 byte stream via ffmpeg (stdin ->
@@ -515,7 +486,7 @@ class SynthesisPipelineMixin:
         cache_part = None
         if cache is not None:
             try:
-                cache_final = cache.cache_path_for(job.text, voice.name)
+                cache_final = cache.cache_path_for(job.text, voice_cache_key(voice))
                 cache_final.parent.mkdir(parents=True, exist_ok=True)
                 cache_part = open(str(cache_final) + ".part", "wb")
             except OSError:
@@ -632,7 +603,7 @@ class SynthesisPipelineMixin:
         if cache is not None and cache_final is not None and part_path:
             try:
                 os.replace(part_path, cache_final)
-                cache.commit_file(job.text, cache_final, voice.name)
+                cache.commit_file(job.text, cache_final, voice_cache_key(voice))
             except OSError:
                 _discard_cache()
         return ("ok", frames_enqueued)
@@ -697,7 +668,7 @@ class SynthesisPipelineMixin:
         cb = self.tts_dispatcher.circuit_breaker
         cache = self.tts_dispatcher.cache
         if cache is not None:
-            cached = cache.lookup(job.text, voice.name)
+            cached = cache.lookup(job.text, voice_cache_key(voice))
             if cached is not None:
                 frames = limit_pcm_frames(await self._safe_pcm_frames(cached), job.text, voice)
                 if frames and not prepared.cancelled:
@@ -717,25 +688,25 @@ class SynthesisPipelineMixin:
         # with the Piper provider in _generate_file_into).
         prepared.provider = "minimax"
         status, _ = await self._stream_to_channel(prepared, voice)
-        if status == "pre_audio":
-            cb.record_failure()
-            return "pre_audio"
-        if status == "cancelled":
-            return "cancelled"
-        cb.record_success() if status == "ok" else cb.record_failure()
+        if status == "ok":
+            cb.record_success()
+        elif status != "cancelled":
+            self.tts_dispatcher.record_failure(cb, prepared.error)
         return status
 
     async def _generate_fish_stream_into(self, prepared: PreparedAudio, voice) -> str:
         job = prepared.job
-        fish = self.tts_dispatcher.fish
-        fish_cfg = fish.config
+        fish_cfg = self.tts_dispatcher.fish.config
         cb = self.tts_dispatcher.fish_circuit_breaker
         cache = self.tts_dispatcher.cache
         ogg_cache_key = fish_cfg.cache_key(voice.fish.reference_id, voice.fish)
+        # Pitch is applied by ffmpeg, so only pitch 0 can skip decoding.
         direct = voice.fish.pitch == 0
-        cache_key = f"{ogg_cache_key}:discord-opus-v1" if direct else ogg_cache_key
         if cache is not None:
-            cached = cache.lookup(job.text, cache_key)
+            if direct:
+                cached = cache.lookup(job.text, ogg_cache_key + DISCORD_OPUS_CACHE_SUFFIX)
+            else:
+                cached = cache.lookup(job.text, ogg_cache_key)
             if cached is not None:
                 if direct:
                     try:
@@ -748,71 +719,22 @@ class SynthesisPipelineMixin:
                         await self._safe_pcm_frames(cached, voice.fish.pitch), job.text, voice,
                     )
                 if frames and not prepared.cancelled:
-                    prepared.codec = "opus" if direct else "pcm"
                     await prepared.channel.put(frames)
                     prepared.provider = "cache"
                     return "cache"
-            if direct:
-                legacy = cache.lookup(job.text, ogg_cache_key)
-                if legacy is not None and legacy.suffix == ".opus":
-                    try:
-                        all_frames = read_ogg_frames(legacy)
-                    except (OSError, UnsupportedOpusStream):
-                        frames = []
-                    else:
-                        try:
-                            self._store_discord_frames(cache, job.text, cache_key, all_frames)
-                        except OSError:
-                            log.warning("Could not convert Fish cache file %s", legacy, exc_info=True)
-                        frames = limit_pcm_frames(all_frames, job.text, voice)
-                    if frames and not prepared.cancelled:
-                        prepared.codec = "opus"
-                        prepared.provider = "cache"
-                        await prepared.channel.put(frames)
-                        return "cache"
         if prepared.cancelled:
             return "cancelled"
         if not cb.allow_request():
             log.info("Fish circuit breaker open; Piper fallback guild=%s", job.guild_id)
             return "pre_audio"
         prepared.provider = "fish"
-        if direct:
-            status, _ = await self._stream_fish_opus_to_channel(
-                prepared, voice, cache_key, request_config=fish_cfg,
-            )
-            if status == "unsupported":
-                log.warning("Fish Opus packet incompatible with direct Discord playback; using ffmpeg")
-                status, _ = await self._stream_fish_to_channel(
-                    prepared, voice, ogg_cache_key, request_config=fish_cfg,
-                )
-        else:
-            status, _ = await self._stream_fish_to_channel(
-                prepared, voice, ogg_cache_key, request_config=fish_cfg,
-            )
-        if status == "pre_audio":
-            cb.record_failure()
-        elif status == "ok":
+        stream = self._stream_fish_opus_to_channel if direct else self._stream_fish_to_channel
+        status, _ = await stream(prepared, voice, ogg_cache_key, request_config=fish_cfg)
+        if status == "ok":
             cb.record_success()
         elif status != "cancelled":
-            cb.record_failure()
+            self.tts_dispatcher.record_failure(cb, prepared.error)
         return status
-
-    @staticmethod
-    def _store_discord_frames(cache, text: str, cache_key: str, frames: list[bytes]) -> None:
-        if not frames:
-            return
-        final = cache.cache_path_for(text, cache_key, "dopus")
-        final.parent.mkdir(parents=True, exist_ok=True)
-        part = final.parent / f"{final.stem}.{uuid.uuid4().hex}.tmp"
-        try:
-            with part.open("wb") as output:
-                output.write(FRAME_CACHE_MAGIC)
-                for packet in frames:
-                    write_frame(output, packet)
-            os.replace(part, final)
-            cache.commit_file(text, final, cache_key)
-        finally:
-            part.unlink(missing_ok=True)
 
     async def _generate_file_into(self, prepared: PreparedAudio, voice) -> None:
         if prepared.cancelled:
@@ -843,21 +765,33 @@ class SynthesisPipelineMixin:
             prepared.job.text, voice_id=mm.voice_id, model=mm.model, speed=mm.speed,
             vol=mm.vol, pitch=mm.pitch, emotion=mm.emotion, language_boost=mm.language_boost,
         )
-        return await self._decode_stream_to_channel(prepared, voice, agen, "mp3", voice.name, "mp3")
+        return await self._decode_stream_to_channel(
+            prepared, voice, agen, "mp3", voice_cache_key(voice), "mp3",
+        )
 
     async def _stream_fish_opus_to_channel(
-        self, prepared: PreparedAudio, voice, cache_key: str, *, request_config=None,
+        self, prepared: PreparedAudio, voice, ogg_cache_key: str, *, request_config=None,
     ) -> tuple[str, int]:
-        """Demux Fish Ogg directly into Discord-ready 20 ms Opus packets."""
+        """Demux Fish Ogg directly into Discord-ready 20 ms Opus packets.
+
+        FISH_TTFA_TIMEOUT covers the first audio packet, not just the first
+        HTTP bytes (Fish sends the Ogg header page before it generates). If
+        the packets cannot go to Discord as-is, the bytes already received
+        are handed to the ffmpeg path instead of paying for a second request.
+        """
         job = prepared.job
+        cache_key = ogg_cache_key + DISCORD_OPUS_CACHE_SUFFIX
         agen = self.tts_dispatcher.fish.stream_audio(
             job.text, reference_id=voice.fish.reference_id, params=voice.fish,
             request_config=request_config,
         )
         demuxer = OggOpusDemuxer()
         frame_limit = playback_frame_limit(job.text, voice)
+        deadline = time.monotonic() + config.FISH_TTFA_TIMEOUT
         frames_count = 0
         limit_hit = False
+        to_ffmpeg = False
+        received: list[bytes] = []  # bytes before the first packet, for the ffmpeg fallback
         status = "ok"
         cache = self.tts_dispatcher.cache
         cache_final: Path | None = None
@@ -873,6 +807,16 @@ class SynthesisPipelineMixin:
             except OSError:
                 cache_final = part_path = cache_part = None
 
+        async def next_chunk() -> bytes | None:
+            try:
+                if frames_count:
+                    return await agen.__anext__()
+                return await asyncio.wait_for(
+                    agen.__anext__(), timeout=max(deadline - time.monotonic(), 0),
+                )
+            except StopAsyncIteration:
+                return None
+
         async def consume(chunk: bytes) -> None:
             nonlocal frames_count, limit_hit, cache_part
             packets = demuxer.feed(chunk)
@@ -881,7 +825,6 @@ class SynthesisPipelineMixin:
                 limit_hit = True
             if not packets:
                 return
-            prepared.codec = "opus"
             if frames_count == 0:
                 log.info(
                     "Fish direct first packet guild=%s message_to_packet_s=%.3f",
@@ -898,51 +841,71 @@ class SynthesisPipelineMixin:
             frames_count += len(packets)
 
         try:
-            try:
-                first_chunk = await asyncio.wait_for(
-                    agen.__anext__(), timeout=config.FISH_TTFA_TIMEOUT,
-                )
-            except StopAsyncIteration:
-                log.warning("Fish stream produced no audio; Piper fallback guild=%s", job.guild_id)
-                status = "pre_audio"
-            except asyncio.TimeoutError:
-                log.warning(
-                    "Fish TTFA exceeded %.2fs; Piper fallback guild=%s chars=%d",
-                    config.FISH_TTFA_TIMEOUT, job.guild_id, len(job.text),
-                )
-                status = "pre_audio"
-            else:
-                await consume(first_chunk)
-                if not limit_hit:
-                    async for chunk in agen:
-                        if prepared.cancelled:
-                            status = "cancelled"
-                            break
-                        await consume(chunk)
-                        if limit_hit:
-                            break
-                if status == "ok" and not limit_hit:
-                    demuxer.finish()
+            while True:
+                chunk = await next_chunk()
+                if chunk is None:
+                    if frames_count:
+                        demuxer.finish()
+                    else:
+                        log.warning("Fish stream produced no audio; Piper fallback guild=%s", job.guild_id)
+                        status = "pre_audio"
+                    break
+                if prepared.cancelled:
+                    status = "cancelled"
+                    break
+                if not frames_count:
+                    received.append(chunk)
+                await consume(chunk)
+                if limit_hit:
+                    break
+        except asyncio.TimeoutError:
+            log.warning(
+                "Fish first audio exceeded %.2fs; Piper fallback guild=%s chars=%d",
+                config.FISH_TTFA_TIMEOUT, job.guild_id, len(job.text),
+            )
+            status = "pre_audio"
         except UnsupportedOpusStream as exc:
-            log.warning("Fish direct Opus stream rejected after %d packets: %s", frames_count, exc)
-            status = "truncated" if frames_count else "unsupported"
+            if frames_count:
+                log.warning("Fish direct Opus stream rejected after %d packets: %s", frames_count, exc)
+                status = "truncated"
+            else:
+                log.warning("Fish Opus packets not playable directly (%s); decoding with ffmpeg", exc)
+                to_ffmpeg = True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            prepared.error = exc
             log.warning("Fish direct Opus stream failed after %d packets: %s", frames_count, exc)
             status = "truncated" if frames_count else "pre_audio"
         finally:
-            await agen.aclose()
+            if not to_ffmpeg:
+                await agen.aclose()
             if cache_part is not None:
                 cache_part.close()
+
+        if to_ffmpeg:
+            if part_path is not None:
+                part_path.unlink(missing_ok=True)
+
+            async def replay():
+                try:
+                    for chunk in received:
+                        yield chunk
+                    async for chunk in agen:
+                        yield chunk
+                finally:
+                    await agen.aclose()
+
+            return await self._decode_stream_to_channel(
+                prepared, voice, replay(), "ogg", ogg_cache_key, "opus",
+                ttfa_timeout=max(deadline - time.monotonic(), 0.5),
+            )
 
         if prepared.cancelled:
             status = "cancelled"
         elif limit_hit:
             status = "truncated"
             log.warning("Fish direct audio length limit hit guild=%s frames=%d", job.guild_id, frames_count)
-        elif status == "ok" and frames_count == 0:
-            status = "pre_audio"
         if part_path is not None:
             if status == "ok" and cache_final is not None and cache_part is not None:
                 try:
@@ -979,6 +942,9 @@ class SynthesisPipelineMixin:
         job = prepared.job
         if ttfa_timeout is None:
             ttfa_timeout = config.TTS_STREAM_TTFA_TIMEOUT
+        # The budget runs until the first decoded frame: an Ogg stream's first
+        # chunk may be only headers, so the first chunk alone proves nothing.
+        deadline = time.monotonic() + ttfa_timeout
         try:
             first_chunk = await asyncio.wait_for(agen.__anext__(), timeout=ttfa_timeout)
         except StopAsyncIteration:
@@ -993,8 +959,7 @@ class SynthesisPipelineMixin:
             await agen.aclose()
             log.warning("Stream failed before first audio (%s: %s); Piper fallback",
                         type(exc).__name__, exc)
-            if isinstance(exc, MiniMaxQuotaExhaustedError):
-                self.tts_dispatcher.record_cloud_failure(exc)
+            prepared.error = exc
             return ("pre_audio", 0)
         if prepared.cancelled:
             await agen.aclose()
@@ -1064,10 +1029,26 @@ class SynthesisPipelineMixin:
         frame_limit = playback_frame_limit(job.text, voice)
         frames_count = 0
         limit_hit = False
+        ttfa_expired = False
         leftover = b""
         try:
             while True:
-                data = await proc.stdout.read(PCM_FRAME_BYTES * 16)
+                read = proc.stdout.read(PCM_FRAME_BYTES * 16)
+                if frames_count:
+                    data = await read
+                else:
+                    try:
+                        data = await asyncio.wait_for(
+                            read, timeout=max(deadline - time.monotonic(), 0),
+                        )
+                    except asyncio.TimeoutError:
+                        ttfa_expired = True
+                        feeder.cancel()
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        break
                 if not data:
                     break
                 buf = leftover + data
@@ -1094,8 +1075,8 @@ class SynthesisPipelineMixin:
                         break
                 leftover = buf[n:]
         finally:
-            await feeder
-            if leftover and not prepared.cancelled and not limit_hit:
+            await asyncio.gather(feeder, return_exceptions=True)
+            if leftover and not prepared.cancelled and not limit_hit and not ttfa_expired:
                 await prepared.channel.put(
                     [leftover + b"\x00" * (PCM_FRAME_BYTES - len(leftover))]
                 )
@@ -1115,6 +1096,10 @@ class SynthesisPipelineMixin:
         if prepared.cancelled:
             _discard()
             return ("cancelled", frames_count)
+        if ttfa_expired:
+            _discard()
+            log.warning("Stream first audio exceeded %.2fs; Piper fallback", ttfa_timeout)
+            return ("pre_audio", 0)
         if limit_hit:
             _discard()  # a stutter loop must never be cached
             return ("truncated", frames_count)

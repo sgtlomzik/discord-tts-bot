@@ -13,9 +13,7 @@ time.
 """
 
 import logging
-import re
 import time
-import uuid
 
 import discord
 from discord import app_commands
@@ -51,19 +49,6 @@ async def require_guild_manager(interaction: discord.Interaction) -> bool:
         await interaction.response.send_message("Нужны права Manage Server или Administrator.", ephemeral=True)
         return False
     return True
-
-
-def _derive_minimax_voice_id(name: str) -> str:
-    """Compatibility helper retained for imports from bot.py."""
-    base = re.sub(r"[^a-z0-9]", "", name.lower())
-    if not base or not base[0].isalpha():
-        base = "voice" + base
-    base = base[:16]
-    suffix = str(uuid.uuid4().int)[:4]
-    vid = base + suffix
-    if len(vid) < 8:
-        vid = (vid + "00000000")[:8]
-    return vid
 
 
 _EMOTION_CHOICES = [
@@ -422,35 +407,12 @@ def build_commands(bot):
             )
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        probe = config.TMP_DIR / f"fish_import_{uuid.uuid4().hex}.opus"
-        try:
-            await fish.synthesize("Проверка голоса.", probe, reference_id=reference_id)
-            with probe.open("rb") as audio:
-                if audio.read(4) != b"OggS":
-                    raise ValueError("Fish не вернул аудио Ogg/Opus")
-        except Exception as exc:
-            await interaction.followup.send(
-                f"Голос недоступен для озвучки: {type(exc).__name__}: {exc}", ephemeral=True,
-            )
-            return
-        finally:
-            probe.unlink(missing_ok=True)
-        record = voice_registry.VoiceRecord(
-            name=name,
-            label=f"{name} (Fish)",
-            description=description.strip(),
-            provider=voice_registry.PROVIDER_FISH,
-            fish=voice_registry.FishParams(reference_id=reference_id),
+        error = await bot.register_fish_voice(
+            name=name, reference_id=reference_id,
+            label=f"{name} (Fish)", description=description.strip(),
         )
-        if name in bot.voice_registry:
-            await interaction.followup.send(f"Голос `{name}` уже существует.", ephemeral=True)
-            return
-        bot.voice_registry.add(record)
-        try:
-            bot.persist_voice_registry()
-        except OSError as exc:
-            bot.voice_registry.voices.pop(name, None)
-            await interaction.followup.send(f"Не удалось сохранить голос: {exc}", ephemeral=True)
+        if error:
+            await interaction.followup.send(f"Голос не добавлен: {error}.", ephemeral=True)
             return
         await interaction.followup.send(
             f"Добавлен голос `{name}` (Fish reference_id=`{reference_id}`). "
@@ -460,7 +422,7 @@ def build_commands(bot):
     @tts_group.command(name="voice-clone", description="Клонировать голос в Fish Audio из аудиофайла")
     @app_commands.describe(
         name="Имя профиля (kebab-case: a-z, 0-9, дефис)",
-        sample="Аудиосэмпл (mp3/m4a/wav/ogg/opus, от 10 сек, до 20 МБ)",
+        sample="Аудиосэмпл (mp3/m4a/wav/ogg/opus/flac, от 10 сек, до 20 МБ)",
         description="Описание (необязательно)",
     )
     async def slash_tts_voice_clone(
@@ -491,10 +453,12 @@ def build_commands(bot):
             )
             return
         fname = sample.filename.lower()
-        # .ogg is what Discord voice messages are saved as.
-        if not fname.endswith((".mp3", ".m4a", ".wav", ".ogg", ".opus")):
+        ctype = (sample.content_type or "").lower()
+        # Trust Discord's audio/* content type; the extensions cover uploads
+        # without one. .ogg is what Discord voice messages are saved as.
+        if not (ctype.startswith("audio/") or fname.endswith((".mp3", ".m4a", ".wav", ".ogg", ".opus", ".flac"))):
             await interaction.response.send_message(
-                "Нужен аудиофайл (mp3/m4a/wav/ogg/opus).", ephemeral=True
+                "Нужен аудиофайл (mp3/m4a/wav/ogg/opus/flac).", ephemeral=True
             )
             return
         if bot.tts_dispatcher.fish is None:

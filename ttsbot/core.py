@@ -8,6 +8,7 @@ are attached from the outside by the composition root (bot.py).
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -86,7 +87,13 @@ class TTSBot(
             minimax_model=_mm_seed.model,
             minimax_language_boost=_mm_seed.language_boost,
         )
-        fish_cfg = FishConfig.from_env()
+        try:
+            fish_cfg = FishConfig.from_env()
+        except ValueError as exc:
+            if os.getenv("FISH_API_KEY", "").strip():
+                raise  # Fish is wanted, so a bad setting must stop startup
+            log.warning("Ignoring invalid FISH_* settings; Fish is disabled: %s", exc)
+            fish_cfg = FishConfig(api_key="")
         self.fish_provider = FishProvider(fish_cfg) if fish_cfg.api_key else None
         if fish_cfg.reference_id:
             current = self.voice_registry.get("fish-default")
@@ -100,7 +107,11 @@ class TTSBot(
                 )
             if current != fish_record:
                 self.voice_registry.add(fish_record)
-                voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
+                try:
+                    voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
+                except OSError:
+                    log.exception("Could not save fish-default to %s; keeping it in memory",
+                                  config.VOICES_REGISTRY_PATH)
         self.config_store = BotConfigStore(
             config.BOT_CONFIG_PATH, config.WHITELIST_USERS, voice_registry=self.voice_registry
         )
