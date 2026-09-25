@@ -421,7 +421,8 @@ Current commands:
 - `voice-describe`, `voice-say-set`, `voice-say-clear` - voice metadata
   and fixed phrases;
 - `emoji-alias`, `emoji-aliases`, `emoji-alias-remove` - custom emoji
-  pronunciations;
+  pronunciations. Aliases are keyed by emoji id and apply in every guild,
+  so only the guild that owns an emoji can set, remove or see its alias;
 - `status` - show current runtime state;
 - `stats` - cache, queue, per-session usage and breaker states;
 - `limit` - show or change the per-message text length cap (persisted in `data/config.json`);

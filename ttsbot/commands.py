@@ -690,13 +690,28 @@ def build_commands(bot):
         )
 
 
+    # Aliases are keyed by emoji id and shared by every guild, so only the
+    # guild that owns an emoji may set, remove or list its pronunciation.
+    # Otherwise any server's manager could make the bot say arbitrary text
+    # in other servers whenever their emoji is posted.
+    def _owned_emoji_ids(guild) -> set[str]:
+        return {str(e.id) for e in (getattr(guild, "emojis", None) or ())}
+
+    _FOREIGN_EMOJI = (
+        "Этот эмодзи не с этого сервера. Произношение эмодзи задаёт только "
+        "сервер, которому он принадлежит."
+    )
+
     async def emoji_alias_autocomplete(
         interaction: discord.Interaction,
         current: str,
     ) -> list[app_commands.Choice[str]]:
         current = current.lower()
+        owned = _owned_emoji_ids(interaction.guild)
         choices: list[app_commands.Choice[str]] = []
         for emoji_id, entry in bot.config_store.emoji_aliases.items():
+            if emoji_id not in owned:
+                continue
             name = entry.get("name") or emoji_id
             say = entry.get("say", "")
             if current in name.lower() or current in say.lower() or current in emoji_id:
@@ -727,6 +742,9 @@ def build_commands(bot):
             )
             return
         emoji_id, name = parsed
+        if emoji_id not in _owned_emoji_ids(interaction.guild):
+            await interaction.response.send_message(_FOREIGN_EMOJI, ephemeral=True)
+            return
         say = sanitize_pronunciation(pronunciation)
         if not say:
             await interaction.response.send_message(
@@ -761,6 +779,9 @@ def build_commands(bot):
                 ephemeral=True,
             )
             return
+        if emoji_id not in _owned_emoji_ids(interaction.guild):
+            await interaction.response.send_message(_FOREIGN_EMOJI, ephemeral=True)
+            return
         if bot.config_store.remove_emoji_alias(emoji_id):
             await interaction.response.send_message(
                 f"Алиас удалён (id `{emoji_id}`).", ephemeral=True
@@ -775,10 +796,14 @@ def build_commands(bot):
     async def slash_emoji_aliases(interaction: discord.Interaction) -> None:
         if not await require_guild_manager(interaction):
             return
-        aliases = bot.config_store.emoji_aliases
+        owned = _owned_emoji_ids(interaction.guild)
+        aliases = {
+            emoji_id: entry for emoji_id, entry in bot.config_store.emoji_aliases.items()
+            if emoji_id in owned
+        }
         if not aliases:
             await interaction.response.send_message(
-                "Алиасы эмодзи не заданы. Добавьте: `/voicebot emoji-alias`.",
+                "Для эмодзи этого сервера алиасы не заданы. Добавьте: `/voicebot emoji-alias`.",
                 ephemeral=True,
             )
             return

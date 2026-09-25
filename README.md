@@ -28,7 +28,8 @@ MiniMax voices remain available. Cloud failures fall back to Piper.
   emoji and questions play immediately.
 - **Speech-friendly text handling** — URLs and markup are stripped, unicode
   emoji are spoken by their Russian names, mentions are read as display
-  names, custom server emoji get configurable pronunciations.
+  names, custom server emoji get configurable pronunciations (each server
+  sets them only for its own emoji).
 - **Managed entirely from Discord** — the `/voicebot` slash-command group
   covers enabling TTS, the user whitelist, voices, cloning, emoji aliases,
   stats and queue control.
