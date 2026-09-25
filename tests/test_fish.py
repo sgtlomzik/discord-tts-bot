@@ -471,6 +471,7 @@ class FishDirectOpusTests(unittest.TestCase):
             demuxer.feed(ogg)
 
 
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
 class FishDecodeTests(unittest.IsolatedAsyncioTestCase):
     async def test_direct_opus_arrives_before_final_ogg_page(self):
         import subprocess

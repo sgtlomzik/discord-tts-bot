@@ -16,6 +16,11 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Install system packages
+        # ffmpeg and libopus are runtime deps (see Dockerfile); without them
+        # the audio and Fish decode tests are skipped.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg libopus0
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
