@@ -13,8 +13,10 @@ The bot is a single-process Discord service that:
 4. optionally merges short messages into a buffer;
 5. queues TTS jobs;
 6. synthesizes speech with the selected Fish, MiniMax or Piper voice;
-7. converts the streaming audio or generated file into PCM frames;
-8. plays the frames into a Discord voice channel;
+7. turns the result into 20 ms frames: Fish Opus packets pass through
+   as-is, everything else is decoded to PCM;
+8. plays the frames into a Discord voice channel through one continuous
+   Opus player;
 9. disconnects when the voice channel goes idle.
 
 The current production runtime is intentionally small:
@@ -42,8 +44,11 @@ The active runtime pieces are:
   - `models.py` - `VoiceProfile`, `GuildConfig`, `TTSJob`,
     `PreparedAudio` and the hardcoded Piper `VOICE_PROFILES`.
   - `store.py` - `BotConfigStore` (data/config.json persistence).
-  - `audio.py` - PCM constants and framing, ffmpeg command builders,
-    Opus loading, `ContinuousTTSAudioSource`.
+  - `audio.py` - PCM constants and framing, ffmpeg command builders
+    (including the Fish pitch filter), Opus loading,
+    `ContinuousTTSAudioSource`.
+  - `ogg_opus.py` - incremental Ogg/Opus demuxer that turns Fish HTTP
+    chunks into 20 ms Discord packets, plus the `.dopus` frame-cache format.
   - `core.py` - the `TTSBot` class: construction and task lifecycle,
     composed from the four concern mixins below.
   - `voice_lifecycle.py` - connect/move locks, cooldowns, stale-client
@@ -52,15 +57,18 @@ The active runtime pieces are:
     decisions.
   - `pipeline.py` - Piper/MiniMax/Fish synthesis, the streaming fast path,
     the prefetch generation worker and the legacy single worker.
-  - `playback.py` - PCM preparation and the continuous player feed.
+  - `playback.py` - PCM preparation and the continuous Opus player feed.
   - `commands.py` - `build_commands(bot)` creates the /voicebot group
     bound to a bot instance; `events.py` - `register_events(bot)`.
 - `ttsbot/providers.py` - provider abstraction: dispatcher, MiniMax
-  client, phrase cache, circuit breaker.
+  client and its error classes, phrase cache, circuit breaker (including
+  the long quota trip).
 - `ttsbot/fish.py` - Fish HTTP client, request configuration and in-flight
   deduplication.
 - `ttsbot/voice_registry.py` - the unified voice catalog
   (data/voices.json).
+- `scripts/` - operator tools: model download, MiniMax voice cloning,
+  `migrate_fish_default.py` (moves every guild to `fish-default`).
 - `tests/` - unit and async integration-style tests.
 - `docker-compose.yml` - container wiring and bind mounts.
 - `Dockerfile` - image build and system packages.
@@ -253,19 +261,44 @@ This is the part to preserve if a new TTS engine is introduced. The engine can c
 
 ## 7. Synthesis Paths
 
-The Fish cache-miss path starts playback before the HTTP response completes:
+The Fish cache-miss path starts playback before the HTTP response completes.
+With pitch 0 (the default) no ffmpeg is involved:
 
 ```text
 Discord text -> Fish POST /v1/tts (Ogg/Opus chunks)
-             -> cache .tmp file -> atomic rename on success
-             -> ffmpeg stdin -> PCM 48 kHz stereo frames
+             -> OggOpusDemuxer -> 20 ms Opus packets
              -> ContinuousTTSAudioSource -> Discord
+             (packets are teed into a .dopus cache file, renamed on success)
 ```
 
-The same cache key includes the text, reference_id, model, and output/tuning
-settings. Cache hits decode the local `.opus` file through ffmpeg. Identical
-concurrent requests share one HTTP stream. A pre-audio Fish failure falls
-back to Piper. MiniMax remains selectable from the voice registry.
+A voice with a non-zero pitch, or a stream whose packets are not 20 ms,
+goes through ffmpeg instead:
+
+```text
+Fish Ogg/Opus -> ffmpeg stdin (pitch filter) -> PCM 48 kHz stereo frames
+              -> ContinuousTTSAudioSource (encodes to Opus) -> Discord
+              (the raw Ogg is cached as .opus)
+```
+
+The cache key covers the text, reference_id, model, latency, output format
+and the tuning sent to Fish. Pitch is left out because ffmpeg applies it
+after the request. `.dopus` hits play without decoding; `.opus` hits are
+demuxed (pitch 0) or decoded through ffmpeg. Identical concurrent requests
+share one HTTP stream.
+
+Fallbacks and breakers:
+
+- No first audio within `FISH_TTFA_TIMEOUT` (default 5 s; MiniMax uses
+  `TTS_STREAM_TTFA_TIMEOUT`), an HTTP error or an open breaker sends the
+  message to the registry's Piper fallback voice. Every case is logged.
+- Fish and MiniMax each have a `CircuitBreaker` (`CB_FAILURE_THRESHOLD`
+  failures open it for `CB_COOLDOWN_SECONDS`).
+- MiniMax reports errors as a plain JSON body even on streaming requests.
+  Status 1008/2056 raise `MiniMaxQuotaExhaustedError`, and
+  `TTSDispatcher.record_cloud_failure` then calls `CircuitBreaker.trip()`
+  for `MINIMAX_QUOTA_COOLDOWN_SECONDS`, which ordinary failures cannot
+  shorten. HTTP 429 and status 1039 are plain `MiniMaxQuotaError` and count
+  as ordinary failures.
 
 `/voicebot voice-clone` uploads a sample to Fish `POST /model` as multipart,
 waits for `GET /model/{id}` to report `trained`, probes the new `reference_id`
@@ -288,8 +321,9 @@ The key runtime objects are:
 - `PiperVoice` - loaded lazily and cached by model path;
 - `SynthesisConfig` - used for speaker and length-scale tuning when needed.
 
-The output of every engine is converted to the same PCM frame format; the
-Discord playback source and voice lifecycle are shared.
+Every engine ends up as 20 ms frames in the same player: Fish as Opus
+packets, Piper and MiniMax as PCM. The Discord playback source and voice
+lifecycle are shared.
 
 ## 8. Playback Path
 
@@ -297,23 +331,28 @@ After synthesis, the bot converts audio into Discord-friendly output.
 
 There are two playback modes:
 
-- continuous PCM stream;
+- continuous Opus stream (default, `TTS_CONTINUOUS_STREAM=1`);
 - fallback FFmpeg playback file path.
 
-The default path uses the continuous stream source:
+The continuous source is always in Opus mode:
 
 ```text
-WAV, MP3 or Ogg/Opus
-  -> ffmpeg PCM frames
-  -> ContinuousTTSAudioSource
-  -> Discord voice client
+Fish Opus packets ---------------------------\
+WAV / MP3 / Ogg -> ffmpeg -> PCM frames -----> ContinuousTTSAudioSource -> Discord
 ```
+
+`ContinuousTTSAudioSource.is_opus()` is true, so discord.py sends its
+packets unchanged. It tells the two frame kinds apart by size (a PCM frame is
+3840 bytes, an Opus packet at most 1275) and encodes PCM with its own
+`discord.opus.Encoder`, created lazily on the player thread. Between jobs it
+sends an Opus silence frame.
 
 Why this matters:
 
 - it keeps playback smooth;
 - it allows idle silence between jobs;
-- it avoids reopening the player for every job when continuous stream is enabled.
+- one player serves every engine, so alternating Fish and Piper/MiniMax
+  voices never stops and restarts it.
 
 The code also applies optional ffmpeg tuning:
 
@@ -361,7 +400,17 @@ Current commands:
 - `voice-set` - change the guild default voice;
 - `voice-user` - assign a voice profile to one member;
 - `voice-clear` - clear a member's voice override;
+- `voice-add` - register an existing MiniMax voice_id;
+- `voice-fish-add` - register a Fish library voice by reference_id;
+- `voice-clone` - clone a voice in Fish from an audio sample;
+- `voice-tune` / `voice-fish-tune` - tune a MiniMax / Fish voice;
+- `fish-latency` - show or set the global Fish latency mode;
+- `voice-describe`, `voice-say-set`, `voice-say-clear` - voice metadata
+  and fixed phrases;
+- `emoji-alias`, `emoji-aliases`, `emoji-alias-remove` - custom emoji
+  pronunciations;
 - `status` - show current runtime state;
+- `stats` - cache, queue, per-session usage and breaker states;
 - `limit` - show or change the per-message text length cap (persisted in `data/config.json`);
 - `queue-clear` - clear queued work;
 - `test` - enqueue a test phrase, optionally to a specific voice channel.
@@ -392,6 +441,9 @@ The important current engine-specific values are:
 - `FISH_FORMAT=opus`, `FISH_LATENCY=low`, `FISH_CHUNK_LENGTH=150`
 - `FISH_OPUS_BITRATE=48000`
 - `FISH_API_KEY` and `FISH_REFERENCE_ID` supplied from the untracked `.env`
+- `FISH_TTFA_TIMEOUT=5`
+- `CB_FAILURE_THRESHOLD=3`, `CB_COOLDOWN_SECONDS=60`
+- `MINIMAX_QUOTA_COOLDOWN_SECONDS=1800`
 - `TTS_DEFAULT_VOICE_PROFILE=piper-ruslan`
 - `PIPER_MODEL_PATH=/app/models/ru_RU-ruslan-medium.onnx`
 - `PIPER_CONFIG_PATH=/app/models/ru_RU-ruslan-medium.onnx.json`
@@ -411,6 +463,11 @@ It covers:
 - selective hold edge cases;
 - voice connect cooldowns;
 - worker success and failure paths.
+
+Engine-specific suites sit next to it: `test_fish.py` (Fish requests,
+Ogg/Opus demuxing, the mixed Opus/PCM player, cache keys, pitch),
+`test_minimax_quota.py` (quota errors, the long breaker trip, the Fish
+first-audio timeout) and the `test_providers*.py` files.
 
 The current test suite is important because it pins the public surface of the package: the tests exec `bot.py` per test case, mutate `ttsbot.config` for tuning, and exercise the pipeline through the facade — so a module can be reworked internally while the suite guards the observable behavior.
 
