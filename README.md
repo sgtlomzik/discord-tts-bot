@@ -19,8 +19,10 @@ MiniMax voices remain available. Cloud failures fall back to Piper.
   fall back to Piper; repeated phrases use an on-disk LRU cache.
 - **Low latency** — Fish streams Ogg/Opus over HTTP; the bot extracts 20 ms
   Opus packets and sends them straight to Discord without decoding or
-  re-encoding. A keep-alive HTTP client is reused, and the next message is
-  synthesized while the previous plays.
+  re-encoding. One continuous Opus player serves every engine (Piper and
+  MiniMax PCM is encoded in place), so switching voices never restarts it.
+  A keep-alive HTTP client is reused, and the next message is synthesized
+  while the previous plays.
 - **Smart message merging** — short bursts of messages from one user are
   merged into a single natural phrase (`selective_hold_v2`), while reactions,
   emoji and questions play immediately.
@@ -108,10 +110,22 @@ For Fish, put `FISH_API_KEY` and `FISH_REFERENCE_ID` in `.env`, then select
 voice assignments must be changed or cleared separately. The direct playback
 cache stores Discord-ready packets in `.dopus`; older `.opus` files are
 converted on read without ffmpeg. Cache keys include the text, `reference_id`,
-model, and TTS settings.
+model, and the settings sent to Fish (pitch is not among them).
+
+If Fish sends no audio within `FISH_TTFA_TIMEOUT` seconds, that message is
+spoken by the Piper fallback voice and a `Fish TTFA exceeded` warning is
+logged. Repeated Fish or MiniMax failures open a circuit breaker for
+`CB_COOLDOWN_SECONDS`. A MiniMax balance or plan limit (status 1008 or 2056)
+pauses MiniMax for `MINIMAX_QUOTA_COOLDOWN_SECONDS` instead; rate limits
+(HTTP 429, status 1039) count as ordinary failures.
+
+To move an existing install to Fish in one step, stop the bot and run
+`python scripts/migrate_fish_default.py data/config.json`. It sets every
+guild's default voice to `fish-default`, clears per-user overrides and writes
+a timestamped backup next to `config.json`.
 
 `/voicebot voice-clone` now creates a private Fish voice from an attached
-WAV/MP3/M4A/Opus sample. The bot waits for training, checks a short TTS
+WAV/MP3/M4A/OGG/Opus sample (OGG covers Discord voice messages). The bot waits for training, checks a short TTS
 generation, then saves its `reference_id` in `data/voices.json`. Assign it
 with `voice-set` or `voice-user`.
 Import a library voice with `/voicebot voice-fish-add name:my-voice
@@ -123,11 +137,14 @@ Fish latency mode in Discord with `/voicebot fish-latency mode:balanced`
 The default is `low`; a Discord selection persists in `data/config.json`
 across restarts and overrides `FISH_LATENCY` from `.env`. The mode is included
 in TTS cache keys. Pitch is applied
-locally by ffmpeg and disables direct Opus playback for that profile. Packets
+locally by ffmpeg, so changing it reuses cached Fish audio, but it disables
+direct Opus playback for that profile. Packets
 with a non-20 ms duration also fall back to ffmpeg. The other controls use
-Fish TTS parameters. Voice tuning survives restarts and changes the cache key.
+Fish TTS parameters. Voice tuning survives restarts; every setting except
+pitch changes the cache key.
 `/voicebot stats` reports successful Fish requests and input characters for
-the current session; this is not Fish billing usage.
+the current session (this is not Fish billing usage) and the Fish and MiniMax
+circuit-breaker states with the remaining cooldown.
 
 ## Commands
 
@@ -143,7 +160,7 @@ the current session; this is not Fish billing usage.
 ```bash
 python3.11 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -p 'test_*.py'  # ~300 tests, no network needed
+python -m unittest discover -s tests -p 'test_*.py'  # ~340 tests, no network needed
 ```
 
 The application lives in the `ttsbot/` package; `bot.py` is the entrypoint
