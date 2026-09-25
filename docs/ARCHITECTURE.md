@@ -47,6 +47,8 @@ The active runtime pieces are:
   - `audio.py` - PCM constants and framing, ffmpeg command builders
     (including the Fish pitch filter), Opus loading,
     `ContinuousTTSAudioSource`.
+  - `errors.py` - `QuotaExhaustedError`, shared by the Fish and MiniMax
+    "balance or plan used up" errors.
   - `ogg_opus.py` - incremental Ogg/Opus demuxer that turns Fish HTTP
     chunks into 20 ms Discord packets, plus the `.dopus` frame-cache format.
   - `core.py` - the `TTSBot` class: construction and task lifecycle,
@@ -271,8 +273,10 @@ Discord text -> Fish POST /v1/tts (Ogg/Opus chunks)
              (packets are teed into a .dopus cache file, renamed on success)
 ```
 
-A voice with a non-zero pitch, or a stream whose packets are not 20 ms,
-goes through ffmpeg instead:
+A voice with a non-zero pitch goes through ffmpeg instead. So does a
+stream whose packets are not 20 ms: the bytes already received are replayed
+into ffmpeg and the same HTTP stream continues, so nothing is requested
+twice.
 
 ```text
 Fish Ogg/Opus -> ffmpeg stdin (pitch filter) -> PCM 48 kHz stereo frames
@@ -282,23 +286,31 @@ Fish Ogg/Opus -> ffmpeg stdin (pitch filter) -> PCM 48 kHz stereo frames
 
 The cache key covers the text, reference_id, model, latency, output format
 and the tuning sent to Fish. Pitch is left out because ffmpeg applies it
-after the request. `.dopus` hits play without decoding; `.opus` hits are
-demuxed (pitch 0) or decoded through ffmpeg. Identical concurrent requests
-share one HTTP stream.
+after the request. `.dopus` hits play without decoding; `.opus` entries
+(pitch shift) are decoded through ffmpeg. Identical concurrent requests
+share one HTTP stream. MiniMax streaming and file paths share one cache key,
+`voice_cache_key(voice)`, which includes the voice tuning, so re-tuning a
+MiniMax voice never replays old audio.
 
 Fallbacks and breakers:
 
 - No first audio within `FISH_TTFA_TIMEOUT` (default 5 s; MiniMax uses
   `TTS_STREAM_TTFA_TIMEOUT`), an HTTP error or an open breaker sends the
-  message to the registry's Piper fallback voice. Every case is logged.
+  message to the registry's Piper fallback voice. Every case is logged. The
+  budget runs until the first audio packet or decoded frame, because an Ogg
+  stream's first bytes may be only the header pages.
 - Fish and MiniMax each have a `CircuitBreaker` (`CB_FAILURE_THRESHOLD`
-  failures open it for `CB_COOLDOWN_SECONDS`).
-- MiniMax reports errors as a plain JSON body even on streaming requests.
-  Status 1008/2056 raise `MiniMaxQuotaExhaustedError`, and
-  `TTSDispatcher.record_cloud_failure` then calls `CircuitBreaker.trip()`
-  for `MINIMAX_QUOTA_COOLDOWN_SECONDS`, which ordinary failures cannot
-  shorten. HTTP 429 and status 1039 are plain `MiniMaxQuotaError` and count
-  as ordinary failures.
+  failures open it for `CB_COOLDOWN_SECONDS`). The generation code does the
+  accounting: a pre-audio exception is stored in `PreparedAudio.error` and
+  passed to `TTSDispatcher.record_failure(breaker, exc)`.
+- An exhausted balance or plan raises a `QuotaExhaustedError` subclass:
+  `FishQuotaExhaustedError` (HTTP 402) or `MiniMaxQuotaExhaustedError`
+  (status 1008/2056). `record_failure` then calls `CircuitBreaker.trip()` for
+  `TTS_QUOTA_COOLDOWN_SECONDS`, which ordinary failures cannot shorten. Rate
+  limits (HTTP 429, MiniMax 1039) count as ordinary failures.
+- MiniMax reports errors as a plain JSON body, sometimes pretty-printed, even
+  on streaming requests. The stream reader collects non-SSE lines and
+  classifies them at the end instead of trusting the `Content-Type` header.
 
 `/voicebot voice-clone` uploads a sample to Fish `POST /model` as multipart,
 waits for `GET /model/{id}` to report `trained`, probes the new `reference_id`
@@ -379,7 +391,8 @@ The persisted state includes:
 
 - whether TTS is enabled for the guild;
 - allowed users;
-- default voice profile;
+- default voice profile (new guilds get `TTS_DEFAULT_VOICE_PROFILE`, or the
+  registry fallback if that name is unknown);
 - per-user voice override.
 
 The config store is intentionally simple JSON, not a database.
@@ -443,7 +456,7 @@ The important current engine-specific values are:
 - `FISH_API_KEY` and `FISH_REFERENCE_ID` supplied from the untracked `.env`
 - `FISH_TTFA_TIMEOUT=5`
 - `CB_FAILURE_THRESHOLD=3`, `CB_COOLDOWN_SECONDS=60`
-- `MINIMAX_QUOTA_COOLDOWN_SECONDS=1800`
+- `TTS_QUOTA_COOLDOWN_SECONDS=1800`
 - `TTS_DEFAULT_VOICE_PROFILE=piper-ruslan`
 - `PIPER_MODEL_PATH=/app/models/ru_RU-ruslan-medium.onnx`
 - `PIPER_CONFIG_PATH=/app/models/ru_RU-ruslan-medium.onnx.json`

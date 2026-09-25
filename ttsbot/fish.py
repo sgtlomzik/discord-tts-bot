@@ -14,7 +14,14 @@ from typing import AsyncIterator
 
 import httpx
 
+from ttsbot.errors import QuotaExhaustedError
+
 log = logging.getLogger("tts_bot")
+
+
+def _env(name: str, default: str) -> str:
+    """Env value with an empty string treated as unset (as in .env.example)."""
+    return os.getenv(name, "").strip() or default
 
 
 @dataclass(frozen=True)
@@ -33,14 +40,14 @@ class FishConfig:
     @classmethod
     def from_env(cls) -> "FishConfig":
         cfg = cls(
-            api_key=os.getenv("FISH_API_KEY", "").strip(),
-            reference_id=os.getenv("FISH_REFERENCE_ID", "").strip(),
-            model=os.getenv("FISH_MODEL", "s2.1-pro-free").strip(),
-            format=os.getenv("FISH_FORMAT", "opus").strip().lower(),
-            latency=os.getenv("FISH_LATENCY", "low").strip().lower(),
-            chunk_length=int(os.getenv("FISH_CHUNK_LENGTH", "150")),
-            opus_bitrate=int(os.getenv("FISH_OPUS_BITRATE", "48000")),
-            base_url=os.getenv("FISH_BASE_URL", "https://api.fish.audio").strip(),
+            api_key=_env("FISH_API_KEY", ""),
+            reference_id=_env("FISH_REFERENCE_ID", ""),
+            model=_env("FISH_MODEL", "s2.1-pro-free"),
+            format=_env("FISH_FORMAT", "opus").lower(),
+            latency=_env("FISH_LATENCY", "low").lower(),
+            chunk_length=int(_env("FISH_CHUNK_LENGTH", "150")),
+            opus_bitrate=int(_env("FISH_OPUS_BITRATE", "48000")),
+            base_url=_env("FISH_BASE_URL", "https://api.fish.audio"),
         )
         if cfg.format != "opus" or cfg.latency not in {"low", "balanced", "normal"}:
             raise ValueError("Fish requires opus format and a supported latency mode")
@@ -71,7 +78,20 @@ class FishConfig:
         return "fish:" + hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 class FishError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class FishQuotaExhaustedError(FishError, QuotaExhaustedError):
+    """HTTP 402: the Fish balance is used up."""
+
+
+def _http_error(what: str, status_code: int, detail: str) -> FishError:
+    message = f"{what} HTTP {status_code}: {detail}"
+    if status_code == 402:
+        return FishQuotaExhaustedError(message, status_code)
+    return FishError(message, status_code)
 
 
 def fish_tts_text(text: str, emotion: str) -> str:
@@ -167,7 +187,7 @@ class FishProvider:
             ) as response:
                 if response.status_code != 200:
                     detail = (await response.aread())[:300].decode("utf-8", "replace")
-                    raise FishError(f"Fish HTTP {response.status_code}: {detail}")
+                    raise _http_error("Fish", response.status_code, detail)
                 async for chunk in response.aiter_bytes():
                     if chunk:
                         async with flight.condition:
@@ -261,7 +281,7 @@ class FishProvider:
             timeout=90.0,
         )
         if response.status_code != 201:
-            raise FishError(f"Fish clone HTTP {response.status_code}: {response.text[:300]}")
+            raise _http_error("Fish clone", response.status_code, response.text[:300])
         try:
             payload = response.json()
             reference_id = payload["_id"]
@@ -283,8 +303,8 @@ class FishProvider:
                 timeout=15.0,
             )
             if model.status_code != 200:
-                raise FishError(
-                    f"Fish clone {reference_id} state HTTP {model.status_code}: {model.text[:300]}"
+                raise _http_error(
+                    f"Fish clone {reference_id} state", model.status_code, model.text[:300],
                 )
             try:
                 state = model.json()["state"]

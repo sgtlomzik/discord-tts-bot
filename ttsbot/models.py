@@ -51,12 +51,14 @@ class PreparedAudio:
     (``list[bytes]`` of PCM or raw Opus) and ends it with a ``None`` sentinel. The playback
     worker drains ``channel`` into the continuous player in order. ``cancelled``
     is set by ``queue-clear`` to stop generation/playback of this item.
+    ``error`` holds the exception behind a pre-audio stream failure, so the
+    caller can count it against the right circuit breaker.
     """
     job: TTSJob
     channel: asyncio.Queue
     cancelled: bool = False
     provider: str = ""
-    codec: str = "pcm"
+    error: BaseException | None = None
 
 
 # Hardcoded Piper profiles. This dict is mutated IN PLACE by

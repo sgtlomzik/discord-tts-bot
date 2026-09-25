@@ -95,37 +95,41 @@ Everything is configured through environment variables — see
 |---|---|
 | `DISCORD_TOKEN` | Bot token (**required**) |
 | `WHITELIST_USERS` | Comma-separated Discord user IDs allowed to use TTS |
-| `TTS_DEFAULT_VOICE_PROFILE` | Default voice (`piper-ruslan`, `piper-irina`, …) |
+| `TTS_DEFAULT_VOICE_PROFILE` | Default voice for new servers (`piper-ruslan`, `fish-default`, …) |
 | `MINIMAX_API_KEY` | Enables MiniMax cloud voices (optional) |
 | `FISH_API_KEY` | Fish Audio key; keep it in `.env` only |
 | `FISH_REFERENCE_ID` | Fish voice ID; seeds the `fish-default` profile |
-| `FISH_TTFA_TIMEOUT` | Seconds to wait for Fish's first audio before Piper (default 5) |
-| `MINIMAX_QUOTA_COOLDOWN_SECONDS` | Pause MiniMax after a quota/balance error (default 1800) |
+| `FISH_TTFA_TIMEOUT` | Seconds to wait for Fish's first audio packet before Piper (default 5) |
+| `TTS_QUOTA_COOLDOWN_SECONDS` | Pause Fish or MiniMax after a balance/plan error (default 1800) |
 | `TTS_PRIMARY_PROVIDER` | `local`, `minimax`, or `fish` |
 | `TTS_MERGE_ALGORITHM` | `selective_hold_v2`, `legacy` or `off` |
 
 For Fish, put `FISH_API_KEY` and `FISH_REFERENCE_ID` in `.env`, then select
-`/voicebot voice-set voice:fish-default`. Defaults are `s2.1-pro-free`,
+`/voicebot voice-set voice:fish-default`, or set
+`TTS_DEFAULT_VOICE_PROFILE=fish-default` so new servers start with Fish. The
+bot never switches the default to Fish on its own. Defaults are `s2.1-pro-free`,
 `opus`, `low`, `chunk_length=150`, and `opus_bitrate=48000`. Existing per-user
 voice assignments must be changed or cleared separately. The direct playback
-cache stores Discord-ready packets in `.dopus`; older `.opus` files are
-converted on read without ffmpeg. Cache keys include the text, `reference_id`,
+cache stores Discord-ready packets in `.dopus`; voices with a pitch shift keep
+the raw Ogg in `.opus`. Cache keys include the text, `reference_id`,
 model, and the settings sent to Fish (pitch is not among them).
 
-If Fish sends no audio within `FISH_TTFA_TIMEOUT` seconds, that message is
-spoken by the Piper fallback voice and a `Fish TTFA exceeded` warning is
-logged. Repeated Fish or MiniMax failures open a circuit breaker for
-`CB_COOLDOWN_SECONDS`. A MiniMax balance or plan limit (status 1008 or 2056)
-pauses MiniMax for `MINIMAX_QUOTA_COOLDOWN_SECONDS` instead; rate limits
-(HTTP 429, status 1039) count as ordinary failures.
+If Fish sends no audio packet within `FISH_TTFA_TIMEOUT` seconds (response
+headers alone do not count), that message is spoken by the Piper fallback
+voice and a `Fish first audio exceeded` warning is logged. Repeated Fish or
+MiniMax failures open a circuit breaker for `CB_COOLDOWN_SECONDS`. An
+exhausted balance or plan (Fish HTTP 402, MiniMax status 1008 or 2056)
+pauses that provider for `TTS_QUOTA_COOLDOWN_SECONDS` instead; rate limits
+(HTTP 429, MiniMax status 1039) count as ordinary failures.
 
 To move an existing install to Fish in one step, stop the bot and run
 `python scripts/migrate_fish_default.py data/config.json`. It sets every
 guild's default voice to `fish-default`, clears per-user overrides and writes
 a timestamped backup next to `config.json`.
 
-`/voicebot voice-clone` now creates a private Fish voice from an attached
-WAV/MP3/M4A/OGG/Opus sample (OGG covers Discord voice messages). The bot waits for training, checks a short TTS
+`/voicebot voice-clone` creates a private Fish voice from an attached audio
+sample (any `audio/*` upload, or WAV/MP3/M4A/OGG/Opus/FLAC by extension; OGG
+covers Discord voice messages). The bot waits for training, checks a short TTS
 generation, then saves its `reference_id` in `data/voices.json`. Assign it
 with `voice-set` or `voice-user`.
 Import a library voice with `/voicebot voice-fish-add name:my-voice
@@ -139,7 +143,8 @@ across restarts and overrides `FISH_LATENCY` from `.env`. The mode is included
 in TTS cache keys. Pitch is applied
 locally by ffmpeg, so changing it reuses cached Fish audio, but it disables
 direct Opus playback for that profile. Packets
-with a non-20 ms duration also fall back to ffmpeg. The other controls use
+with a non-20 ms duration also go through ffmpeg, reusing the bytes already
+received instead of a second Fish request. The other controls use
 Fish TTS parameters. Voice tuning survives restarts; every setting except
 pitch changes the cache key.
 `/voicebot stats` reports successful Fish requests and input characters for
@@ -160,7 +165,7 @@ circuit-breaker states with the remaining cooldown.
 ```bash
 python3.11 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -p 'test_*.py'  # ~340 tests, no network needed
+python -m unittest discover -s tests -p 'test_*.py'  # ~360 tests, no network needed
 ```
 
 The application lives in the `ttsbot/` package; `bot.py` is the entrypoint

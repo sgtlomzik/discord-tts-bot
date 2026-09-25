@@ -1,8 +1,9 @@
-"""MiniMax quota errors: plain-JSON stream errors and the long breaker trip."""
+"""Provider quota errors, MiniMax error bodies and the long breaker trip."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from unittest.mock import MagicMock
 
 import httpx
 
-from ttsbot.voice_registry import FishParams
+from ttsbot.voice_registry import FishParams, MiniMaxParams, VoiceRecord
 from ttsbot.models import PreparedAudio, TTSJob
 from ttsbot.pipeline import SynthesisPipelineMixin
 from ttsbot.providers import (
@@ -19,6 +20,7 @@ from ttsbot.providers import (
     CircuitState,
     DispatcherConfig,
     MiniMaxConfig,
+    MiniMaxError,
     MiniMaxProvider,
     MiniMaxQuotaError,
     MiniMaxQuotaExhaustedError,
@@ -88,12 +90,12 @@ class QuotaBreakerTests(unittest.TestCase):
             local=MagicMock(), circuit_breaker=cb,
             config=DispatcherConfig(quota_cooldown_seconds=900),
         )
-        dispatcher.record_cloud_failure(MiniMaxQuotaError("HTTP 429"))
+        dispatcher.record_failure(cb, MiniMaxQuotaError("HTTP 429"))
         self.assertIs(cb.state, CircuitState.CLOSED)  # rate limit: ordinary failure
-        dispatcher.record_cloud_failure(MiniMaxQuotaExhaustedError("2056"))
+        dispatcher.record_failure(cb, MiniMaxQuotaExhaustedError("2056"))
         self.assertIs(cb.state, CircuitState.OPEN)
         self.assertGreater(cb.cooldown_remaining, 800)
-        dispatcher.record_cloud_failure(RuntimeError("boom"))
+        dispatcher.record_failure(cb, RuntimeError("boom"))
         self.assertGreater(cb.cooldown_remaining, 800)
 
     def test_zero_quota_cooldown_disables_the_pause(self):
@@ -130,7 +132,63 @@ class FishTtfaTests(unittest.IsolatedAsyncioTestCase):
         finally:
             config.TTS_STREAM_TTFA_TIMEOUT, config.FISH_TTFA_TIMEOUT = saved
         self.assertEqual((status, frames), ("pre_audio", 0))
-        self.assertIn("Fish TTFA exceeded", "\n".join(logs.output))
+        self.assertIn("Fish first audio exceeded", "\n".join(logs.output))
+
+
+def _sse(*events: dict) -> bytes:
+    return "".join(f"data: {json.dumps(e)}\n\n" for e in events).encode("utf-8")
+
+
+class MiniMaxStreamParsingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sse_labelled_as_json_still_streams(self):
+        body = _sse(
+            {"data": {"audio": "aabb", "status": 1}, "base_resp": {"status_code": 0}},
+            {"data": {"status": 2}, "extra_info": {"usage_characters": 6},
+             "base_resp": {"status_code": 0}},
+        )
+        provider = _provider(lambda request: httpx.Response(
+            200, content=body, headers={"content-type": "application/json"},
+        ))
+        self.assertEqual([c async for c in provider.stream_audio("привет")], [b"\xaa\xbb"])
+
+    async def test_pretty_printed_error_body_is_classified(self):
+        body = json.dumps({"base_resp": {"status_code": 2056, "status_msg": "limit"}}, indent=2)
+        provider = _provider(lambda request: httpx.Response(200, content=body.encode()))
+        with self.assertRaises(MiniMaxQuotaExhaustedError):
+            async for _ in provider.stream_audio("привет"):
+                pass
+
+    async def test_malformed_status_code_is_a_minimax_error(self):
+        for code in ("null", '"abc"'):
+            body = f'{{"base_resp":{{"status_code":{code},"status_msg":"?"}}}}'.encode()
+            provider = _provider(lambda request, b=body: httpx.Response(200, content=b))
+            with self.assertRaises(MiniMaxError):
+                await provider.synthesize("привет", Path("/tmp/unused.mp3"))
+            with self.assertRaises(MiniMaxError):
+                async for _ in provider.stream_audio("привет"):
+                    pass
+
+
+class PrefetchQuotaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_minimax_quota_in_prefetch_pauses_minimax(self):
+        async def exhausted(*args, **kwargs):
+            raise MiniMaxQuotaExhaustedError("2056")
+            yield b""
+
+        cloud = SimpleNamespace(stream_audio=exhausted)
+        pipeline = SynthesisPipelineMixin()
+        pipeline.tts_dispatcher = TTSDispatcher(
+            local=MagicMock(), cloud=cloud, config=DispatcherConfig(quota_cooldown_seconds=900),
+        )
+        voice = VoiceRecord(name="mm", label="MM", description="", provider="minimax",
+                            minimax=MiniMaxParams(voice_id="mm-voice"))
+        job = TTSJob(text="проверка", voice_channel=None, queued_at=0, author_id=1,
+                     guild_id=1, text_channel_id=1, voice_profile="mm")
+        prepared = PreparedAudio(job=job, channel=asyncio.Queue())
+        self.assertEqual(await pipeline._generate_stream_into(prepared, voice), "pre_audio")
+        cb = pipeline.tts_dispatcher.circuit_breaker
+        self.assertIs(cb.state, CircuitState.OPEN)
+        self.assertGreater(cb.cooldown_remaining, 800)
 
 
 if __name__ == "__main__":

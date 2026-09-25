@@ -15,6 +15,7 @@ import discord
 
 from ttsbot import config
 from ttsbot.audio import (
+    PCM_FRAME_BYTES,
     ContinuousTTSAudioSource,
     OPUS_SILENCE_FRAME,
     build_idle_pcm_frame,
@@ -91,7 +92,9 @@ class PlaybackMixin:
                     "Audio start guild=%s channel=%s provider=%s codec=%s queue_wait=%.3fs "
                     "message_to_audio_s=%.3f queue_to_audio_s=%.3f",
                     job.voice_channel.guild.id, job.voice_channel.id,
-                    prepared.provider or "?", prepared.codec, pickup_ts - job.queued_at,
+                    prepared.provider or "?",
+                    "pcm" if len(batch[0]) == PCM_FRAME_BYTES else "opus",
+                    pickup_ts - job.queued_at,
                     first_ts - job.message_ts, first_ts - job.queued_at,
                 )
         if total == 0 or source is None:

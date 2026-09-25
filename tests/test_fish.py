@@ -20,13 +20,18 @@ from ttsbot.audio import (
 )
 from ttsbot.ogg_opus import OggOpusDemuxer, UnsupportedOpusStream, opus_packet_samples, read_frame_cache
 from ttsbot import config
-from ttsbot.fish import FishConfig, FishProvider, fish_tts_text
+from ttsbot.errors import QuotaExhaustedError
+from ttsbot.fish import FishConfig, FishError, FishProvider, FishQuotaExhaustedError, fish_tts_text
 from ttsbot.models import PreparedAudio, TTSJob
-from ttsbot.pipeline import SynthesisPipelineMixin
+from ttsbot.pipeline import DISCORD_OPUS_CACHE_SUFFIX, SynthesisPipelineMixin
 from ttsbot.playback import PlaybackMixin
-from ttsbot.providers import CircuitBreaker, TTSCacheConfig, TTSPhraseCache
+from ttsbot.providers import (
+    CircuitBreaker, CircuitState, DispatcherConfig, TTSCacheConfig, TTSDispatcher, TTSPhraseCache,
+)
 from ttsbot.store import BotConfigStore
-from ttsbot.voice_registry import FishParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict, save_registry
+from ttsbot.voice_registry import (
+    FishParams, PiperParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict, save_registry,
+)
 from scripts.migrate_fish_default import migrate
 from test_bot import load_bot_module
 
@@ -508,13 +513,12 @@ class FishDecodeTests(unittest.IsolatedAsyncioTestCase):
                 first = await asyncio.wait_for(prepared.channel.get(), 3)
                 self.assertTrue(first)
                 self.assertTrue(all(opus_packet_samples(packet) == 960 for packet in first))
-                self.assertEqual(prepared.codec, "opus")
                 self.assertFalse(task.done())
-                self.assertIsNone(cache.lookup(job.text, "direct-key"))
+                self.assertIsNone(cache.lookup(job.text, "direct-key" + DISCORD_OPUS_CACHE_SUFFIX))
             finally:
                 release.set()
             self.assertEqual((await task)[0], "ok")
-            self.assertEqual(cache.lookup(job.text, "direct-key").suffix, ".dopus")
+            self.assertEqual(cache.lookup(job.text, "direct-key" + DISCORD_OPUS_CACHE_SUFFIX).suffix, ".dopus")
 
     async def test_pitch_shift_raises_frequency_without_changing_duration(self):
         import struct
@@ -632,13 +636,12 @@ class FishDecodeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 first = PreparedAudio(job=job, channel=asyncio.Queue())
                 self.assertEqual(await pipeline._generate_fish_stream_into(first, voice), "ok")
-                self.assertEqual(first.codec, "opus")
+                self.assertTrue(all(len(p) < PCM_FRAME_BYTES for p in await first.channel.get()))
                 second = PreparedAudio(job=job, channel=asyncio.Queue())
                 with patch.object(pipeline, "_safe_pcm_frames", side_effect=AssertionError("ffmpeg used")):
                     self.assertEqual(await pipeline._generate_fish_stream_into(second, voice), "cache")
                 self.assertEqual(calls, 1)
-                self.assertEqual(second.codec, "opus")
-                cached = cache.lookup(job.text, f"{fish.config.cache_key('voice-id', voice.fish)}:discord-opus-v1")
+                cached = cache.lookup(job.text, fish.config.cache_key('voice-id', voice.fish) + DISCORD_OPUS_CACHE_SUFFIX)
                 self.assertEqual(cached.suffix, ".dopus")
                 self.assertGreater(len(list(read_frame_cache(cached))), 0)
                 self.assertGreater(len(await second.channel.get()), 0)
@@ -646,39 +649,279 @@ class FishDecodeTests(unittest.IsolatedAsyncioTestCase):
                 await fish.aclose()
                 await client.aclose()
 
-    async def test_legacy_ogg_cache_converts_without_http_or_ffmpeg(self):
-        import subprocess
 
-        ogg = subprocess.check_output([
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-            "sine=frequency=440:duration=0.5", "-c:a", "libopus", "-f", "ogg", "pipe:1",
-        ])
-        with tempfile.TemporaryDirectory() as tmp:
-            fish = FishProvider(FishConfig(api_key="test-key", reference_id="voice-id"))
-            cache = TTSPhraseCache(TTSCacheConfig(
-                enabled=True, max_entries=1000, max_bytes=1000000, cache_dir=Path(tmp),
-            ))
-            pipeline = SynthesisPipelineMixin()
-            pipeline.tts_dispatcher = SimpleNamespace(
-                fish=fish, cache=cache, fish_circuit_breaker=CircuitBreaker(),
+def _voice(pitch=0):
+    return VoiceRecord(name="fish-voice", label="Fish", description="", provider="fish",
+                       fish=FishParams("voice-id", pitch=pitch))
+
+
+def _fish_job(text="Проверка"):
+    return TTSJob(text=text, voice_channel=None, queued_at=0, author_id=1,
+                  guild_id=1, text_channel_id=1, voice_profile="fish-voice")
+
+
+def _sine_ogg(duration=0.5, frame_ms=20):
+    import subprocess
+
+    return subprocess.check_output([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+        f"sine=frequency=440:duration={duration}", "-c:a", "libopus",
+        "-frame_duration", str(frame_ms), "-f", "ogg", "pipe:1",
+    ])
+
+
+def _header_pages(ogg: bytes) -> bytes:
+    """OpusHead + OpusTags pages only: what Fish sends before audio."""
+    second = ogg.index(b"OggS", 4)
+    return ogg[:ogg.index(b"OggS", second + 4)]
+
+
+class FishQuotaAndConfigTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_402_is_quota_exhausted_and_429_is_not(self):
+        for status, exhausted in ((402, True), (429, False)):
+            client = httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda request, s=status: httpx.Response(s, text="nope")),
+                base_url="https://api.fish.audio",
             )
-            voice = VoiceRecord(name="fish-default", label="Fish", description="",
-                                provider="fish", fish=FishParams("voice-id"))
-            job = TTSJob(text="Привет", voice_channel=None, queued_at=0, author_id=1,
-                         guild_id=1, text_channel_id=1, voice_profile="fish-default")
-            key = fish.config.cache_key("voice-id", voice.fish)
-            old_path = cache.cache_path_for(job.text, key, "opus")
-            old_path.parent.mkdir(parents=True, exist_ok=True)
-            old_path.write_bytes(ogg)
-            cache.commit_file(job.text, old_path, key)
-            prepared = PreparedAudio(job=job, channel=asyncio.Queue())
+            fish = FishProvider(FishConfig(api_key="k", reference_id="voice-id"), client)
             try:
-                with patch.object(fish, "stream_audio", side_effect=AssertionError("HTTP used")), \
-                        patch.object(pipeline, "_safe_pcm_frames", side_effect=AssertionError("ffmpeg used")):
-                    self.assertEqual(await pipeline._generate_fish_stream_into(prepared, voice), "cache")
-                self.assertEqual(prepared.codec, "opus")
-                new_path = cache.lookup(job.text, f"{key}:discord-opus-v1")
-                self.assertEqual(new_path.suffix, ".dopus")
-                self.assertGreater(len(list(read_frame_cache(new_path))), 0)
+                with self.assertRaises(FishError) as ctx:
+                    async for _ in fish.stream_audio("x"):
+                        pass
+                self.assertEqual(ctx.exception.status_code, status)
+                self.assertEqual(isinstance(ctx.exception, QuotaExhaustedError), exhausted)
             finally:
                 await fish.aclose()
+                await client.aclose()
+
+    async def test_dispatcher_pauses_fish_on_quota_and_logs_open_breaker(self):
+        local = MagicMock()
+        local.name = "local"
+        local.synthesize = AsyncMock()
+        fish = SimpleNamespace(
+            config=FishConfig(api_key="k", reference_id="voice-id"),
+            synthesize=AsyncMock(side_effect=FishQuotaExhaustedError("Fish HTTP 402", 402)),
+        )
+        dispatcher = TTSDispatcher(
+            local=local, fish=fish, config=DispatcherConfig(quota_cooldown_seconds=900),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out.wav"
+            self.assertEqual(await dispatcher.synthesize("x", out, voice=_voice()), "local")
+            cb = dispatcher.fish_circuit_breaker
+            self.assertIs(cb.state, CircuitState.OPEN)
+            self.assertGreater(cb.cooldown_remaining, 800)
+            with self.assertLogs("tts_bot.providers", "INFO") as logs:
+                await dispatcher.synthesize("y", out, voice=_voice())
+        self.assertEqual(fish.synthesize.await_count, 1)
+        self.assertIn("Fish circuit breaker open", "\n".join(logs.output))
+
+    async def test_prefetch_fish_quota_trips_the_fish_breaker(self):
+        async def exhausted(*args, **kwargs):
+            raise FishQuotaExhaustedError("Fish HTTP 402", 402)
+            yield b""
+
+        fish = SimpleNamespace(config=FishConfig(api_key="k", reference_id="voice-id"),
+                               stream_audio=exhausted)
+        pipeline = SynthesisPipelineMixin()
+        pipeline.tts_dispatcher = TTSDispatcher(
+            local=MagicMock(), fish=fish, config=DispatcherConfig(quota_cooldown_seconds=900),
+        )
+        prepared = PreparedAudio(job=_fish_job(), channel=asyncio.Queue())
+        self.assertEqual(await pipeline._generate_fish_stream_into(prepared, _voice()), "pre_audio")
+        self.assertIsInstance(prepared.error, FishQuotaExhaustedError)
+        self.assertGreater(pipeline.tts_dispatcher.fish_circuit_breaker.cooldown_remaining, 800)
+
+    def test_from_env_treats_empty_values_as_defaults(self):
+        with patch.dict(os.environ, {"FISH_CHUNK_LENGTH": "", "FISH_OPUS_BITRATE": " ",
+                                     "FISH_LATENCY": "", "FISH_MODEL": ""}):
+            cfg = FishConfig.from_env()
+        self.assertEqual((cfg.chunk_length, cfg.opus_bitrate, cfg.latency, cfg.model),
+                         (150, 48000, "low", "s2.1-pro-free"))
+
+    async def test_bad_fish_settings_only_block_startup_when_fish_is_enabled(self):
+        from ttsbot.core import TTSBot
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(config, "VOICES_REGISTRY_PATH", Path(tmp) / "voices.json"), \
+                patch.object(config, "BOT_CONFIG_PATH", Path(tmp) / "config.json"), \
+                patch.dict(os.environ, {"FISH_API_KEY": "", "FISH_LATENCY": "bogus",
+                                        "TTS_CACHE_ENABLED": "0"}):
+            self.assertIsNone(TTSBot().fish_provider)
+            with patch.dict(os.environ, {"FISH_API_KEY": "k"}):
+                with self.assertRaises(ValueError):
+                    TTSBot()
+
+
+class DefaultVoiceTests(unittest.TestCase):
+    def _registry(self):
+        reg = VoiceRegistry(fallback_profile="piper-ruslan")
+        reg.add(VoiceRecord(name="piper-ruslan", label="R", description="", provider="piper",
+                            piper=PiperParams(model_path="/r.onnx")))
+        reg.add(VoiceRecord(name="piper-irina", label="I", description="", provider="piper",
+                            piper=PiperParams(model_path="/i.onnx")))
+        reg.add(replace(_voice(), name="fish-default"))
+        return reg
+
+    def test_fish_in_registry_does_not_override_configured_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            with patch.object(config, "DEFAULT_VOICE_PROFILE", "piper-irina"):
+                store = BotConfigStore(path, set(), voice_registry=self._registry())
+                self.assertEqual(store.get_guild(1).default_voice, "piper-irina")
+            with patch.object(config, "DEFAULT_VOICE_PROFILE", "fish-default"):
+                store = BotConfigStore(path, set(), voice_registry=self._registry())
+                self.assertEqual(store.get_guild(2).default_voice, "fish-default")
+            with patch.object(config, "DEFAULT_VOICE_PROFILE", "no-such-voice"):
+                store = BotConfigStore(path, set(), voice_registry=self._registry())
+                self.assertEqual(store.get_guild(3).default_voice, "piper-ruslan")
+
+
+class FishRegistrationTests(unittest.IsolatedAsyncioTestCase):
+    def _pipeline(self, tmp, synthesize):
+        pipeline = SynthesisPipelineMixin()
+        pipeline.tts_dispatcher = SimpleNamespace(fish=SimpleNamespace(synthesize=synthesize))
+        pipeline.voice_registry = VoiceRegistry(fallback_profile="piper-ruslan")
+        pipeline.saved = []
+        pipeline.persist_voice_registry = lambda: pipeline.saved.append(True)
+        return pipeline
+
+    async def test_name_taken_during_probe_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "TMP_DIR", Path(tmp)):
+            async def synthesize(text, path, *, reference_id):
+                path.write_bytes(b"OggS-audio")
+                pipeline.voice_registry.add(replace(_voice(), name="taken"))  # a parallel command
+
+            pipeline = self._pipeline(tmp, synthesize)
+            error = await pipeline.register_fish_voice(
+                name="taken", reference_id="new-id", label="taken (Fish)", description="",
+            )
+            self.assertIn("уже существует", error)
+            self.assertEqual(pipeline.voice_registry.get("taken").fish.reference_id, "voice-id")
+            self.assertEqual(pipeline.saved, [])
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    async def test_failed_probe_reports_reason(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "TMP_DIR", Path(tmp)):
+            async def synthesize(text, path, *, reference_id):
+                path.write_bytes(b"not-ogg")
+
+            pipeline = self._pipeline(tmp, synthesize)
+            error = await pipeline.register_fish_voice(
+                name="new", reference_id="bad", label="new (Fish)", description="",
+            )
+            self.assertIn("проверка озвучки не прошла", error)
+            self.assertNotIn("new", pipeline.voice_registry)
+
+
+class VoiceCloneCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def _clone_reply(self, filename, content_type):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "BOT_CONFIG_PATH": str(Path(tmp) / "config.json"),
+            "VOICES_REGISTRY_PATH": str(Path(tmp) / "voices.json"),
+            "FISH_API_KEY": "", "TTS_CACHE_ENABLED": "0",
+        }):
+            bot_mod = load_bot_module()
+            sent = []
+            interaction = SimpleNamespace(
+                guild=SimpleNamespace(id=1), user=SimpleNamespace(id=2),
+                response=SimpleNamespace(send_message=AsyncMock(
+                    side_effect=lambda message, **kwargs: sent.append(message),
+                )),
+            )
+            sample = SimpleNamespace(size=1000, filename=filename, content_type=content_type)
+            with patch.object(bot_mod.tts_commands, "is_guild_manager", return_value=True), \
+                    patch.object(bot_mod.discord, "Member", type(interaction.user)):
+                await bot_mod.slash_tts_voice_clone.callback(interaction, "new-voice", sample)
+            return sent[0]
+
+    async def test_audio_content_type_is_accepted_without_known_extension(self):
+        reply = await self._clone_reply("voice", "audio/flac")
+        self.assertIn("Fish Audio не настроен", reply)  # got past the format check
+
+    async def test_non_audio_file_is_rejected(self):
+        reply = await self._clone_reply("picture.png", "image/png")
+        self.assertIn("Нужен аудиофайл", reply)
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
+class FishFirstAudioTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_deadline_covers_first_packet_not_header_page(self):
+        headers = _header_pages(_sine_ogg())
+
+        async def stalled(*args, **kwargs):
+            yield headers
+            await asyncio.sleep(5)
+            yield b""
+
+        pipeline = SynthesisPipelineMixin()
+        pipeline.tts_dispatcher = SimpleNamespace(fish=SimpleNamespace(stream_audio=stalled), cache=None)
+        prepared = PreparedAudio(job=_fish_job(), channel=asyncio.Queue())
+        started = asyncio.get_running_loop().time()
+        with patch.object(config, "FISH_TTFA_TIMEOUT", 0.3):
+            status, frames = await pipeline._stream_fish_opus_to_channel(prepared, _voice(), "key")
+        self.assertEqual((status, frames), ("pre_audio", 0))
+        self.assertLess(asyncio.get_running_loop().time() - started, 2)
+
+    async def test_decoder_deadline_covers_first_frame(self):
+        headers = _header_pages(_sine_ogg())
+
+        async def stalled():
+            yield headers
+            await asyncio.sleep(5)
+            yield b""
+
+        pipeline = SynthesisPipelineMixin()
+        pipeline.tts_dispatcher = SimpleNamespace(cache=None)
+        prepared = PreparedAudio(job=_fish_job(), channel=asyncio.Queue())
+        started = asyncio.get_running_loop().time()
+        status, frames = await pipeline._decode_stream_to_channel(
+            prepared, _voice(), stalled(), "ogg", "key", "opus", ttfa_timeout=0.3,
+        )
+        self.assertEqual((status, frames), ("pre_audio", 0))
+        self.assertLess(asyncio.get_running_loop().time() - started, 2)
+        self.assertTrue(prepared.channel.empty())
+
+    async def test_unsupported_packets_reuse_received_bytes_with_ffmpeg(self):
+        ogg = _sine_ogg(frame_ms=60)  # 60 ms packets cannot go to Discord as-is
+        calls = 0
+
+        def stream_audio(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+
+            async def chunks():
+                for offset in range(0, len(ogg), 300):
+                    yield ogg[offset:offset + 300]
+            return chunks()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = TTSPhraseCache(TTSCacheConfig(enabled=True, max_entries=1000,
+                                                  max_bytes=1000000, cache_dir=Path(tmp)))
+            pipeline = SynthesisPipelineMixin()
+            pipeline.tts_dispatcher = SimpleNamespace(
+                fish=SimpleNamespace(stream_audio=stream_audio), cache=cache,
+            )
+            prepared = PreparedAudio(job=_fish_job(), channel=asyncio.Queue())
+            status, frames = await pipeline._stream_fish_opus_to_channel(prepared, _voice(), "ogg-key")
+            self.assertEqual(status, "ok")
+            self.assertGreater(frames, 0)
+            self.assertEqual(calls, 1)
+            self.assertTrue(all(len(f) == PCM_FRAME_BYTES for f in await prepared.channel.get()))
+            self.assertEqual(cache.lookup(prepared.job.text, "ogg-key").read_bytes(), ogg)
+            self.assertIsNone(cache.lookup(prepared.job.text, "ogg-key" + DISCORD_OPUS_CACHE_SUFFIX))
+
+    async def test_fish_cache_miss_is_counted_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = TTSPhraseCache(TTSCacheConfig(enabled=True, max_entries=1000,
+                                                  max_bytes=1000000, cache_dir=Path(tmp)))
+            breaker = CircuitBreaker()
+            breaker.trip(60)  # stop before any HTTP request
+            pipeline = SynthesisPipelineMixin()
+            pipeline.tts_dispatcher = SimpleNamespace(
+                fish=SimpleNamespace(config=FishConfig(api_key="k")), cache=cache,
+                fish_circuit_breaker=breaker,
+            )
+            prepared = PreparedAudio(job=_fish_job(), channel=asyncio.Queue())
+            self.assertEqual(await pipeline._generate_fish_stream_into(prepared, _voice()), "pre_audio")
+            self.assertEqual((cache.hits, cache.misses), (0, 1))

@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from ttsbot import voice_registry as vr
 from test_bot import load_bot_module
-from ttsbot.providers import TTSCacheConfig, TTSPhraseCache
+from ttsbot.providers import TTSCacheConfig, TTSPhraseCache, voice_cache_key
 
 
 async def _chunks_then_raise(data: bytes):
@@ -160,7 +160,7 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
         status, frames = await tts_bot._stream_tts_to_source(source, _minimax_voice(), job)
         self.assertEqual(status, "ok")
         # committed: a repeat would hit the cache
-        self.assertIsNotNone(cache.lookup(job.text, "bussshy01"))
+        self.assertIsNotNone(cache.lookup(job.text, voice_cache_key(_minimax_voice())))
         self.assertGreater(cache.total_bytes, 0)
 
     async def test_partial_stream_not_cached(self):
@@ -176,7 +176,7 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
         status, frames = await tts_bot._stream_tts_to_source(source, _minimax_voice(), job)
         self.assertIn(status, ("truncated", "pre_audio"))
         # partial output must NOT be cached
-        self.assertIsNone(cache.lookup(job.text, "bussshy01"))
+        self.assertIsNone(cache.lookup(job.text, voice_cache_key(_minimax_voice())))
 
     async def test_cache_hit_plays_from_file_no_api(self):
         bot_mod = load_bot_module()
@@ -186,7 +186,7 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
         # Pre-store a real MP3 for this (text, voice).
         src = Path(tempfile.mkdtemp()) / "seed.mp3"
         src.write_bytes(_MP3)
-        cache.store(job.text, src, "bussshy01")
+        cache.store(job.text, src, voice_cache_key(_minimax_voice()))
 
         cloud = MagicMock()
         cloud.stream_audio = MagicMock(side_effect=AssertionError("API hit on cache!"))
@@ -202,6 +202,31 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out, "done")
         cloud.stream_audio.assert_not_called()  # served from disk, no API
         self.assertEqual(cache.hits, 1)
+
+    async def test_prefetch_cache_key_follows_voice_tuning(self):
+        from dataclasses import replace
+        from ttsbot.models import PreparedAudio
+
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        cache = self._enable_cache(bot_mod, tts_bot)
+        job = _job(bot_mod)
+        voice = _minimax_voice()
+        src = Path(tempfile.mkdtemp()) / "seed.mp3"
+        src.write_bytes(_MP3)
+        cache.store(job.text, src, voice_cache_key(voice))
+        cloud = MagicMock()
+        cloud.stream_audio = MagicMock(side_effect=AssertionError("API hit"))
+        tts_bot.tts_dispatcher._cloud = cloud
+
+        hit = PreparedAudio(job=job, channel=asyncio.Queue())
+        self.assertEqual(await tts_bot._generate_stream_into(hit, voice), "cache")
+        # A re-tuned voice must not be served the old audio.
+        tuned = replace(voice, minimax=replace(voice.minimax, speed=1.3))
+        tts_bot.tts_dispatcher.circuit_breaker.trip(60)  # the miss must not call the API
+        miss = PreparedAudio(job=job, channel=asyncio.Queue())
+        self.assertEqual(await tts_bot._generate_stream_into(miss, tuned), "pre_audio")
+        cloud.stream_audio.assert_not_called()
 
     async def test_pre_audio_when_stream_raises_before_first_chunk(self):
         bot_mod = load_bot_module()

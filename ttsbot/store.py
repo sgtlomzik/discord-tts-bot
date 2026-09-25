@@ -41,7 +41,16 @@ class BotConfigStore:
         return name in VOICE_PROFILES
 
     def _default_voice(self) -> str:
-        return "fish-default" if self.voice_registry is not None and "fish-default" in self.voice_registry else config.DEFAULT_VOICE_PROFILE
+        """TTS_DEFAULT_VOICE_PROFILE, or the registry fallback if it is unknown.
+
+        Fish becomes the default only when the operator sets
+        TTS_DEFAULT_VOICE_PROFILE=fish-default; its mere presence in the
+        registry must not override the configured default.
+        """
+        if self._is_valid_voice(config.DEFAULT_VOICE_PROFILE):
+            return config.DEFAULT_VOICE_PROFILE
+        fallback = getattr(self.voice_registry, "fallback_profile", "")
+        return fallback if fallback and self._is_valid_voice(fallback) else config.DEFAULT_VOICE_PROFILE
 
     def load(self) -> None:
         if not self.path.exists():

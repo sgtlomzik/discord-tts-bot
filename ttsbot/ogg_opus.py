@@ -127,16 +127,6 @@ class OggOpusDemuxer:
             raise UnsupportedOpusStream("incomplete Ogg/Opus stream")
 
 
-def read_ogg_frames(path: Path) -> list[bytes]:
-    demuxer = OggOpusDemuxer()
-    frames: list[bytes] = []
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(65536), b""):
-            frames.extend(demuxer.feed(chunk))
-    demuxer.finish()
-    return frames
-
-
 def write_frame(output: BinaryIO, packet: bytes) -> None:
     require_discord_frame(packet)
     output.write(struct.pack(">H", len(packet)))

@@ -57,7 +57,6 @@ from ttsbot import events as tts_events
 from ttsbot.commands import (
     _EMOTION_CHOICES,
     _MODEL_CHOICES,
-    _derive_minimax_voice_id,
     _fmt_int,
     _fmt_uptime,
     _render_emoji,
