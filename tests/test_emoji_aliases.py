@@ -335,7 +335,7 @@ class EmojiAliasCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_add_via_token(self):
         bot_mod, store = self._setup()
-        interaction, sent = _make_interaction(bot_mod)
+        interaction, sent = _make_interaction(bot_mod, guild_emojis=[(1035, "Kekis")])
         await self._call(
             bot_mod, bot_mod.slash_emoji_alias, interaction, "<:Kekis:1035>", "кекис"
         )
@@ -352,9 +352,9 @@ class EmojiAliasCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_update_overwrites(self):
         bot_mod, store = self._setup()
-        interaction, _ = _make_interaction(bot_mod)
+        interaction, _ = _make_interaction(bot_mod, guild_emojis=[(1, "K")])
         await self._call(bot_mod, bot_mod.slash_emoji_alias, interaction, "<:K:1>", "кек")
-        interaction2, _ = _make_interaction(bot_mod)
+        interaction2, _ = _make_interaction(bot_mod, guild_emojis=[(1, "K")])
         await self._call(bot_mod, bot_mod.slash_emoji_alias, interaction2, "<:K:1>", "лол")
         self.assertEqual(store.emoji_aliases["1"]["say"], "лол")
 
@@ -373,7 +373,7 @@ class EmojiAliasCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reject_empty_pronunciation(self):
         bot_mod, store = self._setup()
-        interaction, sent = _make_interaction(bot_mod)
+        interaction, sent = _make_interaction(bot_mod, guild_emojis=[(1, "K")])
         # A pronunciation that sanitizes to nothing must be rejected.
         await self._call(bot_mod, bot_mod.slash_emoji_alias, interaction, "<:K:1>", "<@123>")
         self.assertEqual(store.emoji_aliases, {})
@@ -381,7 +381,7 @@ class EmojiAliasCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_remove_via_token(self):
         bot_mod, store = self._setup()
         store.set_emoji_alias("1", "K", "кек")
-        interaction, sent = _make_interaction(bot_mod)
+        interaction, sent = _make_interaction(bot_mod, guild_emojis=[(1, "K")])
         await self._call(
             bot_mod, bot_mod.slash_emoji_alias_remove, interaction, "<:K:1>"
         )
@@ -391,13 +391,13 @@ class EmojiAliasCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_remove_via_raw_id(self):
         bot_mod, store = self._setup()
         store.set_emoji_alias("1", "K", "кек")
-        interaction, _ = _make_interaction(bot_mod)
+        interaction, _ = _make_interaction(bot_mod, guild_emojis=[(1, "K")])
         await self._call(bot_mod, bot_mod.slash_emoji_alias_remove, interaction, "1")
         self.assertEqual(store.emoji_aliases, {})
 
     async def test_remove_unknown(self):
         bot_mod, store = self._setup()
-        interaction, sent = _make_interaction(bot_mod)
+        interaction, sent = _make_interaction(bot_mod, guild_emojis=[(999, "Z")])
         await self._call(bot_mod, bot_mod.slash_emoji_alias_remove, interaction, "999")
         self.assertIn("нет", sent[0])
 
@@ -410,9 +410,38 @@ class EmojiAliasCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_list_shows_entries(self):
         bot_mod, store = self._setup()
         store.set_emoji_alias("1", "Kekis", "кекис")
-        interaction, sent = _make_interaction(bot_mod)
+        interaction, sent = _make_interaction(bot_mod, guild_emojis=[(1, "Kekis")])
         await self._call(bot_mod, bot_mod.slash_emoji_aliases, interaction)
         self.assertIn("кекис", sent[0])
+
+    async def test_foreign_emoji_token_is_rejected(self):
+        bot_mod, store = self._setup()
+        interaction, sent = _make_interaction(bot_mod, guild_emojis=[(1, "Mine")])
+        await self._call(
+            bot_mod, bot_mod.slash_emoji_alias, interaction, "<:Theirs:2>", "что угодно"
+        )
+        self.assertEqual(store.emoji_aliases, {})
+        self.assertIn("не с этого сервера", sent[0])
+
+    async def test_foreign_alias_cannot_be_removed(self):
+        bot_mod, store = self._setup()
+        store.set_emoji_alias("2", "Theirs", "их")
+        interaction, sent = _make_interaction(bot_mod, guild_emojis=[(1, "Mine")])
+        await self._call(bot_mod, bot_mod.slash_emoji_alias_remove, interaction, "2")
+        self.assertIn("2", store.emoji_aliases)
+        self.assertIn("не с этого сервера", sent[0])
+
+    async def test_list_and_autocomplete_show_only_own_emojis(self):
+        bot_mod, store = self._setup()
+        store.set_emoji_alias("1", "Mine", "моё")
+        store.set_emoji_alias("2", "Theirs", "чужое")
+        interaction, sent = _make_interaction(bot_mod, guild_emojis=[(1, "Mine")])
+        await self._call(bot_mod, bot_mod.slash_emoji_aliases, interaction)
+        self.assertIn("моё", sent[0])
+        self.assertNotIn("чужое", sent[0])
+        autocomplete = bot_mod.slash_emoji_alias_remove._params["emoji"].autocomplete
+        choices = await autocomplete(interaction, "")
+        self.assertEqual([c.value for c in choices], ["1"])
 
 
 if __name__ == "__main__":
