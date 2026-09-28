@@ -18,6 +18,7 @@ from discord.ext import commands
 
 from ttsbot import voice_registry
 from ttsbot.fish import FishConfig, FishProvider
+from ttsbot.gemini import GeminiConfig, GeminiProvider
 from ttsbot.providers import (
     LocalProvider,
     TTSDispatcher,
@@ -119,6 +120,10 @@ class TTSBot(
         self.fish_config = replace(fish_cfg, latency=saved_latency) if isinstance(saved_latency, str) else fish_cfg
         if self.fish_provider is not None:
             self.fish_provider.config = self.fish_config
+        # Gemini TTS through OpenRouter: enabled by OPENROUTER_API_KEY alone;
+        # voices are added with /voicebot voice-add provider:gemini.
+        gemini_cfg = GeminiConfig.from_env()
+        self.gemini_provider = GeminiProvider(gemini_cfg) if gemini_cfg.api_key else None
         self.piper_voices: dict[tuple[str, str], object] = {}
         # TTS provider abstraction (see ttsbot/providers.py). Skeleton
         # behavior in this commit: dispatcher always routes to local.
@@ -137,6 +142,7 @@ class TTSBot(
             local=LocalProvider(_piper_synthesize),
             cloud=self._build_cloud_provider(),
             fish=self.fish_provider,
+            gemini=self.gemini_provider,
             config=load_dispatcher_config_from_env(),
             circuit_breaker=load_circuit_breaker_from_env(),
             cache=self.tts_cache,
@@ -205,5 +211,7 @@ class TTSBot(
 
         if self.fish_provider is not None:
             await self.fish_provider.aclose()
+        if self.gemini_provider is not None:
+            await self.gemini_provider.aclose()
 
         await super().close()

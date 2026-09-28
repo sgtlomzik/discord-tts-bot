@@ -1,4 +1,4 @@
-"""Unified voice registry: Piper + MiniMax voices as first-class profiles.
+"""Unified voice registry: Piper, MiniMax, Fish and Gemini voices as profiles.
 
 This module owns the **catalog** of available voices — what voices exist
 and how to drive each engine. It is deliberately separate from the
@@ -40,6 +40,7 @@ _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 PROVIDER_PIPER = "piper"
 PROVIDER_MINIMAX = "minimax"
 PROVIDER_FISH = "fish"
+PROVIDER_GEMINI = "gemini"
 
 
 def valid_voice_name(name: str) -> bool:
@@ -79,14 +80,22 @@ class FishParams:
 
 
 @dataclass(frozen=True)
+class GeminiParams:
+    voice: str = "Kore"
+    model: str = ""  # empty: use the configured GEMINI_TTS_MODEL
+    volume_db: float = 0.0  # applied locally, not sent to the API
+
+
+@dataclass(frozen=True)
 class VoiceRecord:
     name: str
     label: str
     description: str
-    provider: str  # PROVIDER_PIPER | PROVIDER_MINIMAX | PROVIDER_FISH
+    provider: str  # PROVIDER_PIPER | PROVIDER_MINIMAX | PROVIDER_FISH | PROVIDER_GEMINI
     piper: Optional[PiperParams] = None
     minimax: Optional[MiniMaxParams] = None
     fish: Optional[FishParams] = None
+    gemini: Optional[GeminiParams] = None
 
     @property
     def is_minimax(self) -> bool:
@@ -99,6 +108,10 @@ class VoiceRecord:
     @property
     def is_fish(self) -> bool:
         return self.provider == PROVIDER_FISH
+
+    @property
+    def is_gemini(self) -> bool:
+        return self.provider == PROVIDER_GEMINI
 
 
 @dataclass
@@ -169,6 +182,10 @@ def _record_to_dict(r: VoiceRecord) -> dict:
             "speed": r.fish.speed, "volume_db": r.fish.volume_db,
             "pitch": r.fish.pitch, "emotion": r.fish.emotion,
             "temperature": r.fish.temperature, "top_p": r.fish.top_p,
+        }
+    if r.gemini is not None:
+        out["gemini"] = {
+            "voice": r.gemini.voice, "model": r.gemini.model, "volume_db": r.gemini.volume_db,
         }
     return out
 
@@ -245,11 +262,25 @@ def _fish_from_dict(d: dict) -> FishParams:
     )
 
 
+def _gemini_from_dict(d: dict) -> GeminiParams:
+    if not isinstance(d, dict):
+        d = {}
+    try:
+        volume_db = float(d["volume_db"]) if d.get("volume_db") is not None else 0.0
+    except (TypeError, ValueError):
+        volume_db = 0.0
+    return GeminiParams(
+        voice=str(d.get("voice", "") or ""),
+        model=str(d.get("model", "") or ""),
+        volume_db=volume_db,
+    )
+
+
 def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
     if not isinstance(d, dict):
         return None
     provider = str(d.get("provider", "")).strip().lower()
-    if provider not in (PROVIDER_PIPER, PROVIDER_MINIMAX, PROVIDER_FISH):
+    if provider not in (PROVIDER_PIPER, PROVIDER_MINIMAX, PROVIDER_FISH, PROVIDER_GEMINI):
         log.warning("voices.json: skipping %r with unknown provider %r", name, provider)
         return None
     label = str(d.get("label", name) or name)
@@ -259,11 +290,15 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
         _minimax_from_dict(d.get("minimax", {})) if provider == PROVIDER_MINIMAX else None
     )
     fish = _fish_from_dict(d.get("fish") or {}) if provider == PROVIDER_FISH else None
+    gemini = _gemini_from_dict(d.get("gemini") or {}) if provider == PROVIDER_GEMINI else None
     if provider == PROVIDER_MINIMAX and not (minimax and minimax.voice_id):
         log.warning("voices.json: skipping minimax voice %r with no voice_id", name)
         return None
     if provider == PROVIDER_FISH and not (fish and fish.reference_id):
         log.warning("voices.json: skipping fish voice %r with no reference_id", name)
+        return None
+    if provider == PROVIDER_GEMINI and not (gemini and gemini.voice):
+        log.warning("voices.json: skipping gemini voice %r with no voice", name)
         return None
     return VoiceRecord(
         name=name,
@@ -273,6 +308,7 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
         piper=piper,
         minimax=minimax,
         fish=fish,
+        gemini=gemini,
     )
 
 

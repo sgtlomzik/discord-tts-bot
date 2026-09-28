@@ -5,3 +5,4 @@ davey==0.1.5
 piper-tts==1.4.2
 httpx==0.28.1
 emoji==2.15.0
+soxr==1.1.0

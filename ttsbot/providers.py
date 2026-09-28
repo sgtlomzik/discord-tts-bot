@@ -48,6 +48,8 @@ from typing import (
 
 from ttsbot.errors import QuotaExhaustedError
 from ttsbot.fish import FishProvider
+from ttsbot.gemini import GeminiProvider, write_wav
+from ttsbot.pcm import apply_gain, pcm_cache_header, read_pcm_cache
 
 if TYPE_CHECKING:  # pragma: no cover
     import httpx
@@ -277,6 +279,7 @@ class PrimaryProvider(str, Enum):
     LOCAL = "local"
     MINIMAX = "minimax"
     FISH = "fish"
+    GEMINI = "gemini"
 
 
 @dataclass
@@ -359,6 +362,9 @@ class MiniMaxConfig:
 
 
 _DEFAULT_CACHE_DIR = "/app/data/tts_cache"
+# mp3: MiniMax, opus: Fish Ogg, dopus: Discord-ready Fish frames,
+# pcm: Gemini raw PCM with a pcm_cache_header.
+CACHE_SUFFIXES = ("mp3", "opus", "dopus", "pcm")
 _DEFAULT_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
 
@@ -418,7 +424,7 @@ class TTSPhraseCache:
         if not cache_dir.exists():
             return
         try:
-            files = [p for suffix in ("mp3", "opus", "dopus") for p in cache_dir.glob(f"*.{suffix}") if p.is_file()]
+            files = [p for suffix in CACHE_SUFFIXES for p in cache_dir.glob(f"*.{suffix}") if p.is_file()]
         except OSError:
             log.warning("TTS cache: failed to scan %s", cache_dir, exc_info=True)
             return
@@ -541,7 +547,7 @@ class TTSPhraseCache:
         Used by the streaming path to write chunks directly to the final
         cache file (then ``commit_file`` registers it).
         """
-        if suffix not in {"mp3", "opus", "dopus"}:
+        if suffix not in CACHE_SUFFIXES:
             raise ValueError(f"Unsupported cache suffix: {suffix}")
         return self._config.cache_dir / f"{self.hash_text(text, voice_name)}.{suffix}"
 
@@ -558,6 +564,20 @@ class TTSPhraseCache:
             return None
         key = self.hash_text(text, voice_name)
         return self._register(key, cache_file)
+
+    def store_bytes(self, text: str, data: bytes, voice_name: str = "", suffix: str = "pcm") -> Optional[Path]:
+        """Atomically write ``data`` as the cache entry for ``(voice, text)``."""
+        if not self._config.enabled:
+            return None
+        target = self.cache_path_for(text, voice_name, suffix)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.parent / f"{target.stem}.{uuid.uuid4().hex}.tmp"
+        try:
+            temporary.write_bytes(data)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return self._register(self.hash_text(text, voice_name), target)
 
     def _store_key(self, key: str, source_path: Path, suffix: str = "mp3") -> Path:
         target = self._config.cache_dir / f"{key}.{suffix}"
@@ -1177,7 +1197,7 @@ class MiniMaxProvider:
 def load_dispatcher_config_from_env() -> DispatcherConfig:
     """Build a ``DispatcherConfig`` from the standard ``TTS_*`` env vars.
 
-    ``TTS_PRIMARY_PROVIDER`` accepts ``local``, ``minimax`` or ``fish``. Unknown
+    ``TTS_PRIMARY_PROVIDER`` accepts ``local``, ``minimax``, ``fish`` or ``gemini``. Unknown
     values fall back to ``local`` so the bot never silently misroutes.
 
     Default request timeout is 2.5 seconds — see plan §11.4 for the
@@ -1223,6 +1243,7 @@ class TTSDispatcher:
         local: LocalProvider,
         cloud: Optional[TTSProvider] = None,
         fish: Optional[FishProvider] = None,
+        gemini: Optional[GeminiProvider] = None,
         circuit_breaker: Optional[CircuitBreaker] = None,
         config: Optional[DispatcherConfig] = None,
         cache: Optional[TTSPhraseCache] = None,
@@ -1233,6 +1254,8 @@ class TTSDispatcher:
         self._fish = fish
         self._cb = circuit_breaker or CircuitBreaker()
         self._fish_cb = load_circuit_breaker_from_env()
+        self._gemini = gemini
+        self._gemini_cb = load_circuit_breaker_from_env()
         self._config = config or DispatcherConfig()
         self._cache = cache  # None means caching disabled
         # Piper profile name to fall back to when a cloud (MiniMax) voice
@@ -1250,8 +1273,19 @@ class TTSDispatcher:
     def record_failure(
         self, breaker: CircuitBreaker, exc: BaseException | None = None,
     ) -> None:
-        """Count a provider failure; an exhausted balance/plan pauses it longer."""
-        if isinstance(exc, QuotaExhaustedError):
+        """Count a provider failure; an exhausted balance/plan pauses it longer.
+
+        A rate limit that names its Retry-After pauses the provider for
+        exactly that long instead of the quota cooldown.
+        """
+        retry_after = getattr(exc, "retry_after", None)
+        if retry_after:
+            log.warning(
+                "Rate limited (%s); pausing the provider for %.0fs (Retry-After)",
+                type(exc).__name__, retry_after,
+            )
+            breaker.trip(float(retry_after))
+        elif isinstance(exc, QuotaExhaustedError):
             cooldown = self._config.quota_cooldown_seconds
             log.warning(
                 "Quota exhausted (%s); pausing the provider for %.0fs: %s",
@@ -1272,6 +1306,14 @@ class TTSDispatcher:
     @property
     def fish_circuit_breaker(self) -> CircuitBreaker:
         return self._fish_cb
+
+    @property
+    def gemini(self) -> Optional[GeminiProvider]:
+        return self._gemini
+
+    @property
+    def gemini_circuit_breaker(self) -> CircuitBreaker:
+        return self._gemini_cb
 
     @property
     def cache(self) -> Optional[TTSPhraseCache]:
@@ -1304,8 +1346,17 @@ class TTSDispatcher:
             if want_fish else voice_cache_key(voice)
         )
 
+        want_gemini = (
+            provider == "gemini"
+            or (voice is None and self._config.primary is PrimaryProvider.GEMINI)
+        ) and self._gemini is not None
+        if want_gemini:
+            used = await self._synthesize_gemini(text, filename, getattr(voice, "gemini", None))
+            if used:
+                return used
+
         # 1. Cache hit short-circuits everything.
-        if self._cache is not None:
+        if self._cache is not None and not want_gemini:
             cached = self._cache.lookup(text, voice_key)
             if cached is not None:
                 shutil.copyfile(cached, filename)
@@ -1367,7 +1418,7 @@ class TTSDispatcher:
         #    voice, or the registry fallback when a cloud voice was wanted.
         if provider == "piper":
             fallback_name = getattr(voice, "name", None)
-        elif provider in {"minimax", "fish"} or want_minimax or want_fish:
+        elif provider in {"minimax", "fish", "gemini"} or want_minimax or want_fish or want_gemini:
             fallback_name = self._fallback_profile or None
         else:
             fallback_name = None
@@ -1376,9 +1427,42 @@ class TTSDispatcher:
         # operator has opted in, and a cache hit on a repeated short
         # phrase is a win whether the underlying provider is Piper
         # or MiniMax (the local file copy is faster than even Piper).
-        if not want_fish:
+        # A Fish/Gemini voice keys its cache by provider params, so a Piper
+        # fallback stored here would be served as that voice later.
+        if not want_fish and not want_gemini:
             self._maybe_cache(text, filename, voice_key)
         return self._local.name
+
+    async def _synthesize_gemini(self, text: str, filename: Path, params) -> str:
+        """Gemini file path: cache, then the API. Returns "" to fall back."""
+        cache_key = self._gemini.config.cache_key(params)
+        volume_db = float(getattr(params, "volume_db", 0.0) or 0.0)
+        if self._cache is not None:
+            cached = self._cache.lookup(text, cache_key)
+            if cached is not None:
+                try:
+                    rate, channels, pcm = read_pcm_cache(cached)
+                    write_wav(filename, rate, channels, apply_gain(pcm, volume_db))
+                    return "cache"
+                except (OSError, ValueError) as exc:
+                    log.warning("Unreadable Gemini cache file %s (%s); regenerating", cached, exc)
+        if not self._gemini_cb.allow_request():
+            log.info("Gemini circuit breaker open; using fallback Piper")
+            return ""
+        try:
+            rate, channels, pcm = await self._gemini.fetch_pcm(text, params)
+        except Exception as exc:
+            self.record_failure(self._gemini_cb, exc)
+            log.warning("Gemini synthesis failed (%s: %s); falling back to Piper", type(exc).__name__, exc)
+            return ""
+        self._gemini_cb.record_success()
+        write_wav(filename, rate, channels, apply_gain(pcm, volume_db))
+        if self._cache is not None:
+            try:
+                self._cache.store_bytes(text, pcm_cache_header(rate, channels) + pcm, cache_key, "pcm")
+            except OSError as exc:
+                log.warning("TTS cache store failed: %s", exc)
+        return "gemini"
 
     def _maybe_cache(self, text: str, filename: Path, voice_key: str = "", suffix: str | None = None) -> None:
         if self._cache is None:

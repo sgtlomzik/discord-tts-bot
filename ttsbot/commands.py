@@ -23,6 +23,7 @@ from ttsbot import voice_registry
 from dataclasses import replace
 
 from ttsbot import config
+from ttsbot.gemini import GEMINI_VOICES
 from ttsbot.textnorm import (
     build_mention_say_map_from_guild,
     normalize_for_tts,
@@ -81,6 +82,11 @@ _FISH_MODEL_CHOICES = [
     app_commands.Choice(name="S2 Pro", value="s2-pro"),
 ]
 
+_VOICE_ADD_PROVIDER_CHOICES = [
+    app_commands.Choice(name="MiniMax (voice_id)", value="minimax"),
+    app_commands.Choice(name="Gemini через OpenRouter (Kore, Puck…)", value="gemini"),
+]
+
 _FISH_LATENCY_CHOICES = [
     app_commands.Choice(name="low (минимальная задержка)", value="low"),
     app_commands.Choice(name="balanced (баланс скорости и качества)", value="balanced"),
@@ -114,6 +120,14 @@ def _fmt_uptime(seconds: float) -> str:
         parts.append(f"{hours}ч")
     parts.append(f"{minutes}м")
     return " ".join(parts)
+
+
+def _provider_tag(rec) -> str:
+    if rec.is_fish:
+        return "Fish Audio"
+    if rec.is_gemini:
+        return "Gemini"
+    return "MiniMax" if rec.is_minimax else "Piper"
 
 
 def _fmt_int(value: int) -> str:
@@ -165,6 +179,20 @@ def build_commands(bot):
             if current in name.lower() or current in label.lower():
                 choices.append(app_commands.Choice(name=f"{name} - {label}", value=name))
         return choices[:25]
+
+
+    async def voice_id_autocomplete(
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Suggest Gemini voice names when provider:gemini is picked."""
+        if getattr(interaction.namespace, "provider", None) != "gemini":
+            return []
+        current = current.lower()
+        return [
+            app_commands.Choice(name=voice, value=voice)
+            for voice in GEMINI_VOICES if current in voice.lower()
+        ][:25]
 
 
     tts_group = app_commands.Group(name="voicebot", description="Управление озвучкой сообщений")
@@ -300,7 +328,7 @@ def build_commands(bot):
             rec = reg.get(name)
             if rec is None:
                 continue
-            tag = "Fish Audio" if rec.is_fish else "MiniMax" if rec.is_minimax else "Piper"
+            tag = _provider_tag(rec)
             fb = " (fallback)" if name == reg.fallback_profile else ""
             desc = f" — {rec.description}" if rec.description else ""
             lines.append(f"`{name}` [{tag}]{fb} - {rec.label}{desc}")
@@ -309,17 +337,21 @@ def build_commands(bot):
         )
 
 
-    @tts_group.command(name="voice-add", description="Зарегистрировать MiniMax-голос (системный или клон)")
+    @tts_group.command(name="voice-add", description="Зарегистрировать голос MiniMax или Gemini")
     @app_commands.describe(
         name="Имя профиля (kebab-case: a-z, 0-9, дефис)",
-        voice_id="MiniMax voice_id (системный или клон)",
+        voice_id="MiniMax voice_id или голос Gemini (Kore, Puck…)",
         description="Описание (необязательно)",
+        provider="Провайдер голоса (по умолчанию MiniMax)",
     )
+    @app_commands.choices(provider=_VOICE_ADD_PROVIDER_CHOICES)
+    @app_commands.autocomplete(voice_id=voice_id_autocomplete)
     async def slash_tts_voice_add(
         interaction: discord.Interaction,
         name: str,
         voice_id: str,
         description: str = "",
+        provider: app_commands.Choice[str] | None = None,
     ) -> None:
         if not await require_guild_manager(interaction):
             return
@@ -339,6 +371,32 @@ def build_commands(bot):
             return
         if not voice_id:
             await interaction.response.send_message("Укажите voice_id.", ephemeral=True)
+            return
+        if provider is not None and provider.value == "gemini":
+            if bot.tts_dispatcher.gemini is None:
+                await interaction.response.send_message(
+                    "Gemini не настроен (нет OPENROUTER_API_KEY).", ephemeral=True,
+                )
+                return
+            if len(voice_id) > 64 or not voice_id.isalnum():
+                await interaction.response.send_message(
+                    "Укажите имя голоса Gemini, например `Kore`.", ephemeral=True,
+                )
+                return
+            # The probe is a real (billed) request; defer past the 3 s limit.
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            error = await bot.register_gemini_voice(
+                name=name, voice=voice_id,
+                label=f"{name} (Gemini {voice_id})", description=description.strip(),
+            )
+            if error:
+                await interaction.followup.send(f"Голос не добавлен: {error}.", ephemeral=True)
+                return
+            await interaction.followup.send(
+                f"Добавлен голос `{name}` (Gemini `{voice_id}`). "
+                f"Назначьте его через `/voicebot voice-user` или `/voicebot voice-set`.",
+                ephemeral=True,
+            )
             return
         # Validation hits the network; defer so the interaction does not expire.
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -820,6 +878,7 @@ def build_commands(bot):
         cb = getattr(disp, "circuit_breaker", None)
         cloud = getattr(disp, "cloud", None)
         fish = getattr(disp, "fish", None)
+        gemini = getattr(disp, "gemini", None)
         embed = discord.Embed(title="📊 TTS • Статистика", color=0x5865F2)
         if cache is not None:
             hits, misses = cache.hits, cache.misses
@@ -843,13 +902,21 @@ def build_commands(bot):
         breakers = []
         if fish is not None:
             breakers.append(f"Fish {_cb_state(getattr(disp, 'fish_circuit_breaker', None))}")
-        if cloud is not None or fish is None:
+        if gemini is not None:
+            breakers.append(f"Gemini {_cb_state(getattr(disp, 'gemini_circuit_breaker', None))}")
+        if cloud is not None or (fish is None and gemini is None):
             breakers.append(f"MiniMax {_cb_state(cb)}")
         embed.add_field(name="Circuit breaker", value=" · ".join(breakers), inline=True)
         if fish is not None:
             embed.add_field(
                 name="Fish запросы / символы (сессия)",
                 value=f"{_fmt_int(fish.session_requests)} / {_fmt_int(fish.session_chars)}",
+                inline=True,
+            )
+        if gemini is not None:
+            embed.add_field(
+                name="Gemini запросы / символы (сессия)",
+                value=f"{_fmt_int(gemini.session_requests)} / {_fmt_int(gemini.session_chars)}",
                 inline=True,
             )
         chars = getattr(cloud, "session_chars", None)
@@ -908,7 +975,7 @@ def build_commands(bot):
             rec = reg.get(name)
             if rec is None:
                 continue
-            tag = "Fish Audio" if rec.is_fish else "MiniMax" if rec.is_minimax else "Piper"
+            tag = _provider_tag(rec)
             extra = ""
             if rec.is_minimax and rec.minimax is not None:
                 extra = f" · {rec.minimax.model}"
@@ -919,6 +986,8 @@ def build_commands(bot):
                 extra = f" · {rec.fish.model or configured}"
                 if rec.fish.emotion:
                     extra += f" · {rec.fish.emotion}"
+            elif rec.is_gemini and rec.gemini is not None:
+                extra = f" · {rec.gemini.voice}"
             lines.append(f"`{name}` [{tag}]{extra}")
         if lines:
             embed.add_field(name="Список", value="\n".join(lines)[:1000], inline=False)

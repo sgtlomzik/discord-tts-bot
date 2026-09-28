@@ -1,6 +1,6 @@
 """Synthesis pipeline for TTSBot: providers, streaming and workers.
 
-Covers Piper file generation, the MiniMax and Fish streaming paths with their
+Covers Piper file generation, the MiniMax, Fish and Gemini streaming paths with their
 cache/circuit-breaker interplay, the prefetch generation worker and the
 legacy single worker. Playback details live in ttsbot.playback.
 """
@@ -24,6 +24,8 @@ except Exception:  # pragma: no cover - optional dependency
 from ttsbot import voice_registry
 from ttsbot.errors import QuotaExhaustedError
 from ttsbot.fish import FishError
+from ttsbot.gemini import GeminiError
+from ttsbot.pcm import PcmFramer, pcm_cache_header, pcm_to_frames, read_pcm_cache
 from ttsbot.providers import (
     MiniMaxError,
     MiniMaxProvider,
@@ -238,6 +240,39 @@ class SynthesisPipelineMixin:
             return f"не удалось сохранить: {exc}"
         return ""
 
+    async def register_gemini_voice(
+        self, *, name: str, voice: str, label: str, description: str,
+    ) -> str:
+        """Probe a Gemini prebuilt ``voice`` and save it as voice ``name``.
+
+        Returns "" on success or a short reason (lowercase, for a message
+        prefix). The probe is one short billed request.
+        """
+        gemini = self.tts_dispatcher.gemini
+        params = voice_registry.GeminiParams(voice=voice)
+        try:
+            _, _, pcm = await gemini.fetch_pcm("Проверка голоса.", params)
+            if not pcm:
+                raise GeminiError("Gemini returned no audio")
+        except Exception as exc:
+            return f"проверка озвучки не прошла: {type(exc).__name__}: {exc}"
+        if name in self.voice_registry:
+            return f"голос `{name}` уже существует"
+        self.voice_registry.add(voice_registry.VoiceRecord(
+            name=name,
+            label=label,
+            description=description,
+            provider=voice_registry.PROVIDER_GEMINI,
+            gemini=params,
+        ))
+        try:
+            self.persist_voice_registry()
+        except OSError as exc:
+            self.voice_registry.voices.pop(name, None)
+            log.exception("Failed to persist voices.json after adding Gemini voice %s", name)
+            return f"не удалось сохранить: {exc}"
+        return ""
+
     async def clone_fish_voice(
         self, *, name: str, sample: bytes, filename: str, description: str,
     ) -> tuple[bool, str]:
@@ -338,6 +373,7 @@ class SynthesisPipelineMixin:
             and (
                 (getattr(voice, "is_minimax", False) and self.tts_dispatcher.cloud is not None)
                 or (getattr(voice, "is_fish", False) and self.tts_dispatcher.fish is not None)
+                or (getattr(voice, "is_gemini", False) and self.tts_dispatcher.gemini is not None)
             )
         )
 
@@ -646,6 +682,11 @@ class SynthesisPipelineMixin:
                 if status != "pre_audio":
                     return
                 voice = self.voice_registry.fallback_record()
+            if getattr(voice, "is_gemini", False) and self._should_attempt_stream(voice):
+                status = await self._generate_gemini_stream_into(prepared, voice)
+                if status != "pre_audio":
+                    return
+                voice = self.voice_registry.fallback_record()
             if self._should_attempt_stream(voice):
                 status = await self._generate_stream_into(prepared, voice)
                 if status != "pre_audio":
@@ -735,6 +776,164 @@ class SynthesisPipelineMixin:
         elif status != "cancelled":
             self.tts_dispatcher.record_failure(cb, prepared.error)
         return status
+
+    async def _generate_gemini_stream_into(self, prepared: PreparedAudio, voice) -> str:
+        """Gemini PCM through PcmFramer: cache, breaker, then the API.
+
+        No ffmpeg on this path: raw PCM is resampled and framed in-process,
+        both for a cache hit and for a live response.
+        """
+        job = prepared.job
+        gemini = self.tts_dispatcher.gemini
+        cb = self.tts_dispatcher.gemini_circuit_breaker
+        cache = self.tts_dispatcher.cache
+        cache_key = gemini.config.cache_key(voice.gemini)
+        if cache is not None:
+            cached = cache.lookup(job.text, cache_key)
+            if cached is not None:
+                try:
+                    rate, channels, pcm = read_pcm_cache(cached)
+                    frames = limit_pcm_frames(
+                        pcm_to_frames(pcm, rate, channels, voice.gemini.volume_db), job.text, voice,
+                    )
+                except (OSError, ValueError) as exc:
+                    log.warning("Invalid Gemini cache file %s (%s); regenerating", cached, exc)
+                    frames = []
+                if frames and not prepared.cancelled:
+                    await prepared.channel.put(frames)
+                    prepared.provider = "cache"
+                    return "cache"
+        if prepared.cancelled:
+            return "cancelled"
+        if not cb.allow_request():
+            log.info("Gemini circuit breaker open; Piper fallback guild=%s", job.guild_id)
+            return "pre_audio"
+        prepared.provider = "gemini"
+        status, _ = await self._stream_gemini_to_channel(prepared, voice, cache_key)
+        if status == "ok":
+            cb.record_success()
+        elif status != "cancelled":
+            self.tts_dispatcher.record_failure(cb, prepared.error)
+        return status
+
+    async def _stream_gemini_to_channel(
+        self, prepared: PreparedAudio, voice, cache_key: str,
+    ) -> tuple[str, int]:
+        """Frame Gemini PCM chunk by chunk into ``prepared.channel``.
+
+        The first-audio budget grows with the text because OpenRouter sends
+        nothing until the whole clip is generated. Returns (status, frames)
+        with status in ok/truncated/pre_audio/cancelled.
+        """
+        job = prepared.job
+        budget = config.GEMINI_TTFA_TIMEOUT + config.GEMINI_TTFA_PER_CHAR * len(job.text)
+        deadline = time.monotonic() + budget
+        frame_limit = playback_frame_limit(job.text, voice)
+        frames_count = 0
+        limit_hit = False
+        status = "ok"
+        stream = None
+        cache = self.tts_dispatcher.cache
+        cache_final: Path | None = None
+        part_path: Path | None = None
+        cache_part = None
+
+        async def emit(frames: list[bytes]) -> None:
+            nonlocal frames_count, limit_hit
+            if frame_limit is not None and frames_count + len(frames) > frame_limit:
+                frames = frames[:max(0, frame_limit - frames_count)]
+                limit_hit = True
+            if not frames:
+                return
+            if frames_count == 0:
+                log.info(
+                    "Gemini first frame guild=%s message_to_frame_s=%.3f chars=%d",
+                    job.guild_id, time.perf_counter() - job.message_ts, len(job.text),
+                )
+            await prepared.channel.put(frames)
+            frames_count += len(frames)
+
+        try:
+            stream = await asyncio.wait_for(
+                self.tts_dispatcher.gemini.open_stream(job.text, voice.gemini), timeout=budget,
+            )
+            framer = PcmFramer(stream.rate, stream.channels, voice.gemini.volume_db)
+            if cache is not None:
+                try:
+                    cache_final = cache.cache_path_for(job.text, cache_key, "pcm")
+                    cache_final.parent.mkdir(parents=True, exist_ok=True)
+                    part_path = cache_final.parent / f"{cache_final.stem}.{uuid.uuid4().hex}.tmp"
+                    cache_part = part_path.open("wb")
+                    cache_part.write(pcm_cache_header(stream.rate, stream.channels))
+                except OSError:
+                    cache_final = cache_part = None
+            chunks = stream.chunks()
+            try:
+                while True:
+                    try:
+                        if frames_count:
+                            chunk = await chunks.__anext__()
+                        else:
+                            chunk = await asyncio.wait_for(
+                                chunks.__anext__(), timeout=max(deadline - time.monotonic(), 0),
+                            )
+                    except StopAsyncIteration:
+                        break
+                    if prepared.cancelled:
+                        status = "cancelled"
+                        break
+                    if cache_part is not None:
+                        try:
+                            cache_part.write(chunk)
+                        except OSError:
+                            cache_part.close()
+                            cache_part = None
+                    await emit(framer.feed(chunk))
+                    if limit_hit:
+                        break
+            finally:
+                await chunks.aclose()
+            if status == "ok" and not limit_hit:
+                await emit(framer.flush())
+        except asyncio.TimeoutError:
+            log.warning(
+                "Gemini first audio exceeded %.2fs; Piper fallback guild=%s chars=%d",
+                budget, job.guild_id, len(job.text),
+            )
+            status = "truncated" if frames_count else "pre_audio"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            prepared.error = exc
+            log.warning(
+                "Gemini stream failed after %d frames (%s: %s)", frames_count, type(exc).__name__, exc,
+            )
+            status = "truncated" if frames_count else "pre_audio"
+        finally:
+            if stream is not None:
+                await stream.aclose()
+            if cache_part is not None:
+                cache_part.close()
+
+        if prepared.cancelled:
+            status = "cancelled"
+        elif limit_hit:
+            status = "truncated"
+            log.warning("Gemini audio length limit hit guild=%s frames=%d", job.guild_id, frames_count)
+        elif status == "ok" and not frames_count:
+            log.warning("Gemini stream produced no audio; Piper fallback guild=%s", job.guild_id)
+            prepared.error = GeminiError("Gemini returned no audio")
+            status = "pre_audio"
+        if part_path is not None:
+            if status == "ok" and cache_final is not None and cache_part is not None:
+                try:
+                    os.replace(part_path, cache_final)
+                    cache.commit_file(job.text, cache_final, cache_key)
+                except OSError:
+                    part_path.unlink(missing_ok=True)
+            else:
+                part_path.unlink(missing_ok=True)
+        return status, frames_count
 
     async def _generate_file_into(self, prepared: PreparedAudio, voice) -> None:
         if prepared.cancelled:
@@ -1139,10 +1338,12 @@ class SynthesisPipelineMixin:
                     or self.voice_registry.fallback_record()
                 )
 
-                # The legacy single-worker mode still streams Fish audio.
-                # Reuse the same producer/consumer path as prefetch, without
-                # changing the continuous Discord player.
-                if getattr(voice, "is_fish", False) and self._should_attempt_stream(voice):
+                # The legacy single-worker mode still streams Fish and Gemini
+                # audio. Reuse the same producer/consumer path as prefetch,
+                # without changing the continuous Discord player.
+                if (
+                    getattr(voice, "is_fish", False) or getattr(voice, "is_gemini", False)
+                ) and self._should_attempt_stream(voice):
                     prepared = PreparedAudio(job=job, channel=asyncio.Queue())
                     self.active_prepared.add(prepared)
                     generator = asyncio.create_task(self._prepare_into(prepared))
