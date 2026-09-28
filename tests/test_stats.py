@@ -69,6 +69,17 @@ class EmbedBuilderTests(unittest.TestCase):
         self.assertIn("Алиасов эмодзи", names)
 
 
+    def test_long_voice_list_is_split_on_line_boundaries(self):
+        from ttsbot.commands import _chunk_lines
+
+        lines = [f"`gemini-voice-{i:02d}` [Gemini] · Zubenelgenubi" for i in range(60)]
+        blocks = _chunk_lines(lines, 1024)
+        self.assertGreater(len(blocks), 1)
+        self.assertTrue(all(len(block) <= 1024 for block in blocks))
+        self.assertEqual("\n".join(blocks).split("\n"), lines)
+        self.assertEqual(_chunk_lines([], 1900), [])
+
+
 class StatsViewTests(unittest.IsolatedAsyncioTestCase):
     async def test_three_tab_buttons(self):
         # discord.ui.View.__init__ needs a running loop (creates a future)

@@ -23,7 +23,7 @@ from ttsbot import voice_registry
 from dataclasses import replace
 
 from ttsbot import config
-from ttsbot.gemini import GEMINI_VOICES
+from ttsbot.gemini import GEMINI_VOICE_STYLES, GEMINI_VOICES
 from ttsbot.textnorm import (
     build_mention_say_map_from_guild,
     normalize_for_tts,
@@ -130,6 +130,23 @@ def _provider_tag(rec) -> str:
     return "MiniMax" if rec.is_minimax else "Piper"
 
 
+def _chunk_lines(lines: list[str], limit: int) -> list[str]:
+    """Join lines into blocks of at most ``limit`` characters, never
+    splitting a line (Discord caps messages at 2000, embed fields at 1024)."""
+    blocks: list[str] = []
+    current = ""
+    for line in lines:
+        line = line[:limit]
+        if current and len(current) + 1 + len(line) > limit:
+            blocks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        blocks.append(current)
+    return blocks
+
+
 def _fmt_int(value: int) -> str:
     return f"{value:,}".replace(",", " ")
 
@@ -190,7 +207,7 @@ def build_commands(bot):
             return []
         current = current.lower()
         return [
-            app_commands.Choice(name=voice, value=voice)
+            app_commands.Choice(name=f"{voice} — {GEMINI_VOICE_STYLES[voice]}", value=voice)
             for voice in GEMINI_VOICES if current in voice.lower()
         ][:25]
 
@@ -332,9 +349,10 @@ def build_commands(bot):
             fb = " (fallback)" if name == reg.fallback_profile else ""
             desc = f" — {rec.description}" if rec.description else ""
             lines.append(f"`{name}` [{tag}]{fb} - {rec.label}{desc}")
-        await interaction.response.send_message(
-            "\n".join(lines) or "Каталог пуст.", ephemeral=True
-        )
+        blocks = _chunk_lines(lines, 1900) or ["Каталог пуст."]
+        await interaction.response.send_message(blocks[0], ephemeral=True)
+        for block in blocks[1:]:
+            await interaction.followup.send(block, ephemeral=True)
 
 
     @tts_group.command(name="voice-add", description="Зарегистрировать голос MiniMax или Gemini")
@@ -990,7 +1008,8 @@ def build_commands(bot):
                 extra = f" · {rec.gemini.voice}"
             lines.append(f"`{name}` [{tag}]{extra}")
         if lines:
-            embed.add_field(name="Список", value="\n".join(lines)[:1000], inline=False)
+            for index, block in enumerate(_chunk_lines(lines, 1024)):
+                embed.add_field(name="Список" if index == 0 else "​", value=block, inline=False)
         return embed
 
 

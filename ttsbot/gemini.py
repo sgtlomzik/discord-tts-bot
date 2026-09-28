@@ -29,15 +29,27 @@ DEFAULT_MODEL = "google/gemini-3.8-flash-lite-tts"
 DEFAULT_VOICE = "Kore"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Prebuilt Gemini TTS voices, for slash-command autocomplete. Registration
-# probes the voice with a real request, so this list is advisory only.
-GEMINI_VOICES = (
-    "Achernar", "Achird", "Algenib", "Algieba", "Alnilam", "Aoede", "Autonoe",
-    "Callirrhoe", "Charon", "Despina", "Enceladus", "Erinome", "Fenrir", "Gacrux",
-    "Iapetus", "Kore", "Laomedeia", "Leda", "Orus", "Puck", "Pulcherrima",
-    "Rasalgethi", "Sadachbia", "Sadaltager", "Schedar", "Sulafat", "Umbriel",
-    "Vindemiatrix", "Zephyr", "Zubenelgenubi",
-)
+# Prebuilt Gemini TTS voices with Google's style tag and voice gender, for
+# autocomplete and profile descriptions. All 30 answered through OpenRouter
+# on 2026-09-28; registration still probes, so the list is advisory.
+GEMINI_VOICE_STYLES = {
+    "Achernar": "мягкий, женский", "Achird": "дружелюбный, мужской",
+    "Algenib": "с хрипотцой, мужской", "Algieba": "плавный, мужской",
+    "Alnilam": "твёрдый, мужской", "Aoede": "лёгкий, женский",
+    "Autonoe": "яркий, женский", "Callirrhoe": "непринуждённый, женский",
+    "Charon": "информативный, мужской", "Despina": "плавный, женский",
+    "Enceladus": "с придыханием, мужской", "Erinome": "чёткий, женский",
+    "Fenrir": "возбуждённый, мужской", "Gacrux": "зрелый, женский",
+    "Iapetus": "чёткий, мужской", "Kore": "твёрдый, женский",
+    "Laomedeia": "бодрый, женский", "Leda": "юный, женский",
+    "Orus": "твёрдый, мужской", "Puck": "бодрый, мужской",
+    "Pulcherrima": "напористый, женский", "Rasalgethi": "информативный, мужской",
+    "Sadachbia": "живой, мужской", "Sadaltager": "знающий, мужской",
+    "Schedar": "ровный, мужской", "Sulafat": "тёплый, женский",
+    "Umbriel": "непринуждённый, мужской", "Vindemiatrix": "нежный, женский",
+    "Zephyr": "яркий, женский", "Zubenelgenubi": "небрежный, мужской",
+}
+GEMINI_VOICES = tuple(sorted(GEMINI_VOICE_STYLES))
 
 
 def _env(name: str, default: str) -> str:
