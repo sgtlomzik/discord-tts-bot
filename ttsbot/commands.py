@@ -396,9 +396,11 @@ def build_commands(bot):
                     "Gemini не настроен (нет OPENROUTER_API_KEY).", ephemeral=True,
                 )
                 return
-            if len(voice_id) > 64 or not voice_id.isalnum():
+            # Prebuilt names ("Kore") and Voice Library ids ("en-us-nika").
+            if len(voice_id) > 64 or not voice_id.replace("-", "").isalnum():
                 await interaction.response.send_message(
-                    "Укажите имя голоса Gemini, например `Kore`.", ephemeral=True,
+                    "Укажите голос Gemini: имя (`Kore`) или id из библиотеки (`en-us-nika`).",
+                    ephemeral=True,
                 )
                 return
             # The probe is a real (billed) request; defer past the 3 s limit.
