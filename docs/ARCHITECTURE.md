@@ -56,6 +56,10 @@ The active runtime pieces are:
     composed from the four concern mixins below.
   - `voice_lifecycle.py` - connect/move locks, cooldowns, stale-client
     recovery, idle disconnect, auto-connect policy.
+  - `recording/` - voice receive (off unless `RECORDING_ENABLED=1`):
+    `client.py` (a `VoiceClient` subclass), `rtp.py` (transport
+    decryption), `recorder.py` (per-user chunk files), `ogg.py` (Ogg
+    Opus writer).
   - `merge.py` - the enqueue boundary and legacy/selective-hold merge
     decisions.
   - `pipeline.py` - Piper/MiniMax/Fish synthesis, the streaming fast path,
@@ -411,6 +415,35 @@ The bot manages voice state separately from synthesis:
 - auto-connect is suppressed briefly after explicit or idle disconnect.
 
 This is a good separation to preserve when adding a new engine, because the TTS backend should not be responsible for voice lifecycle policy.
+
+### 9.1 Voice recording
+
+With `RECORDING_ENABLED=1` the bot joins voice undeafened (a deafened
+member receives nothing) as `recording.client.RecordingVoiceClient`.
+discord.py 2.7 has no receive API, so the client uses two internal hooks,
+which is why requirements.txt pins discord.py:
+
+- `VoiceConnectionState.add_socket_listener` gets every UDP packet on the
+  socket reader thread. `rtp.decrypt_transport` removes the
+  `aead_xchacha20_poly1305_rtpsize` layer, then the DAVE session
+  discord.py keeps for sending decrypts the Opus packet for its sender.
+- A voice-websocket hook reads SPEAKING (op 5), which maps each SSRC to a
+  user id; packets from an SSRC not yet mapped wait (up to 1 s of them).
+
+Other bots' audio and Discord's end-of-speech silence frames are dropped.
+Opus packets are not decoded: `recorder.ChannelRecorder` hands them to a
+writer thread that muxes each user into `RECORDING_DIR/<guild>/<UTC
+start>-<channel>/<user>/NNNN.ogg`. Discord sends nothing while a user is
+silent, so a file holds speech only; a silence longer than
+`RECORDING_PIECE_GAP_SECONDS` becomes a fixed `RECORDING_PIECE_PAUSE_MS`
+pause and starts a new "piece". Each closed file adds a line to
+`chunks.jsonl` with its pieces as `[offset in file, wall-clock start]`,
+which maps transcript timestamps back to real time; `session.json` holds
+the channel and start/end times. Log lines: `Recording started`,
+`Recording chunk closed ... audio_s= pieces= reason=full|idle|stop`,
+`Recording stats` every minute and `Recording finished` with counters
+(`packets`, `unknown_ssrc_packets`, `dave_errors`, `transport_errors`,
+`late_packets`, `filled_ms`, `bot_packets`).
 
 ## 10. Persistence and Guild State
 
