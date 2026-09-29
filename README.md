@@ -3,9 +3,10 @@
 **English** | [Русский](README.ru.md)
 
 A self-hosted Discord bot that reads chat messages aloud in a voice channel.
-Fish Audio streams Ogg/Opus speech for low-latency playback. Local
-[Piper](https://github.com/OHF-Voice/piper1-gpl) voices work offline, and
-MiniMax voices remain available. Cloud failures fall back to Piper.
+Fish Audio and ElevenLabs stream Ogg/Opus speech for low-latency playback.
+Local [Piper](https://github.com/OHF-Voice/piper1-gpl) voices work offline, and
+MiniMax and Gemini (through OpenRouter) voices are available too. Cloud
+failures fall back to Piper.
 
 [![CI](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/ci.yml)
 [![Docker](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/docker.yml/badge.svg)](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/docker.yml)
@@ -15,12 +16,14 @@ MiniMax voices remain available. Cloud failures fall back to Piper.
 - **Reads chat into voice** — whitelisted users' messages are synthesized and
   played in their current voice channel; the bot auto-connects and
   auto-disconnects when idle.
-- **Three TTS engines** — Fish Audio, MiniMax, and local Piper. Cloud failures
-  fall back to Piper; repeated phrases use an on-disk LRU cache.
-- **Low latency** — Fish streams Ogg/Opus over HTTP; the bot extracts 20 ms
-  Opus packets and sends them straight to Discord without decoding or
-  re-encoding. One continuous Opus player serves every engine (Piper and
-  MiniMax PCM is encoded in place), so switching voices never restarts it.
+- **Five TTS engines** — Fish Audio, ElevenLabs, MiniMax, Gemini (through
+  OpenRouter) and local Piper. Cloud failures fall back to Piper; repeated
+  phrases use an on-disk LRU cache.
+- **Low latency** — Fish and ElevenLabs stream Ogg/Opus over HTTP; the bot
+  extracts 20 ms Opus packets and sends them straight to Discord without
+  decoding or re-encoding. One continuous Opus player serves every engine
+  (Piper, MiniMax and Gemini PCM is encoded in place), so switching voices
+  never restarts it.
   A keep-alive HTTP client is reused, and the next message is synthesized
   while the previous plays.
 - **Smart message merging** — short bursts of messages from one user are
@@ -101,8 +104,10 @@ Everything is configured through environment variables — see
 | `FISH_API_KEY` | Fish Audio key; keep it in `.env` only |
 | `FISH_REFERENCE_ID` | Fish voice ID; seeds the `fish-default` profile |
 | `FISH_TTFA_TIMEOUT` | Seconds to wait for Fish's first audio packet before Piper (default 5) |
-| `TTS_QUOTA_COOLDOWN_SECONDS` | Pause Fish or MiniMax after a balance/plan error (default 1800) |
-| `TTS_PRIMARY_PROVIDER` | `local`, `minimax`, or `fish` |
+| `ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEYS` | Enables ElevenLabs; several keys form a ring (see below) |
+| `OPENROUTER_API_KEY` | Enables Gemini voices through OpenRouter (optional) |
+| `TTS_QUOTA_COOLDOWN_SECONDS` | Pause a cloud provider after a balance/plan error (default 1800) |
+| `TTS_PRIMARY_PROVIDER` | `local`, `minimax`, `fish`, `gemini` or `elevenlabs` |
 | `TTS_MERGE_ALGORITHM` | `selective_hold_v2`, `legacy` or `off` |
 
 For Fish, put `FISH_API_KEY` and `FISH_REFERENCE_ID` in `.env`, then select
@@ -151,6 +156,33 @@ pitch changes the cache key.
 `/voicebot stats` reports successful Fish requests and input characters for
 the current session (this is not Fish billing usage) and the Fish and MiniMax
 circuit-breaker states with the remaining cooldown.
+
+### ElevenLabs
+
+Set `ELEVENLABS_API_KEY` (the key needs the `text_to_speech` permission;
+`voices_read` adds voice_id autocomplete) and add voices with
+`/voicebot voice-add name:my-voice voice_id:<id> provider:ElevenLabs`; the
+bot checks one short generation before saving. `ELEVENLABS_VOICE_ID`
+optionally seeds an `eleven-default` profile. The default model is
+`eleven_v4_turbo` (first audio ~0.2 s, 0.5 credit per character).
+
+`ELEVENLABS_FORMAT=opus_48000_64` (the default) returns Ogg/Opus with 20 ms
+packets, which take the same direct path as Fish. `pcm_48000` or
+`pcm_24000` returns raw PCM, framed in-process without ffmpeg.
+`/voicebot voice-tune` sets `stability`, `similarity` and the model of an
+ElevenLabs voice (`reset` goes back to the voice's own settings). Voice
+Library voices need a paid ElevenLabs plan; premade voices work on a free one.
+
+`ELEVENLABS_API_KEYS=k1,k2,k3` spreads spending over several accounts. When
+the active key is out of credits (under 50 left) or invalid, the same
+message is retried with the next key before any audio plays, and after the
+last key comes the first. A message that is only longer than a key's
+remaining credits goes to the next key without moving the ring. When every
+key is empty, Piper speaks and ElevenLabs pauses for
+`TTS_QUOTA_COOLDOWN_SECONDS`. The active key survives restarts (its hash is
+kept in `data/config.json`), and `/voicebot stats` shows session credits
+per key. Cloned and Voice Library voices must exist in every account of the
+ring.
 
 ## Commands
 

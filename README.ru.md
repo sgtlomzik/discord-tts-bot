@@ -3,10 +3,10 @@
 [English](README.md) | **Русский**
 
 Self-hosted Discord-бот, который озвучивает сообщения из чата в голосовом
-канале. Для потоковой озвучки можно использовать Fish Audio (Ogg/Opus),
-локальные голоса [Piper](https://github.com/OHF-Voice/piper1-gpl) работают
-полностью офлайн; голоса MiniMax остаются доступными. При сбое облачного
-движка бот переключается на Piper.
+канале. Для потоковой озвучки можно использовать Fish Audio и ElevenLabs
+(Ogg/Opus), локальные голоса [Piper](https://github.com/OHF-Voice/piper1-gpl)
+работают полностью офлайн; доступны также голоса MiniMax и Gemini (через
+OpenRouter). При сбое облачного движка бот переключается на Piper.
 
 [![CI](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/ci.yml)
 [![Docker](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/docker.yml/badge.svg)](https://github.com/sgtlomzik/discord-tts-bot/actions/workflows/docker.yml)
@@ -16,10 +16,11 @@ Self-hosted Discord-бот, который озвучивает сообщени
 - **Озвучка чата в войсе** — сообщения пользователей из белого списка
   синтезируются и проигрываются в их голосовом канале; бот сам подключается
   и отключается при простое.
-- **Три TTS-движка** — Fish Audio, MiniMax и локальный Piper. При сбое
+- **Пять TTS-движков** — Fish Audio, ElevenLabs, MiniMax, Gemini (через
+  OpenRouter) и локальный Piper. При сбое
   облака circuit breaker переключает на Piper; повторяющиеся фразы берутся
   из LRU-кэша на диске.
-- **Низкая задержка** — Fish отдаёт Ogg/Opus по HTTP; бот извлекает 20-мс
+- **Низкая задержка** — Fish и ElevenLabs отдают Ogg/Opus по HTTP; бот извлекает 20-мс
   Opus-пакеты и сразу передаёт их в Discord без декодирования и повторного
   кодирования. Следующее сообщение синтезируется, пока играет предыдущее.
   Один HTTP-клиент держит соединение открытым.
@@ -101,8 +102,10 @@ python bot.py
 | `FISH_API_KEY` | Ключ Fish Audio; хранить только в `.env` |
 | `FISH_REFERENCE_ID` | ID голоса Fish; создаёт профиль `fish-default` |
 | `FISH_TTFA_TIMEOUT` | Сколько секунд ждать первый аудиопакет от Fish до перехода на Piper (по умолчанию 5) |
-| `TTS_QUOTA_COOLDOWN_SECONDS` | Пауза для Fish или MiniMax, когда закончился баланс или лимит тарифа (по умолчанию 1800) |
-| `TTS_PRIMARY_PROVIDER` | `local`, `minimax` или `fish` |
+| `ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEYS` | Включает ElevenLabs; несколько ключей образуют кольцо (см. ниже) |
+| `OPENROUTER_API_KEY` | Включает голоса Gemini через OpenRouter (опционально) |
+| `TTS_QUOTA_COOLDOWN_SECONDS` | Пауза для облачного сервиса, когда закончился баланс или лимит тарифа (по умолчанию 1800) |
+| `TTS_PRIMARY_PROVIDER` | `local`, `minimax`, `fish`, `gemini` или `elevenlabs` |
 | `TTS_MERGE_ALGORITHM` | `selective_hold_v2`, `legacy` или `off` |
 
 Для Fish укажите в `.env` `FISH_API_KEY` и `FISH_REFERENCE_ID`, затем
@@ -157,6 +160,34 @@ emotion:happy pitch:2 volume_db:3`. Доступны также `model`, `temper
 `/voicebot stats` показывает число успешных запросов Fish и символов в них
 за текущую сессию (это счётчик входного текста, а не биллинг Fish), а также
 состояние предохранителей Fish и MiniMax с оставшимся временем паузы.
+
+### ElevenLabs
+
+Укажите `ELEVENLABS_API_KEY` (ключу нужно право `text_to_speech`; с правом
+`voices_read` работает автодополнение voice_id) и добавьте голоса командой
+`/voicebot voice-add name:my-voice voice_id:<id> provider:ElevenLabs`: перед
+сохранением бот делает одну короткую пробную генерацию.
+`ELEVENLABS_VOICE_ID` по желанию создаёт профиль `eleven-default`. Модель по
+умолчанию — `eleven_v4_turbo` (первый звук ~0,2 с, 0,5 кредита за символ).
+
+`ELEVENLABS_FORMAT=opus_48000_64` (по умолчанию) отдаёт Ogg/Opus с 20-мс
+пакетами, и они идут в Discord тем же прямым путём, что у Fish. `pcm_48000`
+или `pcm_24000` отдают сырой PCM, который нарезается в процессе, без ffmpeg.
+`/voicebot voice-tune` задаёт ElevenLabs-голосу `stability`, `similarity` и
+модель (`reset` возвращает собственные настройки голоса). Голоса из Voice
+Library требуют платного тарифа ElevenLabs; стандартные работают и на
+бесплатном.
+
+`ELEVENLABS_API_KEYS=k1,k2,k3` распределяет расход по нескольким аккаунтам.
+Если у активного ключа кончились кредиты (осталось меньше 50) или ключ
+недействителен, то же сообщение сразу повторяется со следующим ключом, ещё
+до начала звука; после последнего ключа идёт первый. Сообщение, которое
+просто длиннее остатка ключа, уходит на следующий ключ без смены активного.
+Если пусты все ключи, говорит Piper, а ElevenLabs отдыхает
+`TTS_QUOTA_COOLDOWN_SECONDS`. Активный ключ переживает перезапуск (в
+`data/config.json` хранится его хэш), `/voicebot stats` показывает кредиты
+за сессию по каждому ключу. Клоны и голоса из Voice Library должны быть в
+каждом аккаунте кольца.
 
 ## Команды
 

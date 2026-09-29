@@ -121,8 +121,7 @@ which does not rotate further; premade voices exist in every account.
 
 ## 5. Not done / follow-ups
 
-- README and ARCHITECTURE.md are not updated in this branch: the main
-  checkout has uncommitted edits to both, and touching them here would
-  conflict. Fold this document into them after those edits land.
+- README, README.ru and ARCHITECTURE.md describe ElevenLabs (merged into
+  main together with the Gemini branch on 2026-09-29).
 - Auto-emotion via audio tags (like Fish's `fish_tts_text`) was considered
   and deliberately left out.

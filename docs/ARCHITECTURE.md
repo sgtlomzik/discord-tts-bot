@@ -12,9 +12,10 @@ The bot is a single-process Discord service that:
 3. normalizes and classifies message text;
 4. optionally merges short messages into a buffer;
 5. queues TTS jobs;
-6. synthesizes speech with the selected Fish, MiniMax or Piper voice;
-7. turns the result into 20 ms frames: Fish Opus packets pass through
-   as-is, everything else is decoded to PCM;
+6. synthesizes speech with the selected Fish, ElevenLabs, MiniMax, Gemini
+   or Piper voice;
+7. turns the result into 20 ms frames: Fish and ElevenLabs Opus packets
+   pass through as-is, everything else is decoded to PCM;
 8. plays the frames into a Discord voice channel through one continuous
    Opus player;
 9. disconnects when the voice channel goes idle.
@@ -67,6 +68,11 @@ The active runtime pieces are:
   the long quota trip).
 - `ttsbot/fish.py` - Fish HTTP client, request configuration and in-flight
   deduplication.
+- `ttsbot/elevenlabs.py` - ElevenLabs streaming client, error mapping and
+  the API-key ring.
+- `ttsbot/gemini.py` - Gemini TTS through OpenRouter (raw PCM).
+- `ttsbot/pcm.py` - `PcmFramer`: raw PCM to 48 kHz stereo 20 ms frames
+  in-process (soxr), plus the `.pcm` cache format.
 - `ttsbot/voice_registry.py` - the unified voice catalog
   (data/voices.json).
 - `scripts/` - operator tools: model download, MiniMax voice cloning,
@@ -317,6 +323,28 @@ Fallbacks and breakers:
 waits for `GET /model/{id}` to report `trained`, probes the new `reference_id`
 through `/v1/tts`, and only then saves a Fish voice record in `voices.json`.
 
+ElevenLabs uses `POST /v1/text-to-speech/{voice_id}/stream`, which sends
+audio while it is generated (first audio ~0.2 s with `eleven_v4_turbo`).
+`ELEVENLABS_FORMAT` picks one of two shared paths, neither with ffmpeg:
+
+```text
+opus_48000_* -> Ogg/Opus, mono, 20 ms packets
+             -> _stream_ogg_opus_to_channel (the Fish direct path, .dopus cache)
+pcm_*        -> raw s16le -> _stream_pcm_to_channel (the Gemini PcmFramer path, .pcm cache)
+```
+
+Several keys (`ELEVENLABS_API_KEYS`) form a ring inside
+`ElevenLabsProvider.open_stream`: a key that is out of credits (under 50
+left, read from the `quota_exceeded` message), HTTP 402 or an invalid key
+moves the ring and the same request is retried with the next key before
+any audio. A message only too long for a key's balance, or a voice the
+key's plan does not allow (`paid_plan_required`), is retried with the next
+key without moving the ring. When every key is empty the provider raises
+`ElevenLabsQuotaExhaustedError` (the long breaker trip); request-level
+errors (`ElevenLabsRequestError`: missing voice, message too long for every
+key, plan-restricted voice) fall back to Piper without a breaker failure.
+The active key is persisted as a sha256 fingerprint in `data/config.json`.
+
 The local fallback path is:
 
 ```text
@@ -457,6 +485,9 @@ The important current engine-specific values are:
 - `FISH_OPUS_BITRATE=48000`
 - `FISH_API_KEY` and `FISH_REFERENCE_ID` supplied from the untracked `.env`
 - `FISH_TTFA_TIMEOUT=5`
+- `ELEVENLABS_MODEL=eleven_v4_turbo`, `ELEVENLABS_FORMAT=opus_48000_64`,
+  `ELEVENLABS_TTFA_TIMEOUT=3`; `ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEYS`
+  supplied from `.env`
 - `CB_FAILURE_THRESHOLD=3`, `CB_COOLDOWN_SECONDS=60`
 - `TTS_QUOTA_COOLDOWN_SECONDS=1800`
 - `TTS_DEFAULT_VOICE_PROFILE=piper-ruslan`
@@ -482,7 +513,9 @@ It covers:
 Engine-specific suites sit next to it: `test_fish.py` (Fish requests,
 Ogg/Opus demuxing, the mixed Opus/PCM player, cache keys, pitch),
 `test_minimax_quota.py` (quota errors, the long breaker trip, the Fish
-first-audio timeout) and the `test_providers*.py` files.
+first-audio timeout), `test_gemini.py` and `test_pcm.py` (the PCM path),
+`test_elevenlabs.py` (both ElevenLabs paths, error mapping, the key ring)
+and the `test_providers*.py` files.
 
 The current test suite is important because it pins the public surface of the package: the tests exec `bot.py` per test case, mutate `ttsbot.config` for tuning, and exercise the pipeline through the facade — so a module can be reworked internally while the suite guards the observable behavior.
 
