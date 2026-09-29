@@ -35,6 +35,7 @@ import httpx
 
 from ttsbot.errors import QuotaExhaustedError
 from ttsbot.gemini import write_wav
+from ttsbot.httpclient import provider_limits
 
 log = logging.getLogger("tts_bot")
 
@@ -285,7 +286,7 @@ class ElevenLabsProvider:
         self._client = client or httpx.AsyncClient(
             base_url=config.base_url,
             timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            limits=provider_limits(),
         )
         self._session_requests = 0
         self._session_chars = 0

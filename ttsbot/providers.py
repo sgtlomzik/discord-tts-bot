@@ -52,6 +52,7 @@ from ttsbot import config as bot_config
 from ttsbot.elevenlabs import ElevenLabsProvider, ElevenLabsRequestError
 from ttsbot.fish import FishProvider
 from ttsbot.gemini import GeminiProvider, write_wav
+from ttsbot.httpclient import provider_limits
 from ttsbot.pcm import apply_gain, pcm_cache_header, read_pcm_cache
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -738,7 +739,7 @@ class MiniMaxProvider:
         # larger but each request is short, so 4 keep-alives is plenty.
         self._client = http_client or httpx.AsyncClient(
             timeout=httpx.Timeout(config.timeout_seconds),
-            limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
+            limits=provider_limits(max_connections=8, max_keepalive_connections=4),
         )
         # Cumulative chars billed this process lifetime. Logged on
         # every successful synthesis for quota monitoring.
