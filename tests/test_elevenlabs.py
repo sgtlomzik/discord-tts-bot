@@ -18,7 +18,7 @@ from ttsbot import config
 from ttsbot.audio import PCM_FRAME_BYTES
 from ttsbot.elevenlabs import (
     ElevenLabsAuthError, ElevenLabsConfig, ElevenLabsError, ElevenLabsProvider,
-    ElevenLabsMessageTooLongError, ElevenLabsQuotaExhaustedError, ElevenLabsRateLimitError,
+    ElevenLabsMessageTooLongError, ElevenLabsPaidPlanRequiredError, ElevenLabsQuotaExhaustedError, ElevenLabsRateLimitError,
     ElevenLabsVoiceNotFoundError, format_kind, key_fingerprint,
 )
 from ttsbot.store import BotConfigStore
@@ -342,6 +342,27 @@ class ElevenLabsKeyRingTests(unittest.IsolatedAsyncioTestCase):
             await ring.fetch("x")
         self.assertEqual(ring.active_key_index, 0)
         self.assertFalse(issubclass(ElevenLabsMessageTooLongError, QuotaExhaustedError))
+
+    async def test_library_voice_on_free_plan_neither_rotates_nor_pauses(self):
+        body = {"detail": {"type": "payment_required", "code": "paid_plan_required",
+                           "status": "payment_required",
+                           "message": "Free users cannot use library voices via the API."}}
+        used = []
+
+        def handle(request):
+            used.append(request.headers["xi-api-key"])
+            if request.headers["xi-api-key"] == "k3":  # the one paid account
+                return _audio(b"OggS")
+            return httpx.Response(402, json=body)
+
+        ring = self._ring(handle)
+        self.assertEqual((await ring.fetch("x"))[2], b"OggS")
+        self.assertEqual((used, ring.active_key_index), (["k1", "k2", "k3"], 0))
+        free = self._ring(lambda r: httpx.Response(402, json=body), keys=("k1", "k2"))
+        with self.assertRaises(ElevenLabsPaidPlanRequiredError) as ctx:
+            await free.fetch("x")
+        self.assertNotIsInstance(ctx.exception, QuotaExhaustedError)
+        self.assertEqual(free.active_key_index, 0)
 
     async def test_request_level_401_does_not_rotate(self):
         used = []

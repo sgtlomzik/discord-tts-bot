@@ -160,6 +160,14 @@ class ElevenLabsCreditsError(ElevenLabsKeyError):
         return self.remaining is None or self.remaining < EMPTY_KEY_CREDITS
 
 
+class ElevenLabsPlanError(ElevenLabsKeyError):
+    """This key's plan does not allow the request (402 paid_plan_required).
+
+    Another key may be on a paid plan, so the request is retried with it,
+    but the ring does not move: the key still works for other voices.
+    """
+
+
 def _remaining_credits(message: str) -> int | None:
     match = _REMAINING_RE.search(message)
     return int(match.group(1).replace(",", "")) if match else None
@@ -172,6 +180,11 @@ class ElevenLabsRequestError(ElevenLabsError):
 
 class ElevenLabsVoiceNotFoundError(ElevenLabsRequestError):
     """HTTP 404 voice_not_found, or no voice_id at all."""
+
+
+class ElevenLabsPaidPlanRequiredError(ElevenLabsRequestError):
+    """No key's plan allows this request, e.g. a Voice Library voice on a
+    free plan (HTTP 402 paid_plan_required)."""
 
 
 class ElevenLabsMessageTooLongError(ElevenLabsRequestError):
@@ -203,17 +216,20 @@ def _retry_after(value: str | None) -> float | None:
 def _http_error(response: httpx.Response, body: bytes) -> ElevenLabsError:
     """Map an error response; ElevenLabs puts the reason in ``detail.status``."""
     status = response.status_code
-    reason, message = "", body[:300].decode("utf-8", "replace")
+    reason, code, message = "", "", body[:300].decode("utf-8", "replace")
     try:
         detail = json.loads(body).get("detail")
     except (ValueError, AttributeError):
         detail = None
     if isinstance(detail, dict):
         reason = str(detail.get("status") or detail.get("code") or "")
+        code = str(detail.get("code") or "")
         message = str(detail.get("message") or message)
     elif isinstance(detail, str):
         message = detail
     text = f"ElevenLabs HTTP {status} {reason}: {message}".replace(" :", ":")
+    if code == "paid_plan_required":
+        return ElevenLabsPlanError(text, status)
     if status == 402:
         return ElevenLabsQuotaExhaustedError(text, status)
     if reason == "quota_exceeded":
@@ -403,7 +419,12 @@ class ElevenLabsProvider:
                     return await self._open_with_key(index, voice_id, text, params, output_format)
                 except ElevenLabsKeyError as exc:
                     failures.append(exc)
-                    if isinstance(exc, ElevenLabsCreditsError) and not exc.key_empty:
+                    if isinstance(exc, ElevenLabsPlanError):
+                        log.info(
+                            "ElevenLabs key %s: plan does not allow this voice; "
+                            "trying the next key for this message only", self._key_label(index),
+                        )
+                    elif isinstance(exc, ElevenLabsCreditsError) and not exc.key_empty:
                         log.info(
                             "ElevenLabs key %s has %d credits left, not enough for %d chars; "
                             "trying the next key for this message only",
@@ -415,6 +436,10 @@ class ElevenLabsProvider:
             if moved and self._active != start:
                 self._save_active()  # once per request, not per step
         last = failures[-1]
+        if any(isinstance(exc, ElevenLabsPlanError) for exc in failures):
+            raise ElevenLabsPaidPlanRequiredError(
+                f"No ElevenLabs key's plan allows this voice: {last}", last.status_code,
+            )
         if any(isinstance(exc, ElevenLabsCreditsError) and not exc.key_empty for exc in failures):
             raise ElevenLabsMessageTooLongError(
                 f"No ElevenLabs key has enough credits for {len(text)} chars: {last}", last.status_code,
