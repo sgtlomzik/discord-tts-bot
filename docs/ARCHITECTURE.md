@@ -431,19 +431,29 @@ which is why requirements.txt pins discord.py:
   user id; packets from an SSRC not yet mapped wait (up to 1 s of them).
 
 Other bots' audio and Discord's end-of-speech silence frames are dropped.
-Opus packets are not decoded: `recorder.ChannelRecorder` hands them to a
-writer thread that muxes each user into `RECORDING_DIR/<guild>/<UTC
-start>-<channel>/<user>/NNNN.ogg`. Discord sends nothing while a user is
-silent, so a file holds speech only; a silence longer than
-`RECORDING_PIECE_GAP_SECONDS` becomes a fixed `RECORDING_PIECE_PAUSE_MS`
-pause and starts a new "piece". Each closed file adds a line to
+A packet DAVE cannot decrypt yet (the sender's key arrives ~0.5 s after
+their audio when someone joins) is held for up to 3 s and retried once a
+later packet from that user decrypts.
+
+`recorder.ChannelRecorder` hands the packets to a writer thread that
+muxes each user into `RECORDING_DIR/<guild>/<UTC start>-<channel>/<user>/NNNN.ogg`
+without re-encoding. Discord keeps transmitting through breathing, room
+noise and long runs of digital silence (25 of 35 s in the first live
+test), so the writer decodes each packet only to classify it with WebRTC
+VAD (`vad.py`, `RECORDING_VAD_AGGRESSIVENESS`, default 3: mode 2 still
+kept loud breathing) and keeps speech runs with 200 ms before and 300 ms
+after. A gap between kept speech longer than `RECORDING_PAUSE_MS` becomes
+that much silence and starts a new "piece". Each closed file adds a line to
 `chunks.jsonl` with its pieces as `[offset in file, wall-clock start]`,
 which maps transcript timestamps back to real time; `session.json` holds
 the channel and start/end times. Log lines: `Recording started`,
 `Recording chunk closed ... audio_s= pieces= reason=full|idle|stop`,
-`Recording stats` every minute and `Recording finished` with counters
-(`packets`, `unknown_ssrc_packets`, `dave_errors`, `transport_errors`,
-`late_packets`, `filled_ms`, `bot_packets`).
+`Recording stats` every minute and `Recording finished` with counters:
+`packets` and `heard_ms` received, `written_ms` kept (the rest was
+filtered out),
+`filled_ms` short gaps kept as silence, `unknown_ssrc_packets`,
+`dave_errors` (failed first attempts), `dave_recovered` / `dave_lost`,
+`transport_errors`, `late_packets`, `bot_packets`, `vad_errors`.
 
 ## 10. Persistence and Guild State
 

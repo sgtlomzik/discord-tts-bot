@@ -24,6 +24,7 @@ from discord.voice_state import VoiceConnectionState
 from ttsbot import config
 from ttsbot.recording import rtp
 from ttsbot.recording.recorder import ChannelRecorder, RecorderSettings
+from ttsbot.recording.vad import webrtc_detector_factory
 
 log = logging.getLogger("tts_bot")
 
@@ -34,6 +35,10 @@ _OP_CLIENT_DISCONNECT = 13
 
 # Packets kept per unknown SSRC until its SPEAKING event names the user.
 _PENDING_PACKETS = 50
+# Packets kept per user while DAVE cannot decrypt them yet: right after
+# the bot joins (or someone joins) the sender's key arrives ~0.5 s after
+# its audio. They are retried, in order, once a packet decrypts.
+_DAVE_HOLD_PACKETS = 150
 
 
 def settings_from_config() -> RecorderSettings:
@@ -41,8 +46,11 @@ def settings_from_config() -> RecorderSettings:
         root=config.RECORDING_DIR,
         chunk_seconds=config.RECORDING_CHUNK_SECONDS,
         idle_close_seconds=config.RECORDING_IDLE_CLOSE_SECONDS,
-        piece_gap_seconds=config.RECORDING_PIECE_GAP_SECONDS,
-        piece_pause_ms=config.RECORDING_PIECE_PAUSE_MS,
+        pause_ms=config.RECORDING_PAUSE_MS,
+        detector_factory=(
+            webrtc_detector_factory(config.RECORDING_VAD_AGGRESSIVENESS)
+            if config.RECORDING_VAD_AGGRESSIVENESS >= 0 else None
+        ),
     )
 
 
@@ -51,6 +59,7 @@ class RecordingVoiceClient(discord.VoiceClient):
         self._ssrc_users: dict[int, int] = {}
         self._pending: dict[int, collections.deque] = {}
         self._dave_failed_users: set[int] = set()
+        self._dave_held: dict[int, collections.deque] = {}
         self._recorder: ChannelRecorder | None = None
         self._listening = False
         super().__init__(client, channel)
@@ -95,6 +104,7 @@ class RecordingVoiceClient(discord.VoiceClient):
     def _reset_streams(self) -> None:
         self._ssrc_users.clear()
         self._pending.clear()
+        self._dave_held.clear()
 
     # -- voice websocket (event loop) ----------------------------------
 
@@ -147,22 +157,42 @@ class RecordingVoiceClient(discord.VoiceClient):
         if member is not None and member.bot:
             recorder.count("bot_packets")
             return
-        payload = packet.payload
         connection = self._connection
         session = connection.dave_session
-        if session is not None and connection.dave_protocol_version:
-            try:
-                payload = session.decrypt(user_id, davey.MediaType.audio, payload)
-            except Exception as exc:
-                recorder.count("dave_errors")
-                if user_id not in self._dave_failed_users:
-                    self._dave_failed_users.add(user_id)
-                    log.warning(
-                        "Voice receive DAVE decrypt failed guild=%s user=%s ready=%s: %s: %s",
-                        self.guild.id, user_id, session.ready, type(exc).__name__, exc,
-                    )
-                return
+        if session is None or not connection.dave_protocol_version:
+            self._submit(recorder, user_id, packet.timestamp, packet.payload, wall)
+            return
+        try:
+            payload = session.decrypt(user_id, davey.MediaType.audio, packet.payload)
+        except Exception as exc:
+            recorder.count("dave_errors")
+            if user_id not in self._dave_failed_users:
+                self._dave_failed_users.add(user_id)
+                log.warning(
+                    "Voice receive DAVE decrypt failed guild=%s user=%s ready=%s: %s: %s",
+                    self.guild.id, user_id, session.ready, type(exc).__name__, exc,
+                )
+            held = self._dave_held.setdefault(user_id, collections.deque(maxlen=_DAVE_HOLD_PACKETS))
+            if len(held) == held.maxlen:
+                recorder.count("dave_lost")
+            held.append((packet, wall))
+            return
+        self._dave_failed_users.discard(user_id)
+        held = self._dave_held.pop(user_id, None)
+        if held:
+            for old, old_wall in held:
+                try:
+                    old_payload = session.decrypt(user_id, davey.MediaType.audio, old.payload)
+                except Exception:
+                    recorder.count("dave_lost")
+                    continue
+                recorder.count("dave_recovered")
+                self._submit(recorder, user_id, old.timestamp, old_payload, old_wall)
+        self._submit(recorder, user_id, packet.timestamp, payload, wall)
+
+    @staticmethod
+    def _submit(recorder: ChannelRecorder, user_id: int, timestamp: int, payload: bytes, wall: float) -> None:
         if not payload:
             recorder.count("empty_payloads")
             return
-        recorder.submit(user_id, packet.timestamp, payload, wall)
+        recorder.submit(user_id, timestamp, payload, wall)

@@ -4,12 +4,12 @@ One ``ChannelRecorder`` covers one stay of the bot in one voice channel
 (a session folder). The voice socket thread calls ``submit()``; a writer
 thread owns every file, so the socket thread never waits for the disk.
 
-Discord sends nothing while a user is silent, so a file holds speech
-only: an utterance ("piece") starts after more than
-``piece_gap_seconds`` without packets and is separated from the previous
-one by a fixed ``piece_pause_ms`` of silence. Short gaps inside an
-utterance (lost packets, brief pauses) are kept as silence from the RTP
-timestamps. A file is closed once it holds ``chunk_seconds`` of audio (at
+A file holds speech only. Discord sends nothing while a user is silent,
+and ``detector_factory`` (``vad.py``) drops what it does send between
+words: breathing, room noise, digital silence. A gap in what is kept
+longer than ``pause_ms`` is cut to ``pause_ms`` of silence and starts a
+new "piece"; a shorter gap (a pause between words, lost packets) is kept
+as silence from the RTP timestamps. A file is closed once it holds ``chunk_seconds`` of audio (at
 the next utterance boundary) or after ``idle_close_seconds`` of silence
 from that user, and a line in ``chunks.jsonl`` then records its pieces
 as ``[offset in the file (s), wall-clock start (epoch s)]``: that is what
@@ -26,9 +26,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from ttsbot.ogg_opus import UnsupportedOpusStream, opus_packet_samples
 from ttsbot.recording.ogg import OggOpusWriter
+from ttsbot.recording.vad import DetectorFactory, SpeechGate
 
 log = logging.getLogger("tts_bot")
 
@@ -41,8 +43,8 @@ class RecorderSettings:
     root: Path
     chunk_seconds: float = 600.0
     idle_close_seconds: float = 60.0
-    piece_gap_seconds: float = 2.0
-    piece_pause_ms: int = 500
+    pause_ms: int = 500
+    detector_factory: DetectorFactory | None = None  # None keeps every packet
 
 
 @dataclass
@@ -57,6 +59,9 @@ class _Track:
     last_timestamp: int = 0
     last_samples: int = 0
     packets: int = 0
+    detector: Callable[[bytes], bool] | None = None
+    gate: SpeechGate = field(default_factory=SpeechGate)
+    last_received: float = float("-inf")  # wall time of the last packet heard
 
 
 def _utc_stamp(epoch: float) -> str:
@@ -73,6 +78,7 @@ class ChannelRecorder:
         self.counters: collections.Counter[str] = collections.Counter()
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
         self._tracks: dict[int, _Track] = {}
+        self._logged_packets = 0
         self._thread = threading.Thread(
             target=self._run, name=f"voice-recorder-{guild_id}", daemon=True
         )
@@ -134,17 +140,37 @@ class ChannelRecorder:
             self._close_chunk(track, reason="stop")
 
     def _handle(self, user_id: int, timestamp: int, opus: bytes, wall: float) -> None:
-        settings = self.settings
         track = self._tracks.get(user_id)
         if track is None:
-            track = self._tracks[user_id] = _Track(user_id=user_id)
+            factory = self.settings.detector_factory
+            track = self._tracks[user_id] = _Track(
+                user_id=user_id, detector=factory() if factory else None, gate=SpeechGate()
+            )
         try:
             samples = opus_packet_samples(opus)
         except UnsupportedOpusStream:
             self.count("bad_opus")
             return
+        self.count("packets")
+        self.count("heard_ms", samples // 48)
+        if track.detector is None:
+            self._write(track, timestamp, opus, samples, wall)
+            return
+        if wall - track.last_received > track.gate.settings.hangover * 0.02:
+            track.gate.reset()  # the sender stopped transmitting in between
+        track.last_received = wall
+        try:
+            speech = track.detector(opus)
+        except Exception:
+            self.count("vad_errors")
+            speech = True
+        for item in track.gate.feed((timestamp, opus, samples, wall), speech):
+            self._write(track, *item)
 
-        new_piece = track.writer is None or wall - track.last_wall > settings.piece_gap_seconds
+    def _write(self, track: _Track, timestamp: int, opus: bytes, samples: int, wall: float) -> None:
+        settings = self.settings
+        pause = settings.pause_ms * 48
+        new_piece = track.writer is None
         gap = 0
         if not new_piece:
             delta = (timestamp - track.last_timestamp) & 0xFFFFFFFF
@@ -152,14 +178,16 @@ class ChannelRecorder:
                 self.count("late_packets")  # a duplicate, or older than the last one written
                 return
             gap = max(0, delta - track.last_samples)
-            if gap > settings.piece_gap_seconds * 48000:
-                new_piece = True  # the sender's clock jumped
+            # The wall clock also catches a sender whose RTP clock stood
+            # still while it was not transmitting; 0.2 s absorbs jitter.
+            wall_gap = wall - track.last_wall - (track.last_samples + pause) / 48000
+            new_piece = gap > pause or wall_gap > 0.2
         if new_piece and track.writer is not None and track.writer.seconds >= settings.chunk_seconds:
             self._close_chunk(track, reason="full")
         if track.writer is None:
             self._open_chunk(track, wall)
         elif new_piece:
-            track.writer.write_silence(settings.piece_pause_ms * 48)
+            track.writer.write_silence(pause)
             track.pieces.append([round(track.writer.seconds, 3), round(wall, 3)])
         elif gap > 0:
             track.writer.write_silence(gap)
@@ -170,7 +198,7 @@ class ChannelRecorder:
         track.last_timestamp = timestamp
         track.last_samples = samples
         track.packets += 1
-        self.count("packets")
+        self.count("written_ms", samples // 48)
 
     def _open_chunk(self, track: _Track, wall: float) -> None:
         folder = self.path / str(track.user_id)
@@ -223,8 +251,10 @@ class ChannelRecorder:
 
     def _log_stats(self, final: bool = False) -> None:
         counters = dict(self.counters)
-        if not counters and not final:
-            return
+        packets = counters.get("packets", 0)
+        if not final and packets == self._logged_packets:
+            return  # nothing heard since the last line
+        self._logged_packets = packets
         log.info(
             "Recording %s guild=%s channel=%s users=%d %s",
             "finished" if final else "stats", self.guild_id, self.channel_id, len(self._tracks),

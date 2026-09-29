@@ -74,7 +74,7 @@ def reload() -> None:
     global PIPER_SPEAKER, PIPER_LENGTH_SCALE
     global WHITELIST_USERS
     global RECORDING_ENABLED, RECORDING_DIR, RECORDING_CHUNK_SECONDS
-    global RECORDING_IDLE_CLOSE_SECONDS, RECORDING_PIECE_GAP_SECONDS, RECORDING_PIECE_PAUSE_MS
+    global RECORDING_IDLE_CLOSE_SECONDS, RECORDING_PAUSE_MS, RECORDING_VAD_AGGRESSIVENESS
 
     TMP_DIR = Path(os.getenv("TTS_TMP_DIR", "/dev/shm"))
     BOT_CONFIG_PATH = Path(os.getenv("BOT_CONFIG_PATH", "/app/data/config.json"))
@@ -190,14 +190,16 @@ def reload() -> None:
     # joins voice undeafened and writes every non-bot speaker to Ogg files
     # under RECORDING_DIR, one folder per channel stay. A file closes after
     # RECORDING_CHUNK_SECONDS of speech (at an utterance boundary) or
-    # RECORDING_IDLE_CLOSE_SECONDS of that user's silence. Silences longer
-    # than RECORDING_PIECE_GAP_SECONDS are cut to RECORDING_PIECE_PAUSE_MS.
+    # RECORDING_IDLE_CLOSE_SECONDS of that user's silence. WebRTC VAD at
+    # RECORDING_VAD_AGGRESSIVENESS (0-3; -1 keeps everything) drops
+    # breathing and silence; 3 was the one that dropped loud breathing in
+    # the first live test. Longer gaps become RECORDING_PAUSE_MS of silence.
     RECORDING_ENABLED = _flag("RECORDING_ENABLED", "0")
     RECORDING_DIR = Path(os.getenv("RECORDING_DIR", str(BOT_CONFIG_PATH.parent / "recordings")))
     RECORDING_CHUNK_SECONDS = max(10.0, float(os.getenv("RECORDING_CHUNK_SECONDS", "600")))
     RECORDING_IDLE_CLOSE_SECONDS = max(5.0, float(os.getenv("RECORDING_IDLE_CLOSE_SECONDS", "60")))
-    RECORDING_PIECE_GAP_SECONDS = max(0.2, float(os.getenv("RECORDING_PIECE_GAP_SECONDS", "2")))
-    RECORDING_PIECE_PAUSE_MS = max(0, int(os.getenv("RECORDING_PIECE_PAUSE_MS", "500")))
+    RECORDING_PAUSE_MS = max(0, int(os.getenv("RECORDING_PAUSE_MS", "500")))
+    RECORDING_VAD_AGGRESSIVENESS = min(3, max(-1, int(os.getenv("RECORDING_VAD_AGGRESSIVENESS", "3"))))
 
     VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
     # One knob for bare-metal runs: point PIPER_MODELS_DIR at ./models and

@@ -19,6 +19,7 @@ from ttsbot.recording import rtp
 from ttsbot.recording.client import RecordingVoiceClient
 from ttsbot.recording.ogg import OggOpusWriter
 from ttsbot.recording.recorder import ChannelRecorder, RecorderSettings
+from ttsbot.recording.vad import GateSettings, OpusSpeechDetector, SpeechGate
 
 KEY = bytes(range(32))
 # A 20 ms CELT fullband Opus packet (TOC 0xFC: config 31, stereo, one frame).
@@ -90,7 +91,7 @@ class RecorderTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir)
 
     def recorder(self, **kw):
-        settings = RecorderSettings(root=self.dir, piece_gap_seconds=2.0, piece_pause_ms=500, **kw)
+        settings = RecorderSettings(root=self.dir, pause_ms=500, **kw)
         rec = ChannelRecorder(settings, guild_id=1, channel_id=2)
         rec.start()
         return rec
@@ -150,6 +151,60 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(chunk["reason"], "idle")
 
 
+    def test_speech_filter_drops_breathing_and_cuts_long_gaps(self):
+        # Packets carry their "speech" flag in the second byte.
+        speech = lambda: (lambda packet: packet[1] == 1)
+        rec = self.recorder(detector_factory=speech)
+        voice, breath = b"\xfc\x01" + bytes(39), b"\xfc\x00" + bytes(39)
+        pattern = [voice] * 50 + [breath] * 100 + [voice] * 50 + [breath] * 10 + [voice] * 20
+        for i, packet in enumerate(pattern):
+            rec.submit(5, 960 * i, packet, 1000.0 + i * 0.02)
+        rec.stop()
+        [chunk] = self.chunks(rec)
+        # Run 1: 50 speech + 13 hangover packets. Run 2 starts at the 6th
+        # speech packet with a 10-packet pre-roll (4 of them breathing),
+        # keeps the 200 ms of breathing inside it and runs to the end. The
+        # 1.7 s between the runs becomes a 0.5 s pause and a new piece.
+        self.assertEqual(len(chunk["pieces"]), 2)
+        self.assertAlmostEqual(chunk["pieces"][1][1], 1000.0 + 146 * 0.02, places=2)
+        self.assertEqual(rec.counters["packets"], 230)
+        self.assertEqual(rec.counters["heard_ms"], 230 * 20)
+        self.assertEqual(rec.counters["written_ms"], (63 + 84) * 20)
+        self.assertAlmostEqual(chunk["audio_seconds"], (63 + 84) * 0.02 + 0.5)
+
+
+class SpeechGateTests(unittest.TestCase):
+    def feed(self, gate, flags):
+        out = []
+        for i, flag in enumerate(flags):
+            out.extend(gate.feed(i, flag))
+        return out
+
+    def test_needs_six_of_ten_to_start_and_brings_preroll(self):
+        gate = SpeechGate(GateSettings())
+        self.assertEqual(self.feed(gate, [False] * 20 + [True] * 5), [])  # 5 of 10: not yet
+        self.assertEqual(gate.feed(25, True), list(range(16, 26)))  # 6th: pre-roll of 10
+        self.assertTrue(gate.speaking)
+
+    def test_isolated_clicks_never_start_and_hangover_ends_run(self):
+        gate = SpeechGate(GateSettings())
+        self.assertEqual(self.feed(gate, [True, False, False] * 20), [])
+        gate.reset()
+        kept = self.feed(gate, [True] * 10 + [False] * 30)
+        self.assertEqual(len(kept), 10 + 13)  # ends once <= 2 of the last 15 are speech
+        self.assertFalse(gate.speaking)
+        gate.feed(0, True)
+        gate.reset()
+        self.assertEqual(self.feed(gate, [True] * 5), [])  # the reset forgot the context
+
+
+class OpusDetectorTests(unittest.TestCase):
+    def test_silent_frame_is_not_speech(self):
+        detector = OpusSpeechDetector(3)
+        self.assertFalse(detector.is_speech(rtp.OPUS_SILENCE))
+        self.assertFalse(detector.is_speech(FRAME))
+
+
 class FakeDave:
     def __init__(self, fail=False):
         self.fail = fail
@@ -169,6 +224,7 @@ class ClientTests(unittest.TestCase):
         client._ssrc_users = {}
         client._pending = {}
         client._dave_failed_users = set()
+        client._dave_held = {}
         client._listening = True
         client._connection = types.SimpleNamespace(
             mode=rtp.SUPPORTED_MODE, secret_key=list(KEY), dave_session=dave,
@@ -225,6 +281,20 @@ class ClientTests(unittest.TestCase):
         self.assertIn("DAVE decrypt failed", logs.output[0])
         self.assertEqual(client._recorder.counters["dave_errors"], 2)
         self.assertEqual(submitted, [])
+
+    def test_packets_held_until_the_key_arrives_are_recovered_in_order(self):
+        dave = FakeDave(fail=True)
+        client, submitted = self.make_client(dave)
+        self.hook(client, 5, ssrc=7, user_id="5", speaking=1)
+        with self.assertLogs("tts_bot", "WARNING"):
+            for i in range(3):
+                client._on_packet(encrypt(FRAME, ssrc=7, timestamp=960 * i))
+        dave.fail = False
+        client._on_packet(encrypt(FRAME, ssrc=7, timestamp=960 * 3))
+        self.assertEqual([s[1] for s in submitted], [0, 960, 1920, 2880])
+        counters = client._recorder.counters
+        self.assertEqual((counters["dave_errors"], counters["dave_recovered"]), (3, 3))
+        self.assertEqual(client._dave_held, {})
 
     def test_without_dave_payload_is_passed_through(self):
         client, submitted = self.make_client(None)
