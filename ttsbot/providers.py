@@ -26,6 +26,7 @@ provider can safely emit WAV or MP3 as long as it is a valid container.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -47,6 +48,8 @@ from typing import (
 )
 
 from ttsbot.errors import QuotaExhaustedError
+from ttsbot import config as bot_config
+from ttsbot.elevenlabs import ElevenLabsProvider, ElevenLabsVoiceNotFoundError
 from ttsbot.fish import FishProvider
 from ttsbot.gemini import GeminiProvider, write_wav
 from ttsbot.pcm import apply_gain, pcm_cache_header, read_pcm_cache
@@ -280,6 +283,7 @@ class PrimaryProvider(str, Enum):
     MINIMAX = "minimax"
     FISH = "fish"
     GEMINI = "gemini"
+    ELEVENLABS = "elevenlabs"
 
 
 @dataclass
@@ -362,8 +366,8 @@ class MiniMaxConfig:
 
 
 _DEFAULT_CACHE_DIR = "/app/data/tts_cache"
-# mp3: MiniMax, opus: Fish Ogg, dopus: Discord-ready Fish frames,
-# pcm: Gemini raw PCM with a pcm_cache_header.
+# mp3: MiniMax, opus: Fish/ElevenLabs Ogg, dopus: Discord-ready Opus frames,
+# pcm: Gemini/ElevenLabs raw PCM with a pcm_cache_header.
 CACHE_SUFFIXES = ("mp3", "opus", "dopus", "pcm")
 _DEFAULT_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
@@ -1197,7 +1201,8 @@ class MiniMaxProvider:
 def load_dispatcher_config_from_env() -> DispatcherConfig:
     """Build a ``DispatcherConfig`` from the standard ``TTS_*`` env vars.
 
-    ``TTS_PRIMARY_PROVIDER`` accepts ``local``, ``minimax``, ``fish`` or ``gemini``. Unknown
+    ``TTS_PRIMARY_PROVIDER`` accepts ``local``, ``minimax``, ``fish``, ``gemini`` or
+    ``elevenlabs``. Unknown
     values fall back to ``local`` so the bot never silently misroutes.
 
     Default request timeout is 2.5 seconds — see plan §11.4 for the
@@ -1244,6 +1249,7 @@ class TTSDispatcher:
         cloud: Optional[TTSProvider] = None,
         fish: Optional[FishProvider] = None,
         gemini: Optional[GeminiProvider] = None,
+        elevenlabs: Optional[ElevenLabsProvider] = None,
         circuit_breaker: Optional[CircuitBreaker] = None,
         config: Optional[DispatcherConfig] = None,
         cache: Optional[TTSPhraseCache] = None,
@@ -1256,6 +1262,8 @@ class TTSDispatcher:
         self._fish_cb = load_circuit_breaker_from_env()
         self._gemini = gemini
         self._gemini_cb = load_circuit_breaker_from_env()
+        self._elevenlabs = elevenlabs
+        self._elevenlabs_cb = load_circuit_breaker_from_env()
         self._config = config or DispatcherConfig()
         self._cache = cache  # None means caching disabled
         # Piper profile name to fall back to when a cloud (MiniMax) voice
@@ -1316,6 +1324,14 @@ class TTSDispatcher:
         return self._gemini_cb
 
     @property
+    def elevenlabs(self) -> Optional[ElevenLabsProvider]:
+        return self._elevenlabs
+
+    @property
+    def elevenlabs_circuit_breaker(self) -> CircuitBreaker:
+        return self._elevenlabs_cb
+
+    @property
     def cache(self) -> Optional[TTSPhraseCache]:
         return self._cache
 
@@ -1355,8 +1371,24 @@ class TTSDispatcher:
             if used:
                 return used
 
+        want_elevenlabs = self._elevenlabs is not None and (
+            provider == "elevenlabs"
+            # No record: only when ELEVENLABS_VOICE_ID gives a voice to use.
+            or (
+                voice is None and self._config.primary is PrimaryProvider.ELEVENLABS
+                and bool(self._elevenlabs.config.voice_id)
+            )
+        )
+        if want_elevenlabs:
+            used = await self._synthesize_elevenlabs(
+                text, filename, getattr(voice, "elevenlabs", None),
+            )
+            if used:
+                return used
+        own_cache = want_gemini or want_elevenlabs
+
         # 1. Cache hit short-circuits everything.
-        if self._cache is not None and not want_gemini:
+        if self._cache is not None and not own_cache:
             cached = self._cache.lookup(text, voice_key)
             if cached is not None:
                 shutil.copyfile(cached, filename)
@@ -1418,7 +1450,10 @@ class TTSDispatcher:
         #    voice, or the registry fallback when a cloud voice was wanted.
         if provider == "piper":
             fallback_name = getattr(voice, "name", None)
-        elif provider in {"minimax", "fish", "gemini"} or want_minimax or want_fish or want_gemini:
+        elif (
+            provider in {"minimax", "fish", "gemini", "elevenlabs"}
+            or want_minimax or want_fish or own_cache
+        ):
             fallback_name = self._fallback_profile or None
         else:
             fallback_name = None
@@ -1427,9 +1462,9 @@ class TTSDispatcher:
         # operator has opted in, and a cache hit on a repeated short
         # phrase is a win whether the underlying provider is Piper
         # or MiniMax (the local file copy is faster than even Piper).
-        # A Fish/Gemini voice keys its cache by provider params, so a Piper
-        # fallback stored here would be served as that voice later.
-        if not want_fish and not want_gemini:
+        # A Fish/Gemini/ElevenLabs voice keys its cache by provider params, so
+        # a Piper fallback stored here would be served as that voice later.
+        if not want_fish and not own_cache:
             self._maybe_cache(text, filename, voice_key)
         return self._local.name
 
@@ -1463,6 +1498,54 @@ class TTSDispatcher:
             except OSError as exc:
                 log.warning("TTS cache store failed: %s", exc)
         return "gemini"
+
+    async def _synthesize_elevenlabs(self, text: str, filename: Path, params) -> str:
+        """ElevenLabs file path: cache, then the API. Returns "" to fall back.
+
+        Opus is cached as the raw Ogg (.opus, decoded by ffmpeg), PCM as a
+        .pcm entry; the streaming path keeps its own Discord-frame entries.
+        """
+        cfg = self._elevenlabs.config
+        cache_key = cfg.cache_key(params)
+        if self._cache is not None:
+            cached = self._cache.lookup(text, cache_key)
+            if cached is not None:
+                try:
+                    if cfg.kind == "pcm":
+                        rate, channels, pcm = read_pcm_cache(cached)
+                        write_wav(filename, rate, channels, pcm)
+                    else:
+                        shutil.copyfile(cached, filename)
+                    return "cache"
+                except (OSError, ValueError) as exc:
+                    log.warning("Unreadable ElevenLabs cache file %s (%s); regenerating", cached, exc)
+        if not self._elevenlabs_cb.allow_request():
+            log.info("ElevenLabs circuit breaker open; using fallback Piper")
+            return ""
+        # The file path reads the whole clip, so the budget grows with the text.
+        budget = bot_config.ELEVENLABS_TTFA_TIMEOUT + 0.03 * len(text)
+        try:
+            kind, rate, data = await asyncio.wait_for(self._elevenlabs.fetch(text, params), budget)
+        except Exception as exc:
+            if not isinstance(exc, ElevenLabsVoiceNotFoundError):
+                self.record_failure(self._elevenlabs_cb, exc)
+            log.warning(
+                "ElevenLabs synthesis failed (%s: %s); falling back to Piper", type(exc).__name__, exc,
+            )
+            return ""
+        self._elevenlabs_cb.record_success()
+        if kind == "pcm":
+            write_wav(filename, rate, 1, data)
+            entry, suffix = pcm_cache_header(rate, 1) + data, "pcm"
+        else:
+            filename.write_bytes(data)
+            entry, suffix = data, "opus"
+        if self._cache is not None:
+            try:
+                self._cache.store_bytes(text, entry, cache_key, suffix)
+            except OSError as exc:
+                log.warning("TTS cache store failed: %s", exc)
+        return "elevenlabs"
 
     def _maybe_cache(self, text: str, filename: Path, voice_key: str = "", suffix: str | None = None) -> None:
         if self._cache is None:

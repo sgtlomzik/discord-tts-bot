@@ -49,6 +49,7 @@ def reload() -> None:
     global TTS_PREROLL_MS, TTS_PREROLL_MODE, TTS_PREROLL_VOLUME_DB, TTS_SILENCE_TAIL_MS
     global TTS_CONTINUOUS_STREAM, TTS_STREAMING_ENABLED, TTS_STREAM_TTFA_TIMEOUT
     global FISH_TTFA_TIMEOUT, GEMINI_TTFA_TIMEOUT, GEMINI_TTFA_PER_CHAR
+    global ELEVENLABS_TTFA_TIMEOUT
     global TTS_PREFETCH_ENABLED, TTS_PREFETCH_LOOKAHEAD
     global TTS_IDLE_FRAME_MODE, TTS_IDLE_VOLUME_DB, TTS_STREAM_TAIL_MS
     global TTS_MAX_CONTINUOUS_IDLE_SECONDS, IDLE_DISCONNECT_SECONDS
@@ -111,6 +112,9 @@ def reload() -> None:
     # grows with the text: base + per_char * len(text).
     GEMINI_TTFA_TIMEOUT = max(0.5, float(os.getenv("GEMINI_TTFA_TIMEOUT", "3")))
     GEMINI_TTFA_PER_CHAR = max(0.0, float(os.getenv("GEMINI_TTFA_PER_CHAR", "0.03")))
+    # ElevenLabs streams while it generates: first audio measured 0.22-0.26 s
+    # (0.66 s on a cold connection) for 2-133 characters, so a flat budget.
+    ELEVENLABS_TTFA_TIMEOUT = max(0.5, float(os.getenv("ELEVENLABS_TTFA_TIMEOUT", "3")))
     # Prefetch: decouple generation from playback so message N+1 is synthesized
     # while N is still playing (cuts queue_wait under bursts). Playback stays
     # strictly sequential FIFO. TTS_PREFETCH_ENABLED=0 reverts to the proven

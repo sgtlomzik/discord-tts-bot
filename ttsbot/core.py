@@ -17,6 +17,7 @@ import discord
 from discord.ext import commands
 
 from ttsbot import voice_registry
+from ttsbot.elevenlabs import ElevenLabsConfig, ElevenLabsProvider
 from ttsbot.fish import FishConfig, FishProvider
 from ttsbot.gemini import GeminiConfig, GeminiProvider
 from ttsbot.providers import (
@@ -124,6 +125,18 @@ class TTSBot(
         # voices are added with /voicebot voice-add provider:gemini.
         gemini_cfg = GeminiConfig.from_env()
         self.gemini_provider = GeminiProvider(gemini_cfg) if gemini_cfg.api_key else None
+        # ElevenLabs: enabled by ELEVENLABS_API_KEY; ELEVENLABS_VOICE_ID seeds
+        # the eleven-default voice, others come from voice-add provider:elevenlabs.
+        try:
+            eleven_cfg = ElevenLabsConfig.from_env()
+        except ValueError as exc:
+            if os.getenv("ELEVENLABS_API_KEY", "").strip():
+                raise  # ElevenLabs is wanted, so a bad setting must stop startup
+            log.warning("Ignoring invalid ELEVENLABS_* settings; ElevenLabs is disabled: %s", exc)
+            eleven_cfg = ElevenLabsConfig(api_key="")
+        self.elevenlabs_provider = ElevenLabsProvider(eleven_cfg) if eleven_cfg.api_key else None
+        if self.elevenlabs_provider is not None and eleven_cfg.voice_id:
+            self._seed_elevenlabs_default(eleven_cfg.voice_id)
         self.piper_voices: dict[tuple[str, str], object] = {}
         # TTS provider abstraction (see ttsbot/providers.py). Skeleton
         # behavior in this commit: dispatcher always routes to local.
@@ -143,6 +156,7 @@ class TTSBot(
             cloud=self._build_cloud_provider(),
             fish=self.fish_provider,
             gemini=self.gemini_provider,
+            elevenlabs=self.elevenlabs_provider,
             config=load_dispatcher_config_from_env(),
             circuit_breaker=load_circuit_breaker_from_env(),
             cache=self.tts_cache,
@@ -153,6 +167,30 @@ class TTSBot(
         self.merge_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self.merge_generations: dict[tuple[int, int], int] = {}
         self.last_user_message_ts: dict[tuple[int, int], float] = {}
+
+    def _seed_elevenlabs_default(self, voice_id: str) -> None:
+        """Point eleven-default at ELEVENLABS_VOICE_ID, keeping its tuning."""
+        current = self.voice_registry.get("eleven-default")
+        if current is not None and not current.is_elevenlabs:
+            log.warning("Voice eleven-default is a %s voice; not seeding ELEVENLABS_VOICE_ID",
+                        current.provider)
+            return
+        if current is not None and current.elevenlabs is not None:
+            record = replace(current, elevenlabs=replace(current.elevenlabs, voice_id=voice_id))
+        else:
+            record = voice_registry.VoiceRecord(
+                name="eleven-default", label="ElevenLabs", description="ElevenLabs voice from .env",
+                provider=voice_registry.PROVIDER_ELEVENLABS,
+                elevenlabs=voice_registry.ElevenLabsParams(voice_id=voice_id),
+            )
+        if current == record:
+            return
+        self.voice_registry.add(record)
+        try:
+            voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
+        except OSError:
+            log.exception("Could not save eleven-default to %s; keeping it in memory",
+                          config.VOICES_REGISTRY_PATH)
 
     @property
     def fish_latency(self) -> str:
@@ -213,5 +251,7 @@ class TTSBot(
             await self.fish_provider.aclose()
         if self.gemini_provider is not None:
             await self.gemini_provider.aclose()
+        if self.elevenlabs_provider is not None:
+            await self.elevenlabs_provider.aclose()
 
         await super().close()

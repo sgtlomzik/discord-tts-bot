@@ -1,4 +1,4 @@
-"""Unified voice registry: Piper, MiniMax, Fish and Gemini voices as profiles.
+"""Unified voice registry: Piper, MiniMax, Fish, Gemini and ElevenLabs voices as profiles.
 
 This module owns the **catalog** of available voices — what voices exist
 and how to drive each engine. It is deliberately separate from the
@@ -41,6 +41,7 @@ PROVIDER_PIPER = "piper"
 PROVIDER_MINIMAX = "minimax"
 PROVIDER_FISH = "fish"
 PROVIDER_GEMINI = "gemini"
+PROVIDER_ELEVENLABS = "elevenlabs"
 
 
 def valid_voice_name(name: str) -> bool:
@@ -87,15 +88,25 @@ class GeminiParams:
 
 
 @dataclass(frozen=True)
+class ElevenLabsParams:
+    voice_id: str = ""
+    model: str = ""  # empty: use the configured ELEVENLABS_MODEL
+    # None: do not send the setting, the voice's own default applies.
+    stability: Optional[float] = None
+    similarity_boost: Optional[float] = None
+
+
+@dataclass(frozen=True)
 class VoiceRecord:
     name: str
     label: str
     description: str
-    provider: str  # PROVIDER_PIPER | PROVIDER_MINIMAX | PROVIDER_FISH | PROVIDER_GEMINI
+    provider: str  # PROVIDER_PIPER | _MINIMAX | _FISH | _GEMINI | _ELEVENLABS
     piper: Optional[PiperParams] = None
     minimax: Optional[MiniMaxParams] = None
     fish: Optional[FishParams] = None
     gemini: Optional[GeminiParams] = None
+    elevenlabs: Optional[ElevenLabsParams] = None
 
     @property
     def is_minimax(self) -> bool:
@@ -112,6 +123,10 @@ class VoiceRecord:
     @property
     def is_gemini(self) -> bool:
         return self.provider == PROVIDER_GEMINI
+
+    @property
+    def is_elevenlabs(self) -> bool:
+        return self.provider == PROVIDER_ELEVENLABS
 
 
 @dataclass
@@ -186,6 +201,12 @@ def _record_to_dict(r: VoiceRecord) -> dict:
     if r.gemini is not None:
         out["gemini"] = {
             "voice": r.gemini.voice, "model": r.gemini.model, "volume_db": r.gemini.volume_db,
+        }
+    if r.elevenlabs is not None:
+        out["elevenlabs"] = {
+            "voice_id": r.elevenlabs.voice_id, "model": r.elevenlabs.model,
+            "stability": r.elevenlabs.stability,
+            "similarity_boost": r.elevenlabs.similarity_boost,
         }
     return out
 
@@ -276,11 +297,32 @@ def _gemini_from_dict(d: dict) -> GeminiParams:
     )
 
 
+def _elevenlabs_from_dict(d: dict) -> ElevenLabsParams:
+    if not isinstance(d, dict):
+        d = {}
+
+    def unit(key: str) -> Optional[float]:
+        try:
+            value = float(d[key]) if d.get(key) is not None else None
+        except (TypeError, ValueError):
+            return None
+        return value if value is not None and 0.0 <= value <= 1.0 else None
+
+    return ElevenLabsParams(
+        voice_id=str(d.get("voice_id", "") or ""),
+        model=str(d.get("model", "") or ""),
+        stability=unit("stability"),
+        similarity_boost=unit("similarity_boost"),
+    )
+
+
 def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
     if not isinstance(d, dict):
         return None
     provider = str(d.get("provider", "")).strip().lower()
-    if provider not in (PROVIDER_PIPER, PROVIDER_MINIMAX, PROVIDER_FISH, PROVIDER_GEMINI):
+    if provider not in (
+        PROVIDER_PIPER, PROVIDER_MINIMAX, PROVIDER_FISH, PROVIDER_GEMINI, PROVIDER_ELEVENLABS,
+    ):
         log.warning("voices.json: skipping %r with unknown provider %r", name, provider)
         return None
     label = str(d.get("label", name) or name)
@@ -291,6 +333,10 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
     )
     fish = _fish_from_dict(d.get("fish") or {}) if provider == PROVIDER_FISH else None
     gemini = _gemini_from_dict(d.get("gemini") or {}) if provider == PROVIDER_GEMINI else None
+    elevenlabs = (
+        _elevenlabs_from_dict(d.get("elevenlabs") or {})
+        if provider == PROVIDER_ELEVENLABS else None
+    )
     if provider == PROVIDER_MINIMAX and not (minimax and minimax.voice_id):
         log.warning("voices.json: skipping minimax voice %r with no voice_id", name)
         return None
@@ -299,6 +345,9 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
         return None
     if provider == PROVIDER_GEMINI and not (gemini and gemini.voice):
         log.warning("voices.json: skipping gemini voice %r with no voice", name)
+        return None
+    if provider == PROVIDER_ELEVENLABS and not (elevenlabs and elevenlabs.voice_id):
+        log.warning("voices.json: skipping elevenlabs voice %r with no voice_id", name)
         return None
     return VoiceRecord(
         name=name,
@@ -309,6 +358,7 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
         minimax=minimax,
         fish=fish,
         gemini=gemini,
+        elevenlabs=elevenlabs,
     )
 
 

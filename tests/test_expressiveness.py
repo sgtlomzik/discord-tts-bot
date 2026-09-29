@@ -239,6 +239,42 @@ class VoiceTuneCommandTests(unittest.IsolatedAsyncioTestCase):
         after = bot_mod.bot.voice_registry.get("bussshy")
         self.assertNotEqual(voice_cache_key(before), voice_cache_key(after))
 
+    def _add_eleven(self, bot_mod, **params):
+        vr = bot_mod.voice_registry
+        bot_mod.bot.voice_registry.add(vr.VoiceRecord(
+            name="eleven", label="E", description="", provider=vr.PROVIDER_ELEVENLABS,
+            elevenlabs=vr.ElevenLabsParams(voice_id="JBFqnCBsd6RMkjVDRZzb", **params),
+        ))
+
+    async def test_elevenlabs_stability_similarity_model_and_reset(self):
+        bot_mod = self._setup()
+        self._add_eleven(bot_mod)
+        interaction, sent = self._interaction()
+        await self._call(bot_mod, interaction, "eleven", stability=0.3,
+                         model=types.SimpleNamespace(value="eleven_v4"))
+        el = bot_mod.bot.voice_registry.get("eleven").elevenlabs
+        self.assertEqual((el.stability, el.similarity_boost, el.model), (0.3, None, "eleven_v4"))
+        self.assertIn("similarity `как у голоса`", sent[-1])
+        await self._call(bot_mod, interaction, "eleven", reset=True, similarity=0.9)
+        el = bot_mod.bot.voice_registry.get("eleven").elevenlabs
+        self.assertEqual((el.stability, el.similarity_boost, el.model), (None, 0.9, "eleven_v4"))
+        self.assertEqual(bot_mod.bot.persist_voice_registry.call_count, 2)
+
+    async def test_rejects_params_of_the_other_provider(self):
+        bot_mod = self._setup()
+        self._add_eleven(bot_mod, stability=0.5)
+        interaction, sent = self._interaction()
+        await self._call(bot_mod, interaction, "eleven", speed=1.2)
+        self.assertIn("нет emotion / speed", sent[-1])
+        await self._call(bot_mod, interaction, "eleven", model=types.SimpleNamespace(value="speech-2.8-hd"))
+        self.assertIn("модель MiniMax", sent[-1])
+        await self._call(bot_mod, interaction, "bussshy", stability=0.2)
+        self.assertIn("только для ElevenLabs", sent[-1])
+        await self._call(bot_mod, interaction, "bussshy", model=types.SimpleNamespace(value="eleven_v4"))
+        self.assertIn("модель ElevenLabs", sent[-1])
+        self.assertEqual(bot_mod.bot.voice_registry.get("eleven").elevenlabs.stability, 0.5)
+        bot_mod.bot.persist_voice_registry.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

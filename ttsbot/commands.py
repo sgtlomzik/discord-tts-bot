@@ -13,6 +13,7 @@ time.
 """
 
 import logging
+import re
 import time
 
 import discord
@@ -85,6 +86,12 @@ _FISH_MODEL_CHOICES = [
 _VOICE_ADD_PROVIDER_CHOICES = [
     app_commands.Choice(name="MiniMax (voice_id)", value="minimax"),
     app_commands.Choice(name="Gemini через OpenRouter (Kore, Puck…)", value="gemini"),
+    app_commands.Choice(name="ElevenLabs (voice_id)", value="elevenlabs"),
+]
+
+_ELEVENLABS_MODEL_CHOICES = [
+    app_commands.Choice(name="ElevenLabs v4 Turbo (быстрая, ~0.25 с)", value="eleven_v4_turbo"),
+    app_commands.Choice(name="ElevenLabs v4 (максимум выразительности)", value="eleven_v4"),
 ]
 
 _FISH_LATENCY_CHOICES = [
@@ -127,6 +134,8 @@ def _provider_tag(rec) -> str:
         return "Fish Audio"
     if rec.is_gemini:
         return "Gemini"
+    if rec.is_elevenlabs:
+        return "ElevenLabs"
     return "MiniMax" if rec.is_minimax else "Piper"
 
 
@@ -202,10 +211,19 @@ def build_commands(bot):
         interaction: discord.Interaction,
         current: str,
     ) -> list[app_commands.Choice[str]]:
-        """Suggest Gemini voice names when provider:gemini is picked."""
-        if getattr(interaction.namespace, "provider", None) != "gemini":
-            return []
+        """Suggest Gemini voice names or the ElevenLabs account's voices."""
+        provider = getattr(interaction.namespace, "provider", None)
         current = current.lower()
+        if provider == "elevenlabs":
+            elevenlabs = bot.tts_dispatcher.elevenlabs
+            voices = await elevenlabs.list_voices() if elevenlabs is not None else []
+            return [
+                app_commands.Choice(name=f"{title} ({voice_id})"[:100], value=voice_id)
+                for voice_id, title in voices
+                if current in title.lower() or current in voice_id.lower()
+            ][:25]
+        if provider != "gemini":
+            return []
         return [
             app_commands.Choice(name=f"{voice} — {GEMINI_VOICE_STYLES[voice]}", value=voice)
             for voice in GEMINI_VOICES if current in voice.lower()
@@ -355,10 +373,10 @@ def build_commands(bot):
             await interaction.followup.send(block, ephemeral=True)
 
 
-    @tts_group.command(name="voice-add", description="Зарегистрировать голос MiniMax или Gemini")
+    @tts_group.command(name="voice-add", description="Зарегистрировать голос MiniMax, Gemini или ElevenLabs")
     @app_commands.describe(
         name="Имя профиля (kebab-case: a-z, 0-9, дефис)",
-        voice_id="MiniMax voice_id или голос Gemini (Kore, Puck…)",
+        voice_id="MiniMax/ElevenLabs voice_id или голос Gemini (Kore, Puck…)",
         description="Описание (необязательно)",
         provider="Провайдер голоса (по умолчанию MiniMax)",
     )
@@ -389,6 +407,33 @@ def build_commands(bot):
             return
         if not voice_id:
             await interaction.response.send_message("Укажите voice_id.", ephemeral=True)
+            return
+        if provider is not None and provider.value == "elevenlabs":
+            if bot.tts_dispatcher.elevenlabs is None:
+                await interaction.response.send_message(
+                    "ElevenLabs не настроен (нет ELEVENLABS_API_KEY).", ephemeral=True,
+                )
+                return
+            if not re.fullmatch(r"[A-Za-z0-9]{1,64}", voice_id):
+                await interaction.response.send_message(
+                    "Укажите voice_id ElevenLabs (например `JBFqnCBsd6RMkjVDRZzb`).", ephemeral=True,
+                )
+                return
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            titles = dict(await bot.tts_dispatcher.elevenlabs.list_voices())
+            title = titles.get(voice_id, "").split(" - ")[0] or voice_id
+            error = await bot.register_elevenlabs_voice(
+                name=name, voice_id=voice_id,
+                label=f"{name} (ElevenLabs {title})", description=description.strip(),
+            )
+            if error:
+                await interaction.followup.send(f"Голос не добавлен: {error}.", ephemeral=True)
+                return
+            await interaction.followup.send(
+                f"Добавлен голос `{name}` (ElevenLabs `{voice_id}`). "
+                f"Назначьте его через `/voicebot voice-user` или `/voicebot voice-set`.",
+                ephemeral=True,
+            )
             return
         if provider is not None and provider.value == "gemini":
             if bot.tts_dispatcher.gemini is None:
@@ -689,18 +734,21 @@ def build_commands(bot):
         )
 
     @tts_group.command(
-        name="voice-tune", description="Настроить выразительность голоса (MiniMax)"
+        name="voice-tune", description="Настроить голос MiniMax или ElevenLabs"
     )
     @app_commands.describe(
         name="Имя голоса",
-        emotion="Эмоция (auto = подбор по тексту сообщения)",
-        speed="Скорость речи 0.5–2.0 (норма 1.0)",
-        pitch="Высота тона -12..12 (норма 0)",
-        vol="Громкость 0.1–10 (норма 1.0)",
-        model="Модель синтеза MiniMax (HD = качество, Turbo = скорость)",
+        emotion="MiniMax: эмоция (auto = подбор по тексту сообщения)",
+        speed="MiniMax: скорость речи 0.5–2.0 (норма 1.0)",
+        pitch="MiniMax: высота тона -12..12 (норма 0)",
+        vol="MiniMax: громкость 0.1–10 (норма 1.0)",
+        model="Модель синтеза (MiniMax или ElevenLabs — по типу голоса)",
+        stability="ElevenLabs: стабильность 0–1 (ниже — живее, выше — ровнее)",
+        similarity="ElevenLabs: сходство с исходным голосом 0–1",
+        reset="ElevenLabs: вернуть stability/similarity к настройкам самого голоса",
     )
     @app_commands.autocomplete(name=voice_profile_autocomplete)
-    @app_commands.choices(emotion=_EMOTION_CHOICES, model=_MODEL_CHOICES)
+    @app_commands.choices(emotion=_EMOTION_CHOICES, model=_MODEL_CHOICES + _ELEVENLABS_MODEL_CHOICES)
     async def slash_tts_voice_tune(
         interaction: discord.Interaction,
         name: str,
@@ -709,6 +757,9 @@ def build_commands(bot):
         pitch: app_commands.Range[int, -12, 12] | None = None,
         vol: app_commands.Range[float, 0.1, 10.0] | None = None,
         model: app_commands.Choice[str] | None = None,
+        stability: app_commands.Range[float, 0.0, 1.0] | None = None,
+        similarity: app_commands.Range[float, 0.0, 1.0] | None = None,
+        reset: bool = False,
     ) -> None:
         if not await require_guild_manager(interaction):
             return
@@ -719,9 +770,27 @@ def build_commands(bot):
                 f"Голос `{name}` не найден. Список: `/voicebot voices`.", ephemeral=True
             )
             return
+        if rec.is_elevenlabs and rec.elevenlabs is not None:
+            await _tune_elevenlabs(
+                interaction, rec, name,
+                minimax_only=(emotion, speed, pitch, vol),
+                model=model, stability=stability, similarity=similarity, reset=reset,
+            )
+            return
         if not rec.is_minimax or rec.minimax is None:
             await interaction.response.send_message(
-                "Выразительность доступна только для MiniMax-голосов.", ephemeral=True
+                "Настройка доступна только для MiniMax- и ElevenLabs-голосов "
+                "(Fish: `/voicebot voice-fish-tune`).", ephemeral=True
+            )
+            return
+        if stability is not None or similarity is not None or reset:
+            await interaction.response.send_message(
+                "stability / similarity / reset — только для ElevenLabs-голосов.", ephemeral=True
+            )
+            return
+        if model is not None and not model.value.startswith("speech-"):
+            await interaction.response.send_message(
+                f"`{model.value}` — модель ElevenLabs, а `{name}` — MiniMax-голос.", ephemeral=True
             )
             return
         if emotion is None and speed is None and pitch is None and vol is None and model is None:
@@ -764,6 +833,56 @@ def build_commands(bot):
             f"Голос `{name}` настроен: эмоция `{emotion_label}`, "
             f"скорость `{new_speed}`, тон `{new_pitch}`, громкость `{new_vol}`, "
             f"модель `{new_model}`.",
+            ephemeral=True,
+        )
+
+
+    async def _tune_elevenlabs(
+        interaction, rec, name: str, *, minimax_only, model, stability, similarity, reset,
+    ) -> None:
+        if any(value is not None for value in minimax_only):
+            await interaction.response.send_message(
+                "У ElevenLabs v4 нет emotion / speed / pitch / vol: доступны "
+                "stability, similarity, model и reset.", ephemeral=True,
+            )
+            return
+        if model is not None and not model.value.startswith("eleven_"):
+            await interaction.response.send_message(
+                f"`{model.value}` — модель MiniMax, а `{name}` — ElevenLabs-голос.", ephemeral=True
+            )
+            return
+        if not reset and stability is None and similarity is None and model is None:
+            await interaction.response.send_message(
+                "Укажите хотя бы один параметр: stability / similarity / model / reset.",
+                ephemeral=True,
+            )
+            return
+        old = rec.elevenlabs
+        if reset:
+            old = replace(old, stability=None, similarity_boost=None)
+        tuned = replace(
+            old,
+            stability=old.stability if stability is None else float(stability),
+            similarity_boost=old.similarity_boost if similarity is None else float(similarity),
+            model=old.model if model is None else model.value,
+        )
+        bot.voice_registry.add(replace(rec, elevenlabs=tuned))
+        try:
+            bot.persist_voice_registry()
+        except OSError as exc:
+            bot.voice_registry.add(rec)
+            log.exception("Failed to persist voices.json after voice-tune")
+            await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
+            return
+
+        def shown(value) -> str:
+            return "как у голоса" if value is None else f"{value:g}"
+
+        elevenlabs = bot.tts_dispatcher.elevenlabs
+        configured = elevenlabs.config.model if elevenlabs is not None else "eleven_v4_turbo"
+        await interaction.response.send_message(
+            f"Голос `{name}` настроен: stability `{shown(tuned.stability)}`, "
+            f"similarity `{shown(tuned.similarity_boost)}`, модель `{tuned.model or configured}`.",
             ephemeral=True,
         )
 
@@ -899,6 +1018,7 @@ def build_commands(bot):
         cloud = getattr(disp, "cloud", None)
         fish = getattr(disp, "fish", None)
         gemini = getattr(disp, "gemini", None)
+        elevenlabs = getattr(disp, "elevenlabs", None)
         embed = discord.Embed(title="📊 TTS • Статистика", color=0x5865F2)
         if cache is not None:
             hits, misses = cache.hits, cache.misses
@@ -924,7 +1044,11 @@ def build_commands(bot):
             breakers.append(f"Fish {_cb_state(getattr(disp, 'fish_circuit_breaker', None))}")
         if gemini is not None:
             breakers.append(f"Gemini {_cb_state(getattr(disp, 'gemini_circuit_breaker', None))}")
-        if cloud is not None or (fish is None and gemini is None):
+        if elevenlabs is not None:
+            breakers.append(
+                f"ElevenLabs {_cb_state(getattr(disp, 'elevenlabs_circuit_breaker', None))}"
+            )
+        if cloud is not None or (fish is None and gemini is None and elevenlabs is None):
             breakers.append(f"MiniMax {_cb_state(cb)}")
         embed.add_field(name="Circuit breaker", value=" · ".join(breakers), inline=True)
         if fish is not None:
@@ -937,6 +1061,15 @@ def build_commands(bot):
             embed.add_field(
                 name="Gemini запросы / символы (сессия)",
                 value=f"{_fmt_int(gemini.session_requests)} / {_fmt_int(gemini.session_chars)}",
+                inline=True,
+            )
+        if elevenlabs is not None:
+            embed.add_field(
+                name="ElevenLabs запросы / символы / кредиты (сессия)",
+                value=(
+                    f"{_fmt_int(elevenlabs.session_requests)} / {_fmt_int(elevenlabs.session_chars)}"
+                    f" / {_fmt_int(elevenlabs.session_credits)}"
+                ),
                 inline=True,
             )
         chars = getattr(cloud, "session_chars", None)
@@ -1008,6 +1141,12 @@ def build_commands(bot):
                     extra += f" · {rec.fish.emotion}"
             elif rec.is_gemini and rec.gemini is not None:
                 extra = f" · {rec.gemini.voice}"
+            elif rec.is_elevenlabs and rec.elevenlabs is not None:
+                configured = (
+                    bot.tts_dispatcher.elevenlabs.config.model
+                    if bot.tts_dispatcher.elevenlabs else "eleven_v4_turbo"
+                )
+                extra = f" · {rec.elevenlabs.model or configured}"
             lines.append(f"`{name}` [{tag}]{extra}")
         if lines:
             for index, block in enumerate(_chunk_lines(lines, 1024)):
