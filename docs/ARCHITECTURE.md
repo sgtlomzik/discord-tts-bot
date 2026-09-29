@@ -70,7 +70,8 @@ The active runtime pieces are:
 - `ttsbot/voice_registry.py` - the unified voice catalog
   (data/voices.json).
 - `scripts/` - operator tools: model download, MiniMax voice cloning,
-  `migrate_fish_default.py` (moves every guild to `fish-default`).
+  `migrate_fish_default.py` (moves every guild to `fish-default`),
+  `usage_stats.py` (per-user generated characters from logs + Discord history).
 - `tests/` - unit and async integration-style tests.
 - `docker-compose.yml` - container wiring and bind mounts.
 - `Dockerfile` - image build and system packages.

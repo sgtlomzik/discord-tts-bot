@@ -161,6 +161,29 @@ circuit-breaker states with the remaining cooldown.
 `emoji-aliases`, `emoji-alias-remove`, `status`, `stats`, `test`,
 `limit`, `queue-clear` — plus legacy `!tts join` / `!tts stop` text commands.
 
+## Usage statistics
+
+`scripts/usage_stats.py` reports how many characters a user sent to synthesis
+over a period: total, average per day and per 30 days. "Characters" means
+the text length after the bot's normalization (emoji aliases, mentions,
+stripped URLs, the `TTS_MAX_CHARS` cap) — exactly what the TTS provider got.
+
+It combines the bot logs (`Queued TTS ... author=<id>` lines: exact, but
+Docker drops them when the container is recreated) with the user's Discord
+channel history (REST API, bot token) for the whole period. Each log line is
+matched to its Discord message; the voiced share measured inside the log
+window is applied to the history before it to fill the full period. A linear
+extrapolation and an upper bound are printed for comparison.
+
+Run it in the bot image from the repository root on the host:
+
+```bash
+docker logs discord_tts_bot 2>&1 | docker run --rm -i --env-file .env   -v "$PWD/scripts:/app/scripts:ro" -v "$PWD/data:/app/data:ro"   ghcr.io/sgtlomzik/discord-tts-bot:latest   python scripts/usage_stats.py --user <discord_user_id> --days 30 > exports/usage.md
+```
+
+Options: `--days` (default 30), `--guild` / `--channel` (repeatable) when
+the user has no log lines, `--log-file` instead of stdin, `--json`.
+
 ## Development
 
 ```bash
