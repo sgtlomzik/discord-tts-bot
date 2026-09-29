@@ -260,13 +260,23 @@ class TTSBot(
         return TranscriptionWorker(config.RECORDING_DIR, self.transcriber, budget,
                                    name_for=self.member_display_name, tz=tz, ready=self.wait_until_ready)
 
-    def member_display_name(self, guild_id: int, user_id: int) -> str:
+    async def member_display_name(self, guild_id: int, user_id: int) -> str | None:
+        """Server nickname or global name, from the cache or Discord's API
+        (the bot has no members intent, so people who left voice are not
+        cached)."""
         guild = self.get_guild(guild_id)
         member = guild.get_member(user_id) if guild else None
         if member is not None:
             return member.display_name
-        user = self.get_user(user_id)
-        return user.display_name if user is not None else str(user_id)
+        try:
+            if guild is not None:
+                return (await guild.fetch_member(user_id)).display_name
+        except discord.HTTPException:
+            pass  # left the server
+        try:
+            return (await self.fetch_user(user_id)).display_name
+        except discord.HTTPException:
+            return None
 
     async def close(self) -> None:
         for task in (self.worker_task, self.generation_task, self.playback_task,

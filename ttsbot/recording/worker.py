@@ -45,8 +45,9 @@ def error_path(session: Path, chunk_file: str) -> Path:
 
 class TranscriptionWorker:
     def __init__(self, root: Path, transcriber: GroqTranscriber, budget: AudioBudget, *,
-                 name_for: Callable[[int, int], str], tz: dt.tzinfo, scan_seconds: float = 30.0,
-                 max_attempts: int = 3, ready: Callable[[], Awaitable] | None = None) -> None:
+                 name_for: Callable[[int, int], Awaitable[str | None]], tz: dt.tzinfo,
+                 scan_seconds: float = 30.0, max_attempts: int = 3,
+                 ready: Callable[[], Awaitable] | None = None) -> None:
         self.root = root
         self.transcriber = transcriber
         self.budget = budget
@@ -60,7 +61,7 @@ class TranscriptionWorker:
 
     async def run(self) -> None:
         if self._ready is not None:
-            await self._ready()  # names come from the member cache
+            await self._ready()  # names come from the member cache first
         log.info(
             "Transcription worker started root=%s model=%s per_hour=%.0f per_day=%.0f used_day_s=%.0f",
             self.root, self.transcriber.model, self.budget.per_hour, self.budget.per_day,
@@ -79,7 +80,10 @@ class TranscriptionWorker:
 
     async def step(self) -> float:
         """Do one unit of work; return how long to sleep before the next."""
-        pending = await asyncio.to_thread(self.scan)
+        pending, ended = await asyncio.to_thread(self.scan)
+        for session in ended:
+            await self.rebuild(session)
+            self._finished.add(session)
         if not pending:
             return self.scan_seconds
         chunk = pending[0]
@@ -99,9 +103,11 @@ class TranscriptionWorker:
         await self.transcribe(chunk, pending=len(pending) - 1)
         return 0.0
 
-    def scan(self) -> list[PendingChunk]:
-        """Pending chunks of every session, oldest first; finish ended sessions."""
+    def scan(self) -> tuple[list[PendingChunk], list[Path]]:
+        """Pending chunks of every session, oldest first, and the sessions
+        that have ended with nothing left to send."""
         pending: list[PendingChunk] = []
+        ended: list[Path] = []
         for session in sorted(self.root.glob("*/*/")):
             if session in self._finished or not (session / "session.json").exists():
                 continue
@@ -112,10 +118,9 @@ class TranscriptionWorker:
             todo = [PendingChunk(session, entry) for entry in self._entries(session) if self._needs_work(session, entry)]
             pending.extend(todo)
             if not todo and info.get("ended_at") is not None and session not in recorder.ACTIVE_SESSIONS:
-                self._rebuild(session, info)
-                self._finished.add(session)
+                ended.append(session)
         pending.sort(key=lambda chunk: chunk.entry["started_at"])
-        return pending
+        return pending, ended
 
     @staticmethod
     def _entries(session: Path) -> list[dict]:
@@ -166,8 +171,7 @@ class TranscriptionWorker:
             "-" if result.remaining_audio_seconds is None else f"{result.remaining_audio_seconds:.0f}",
             self.budget.used(86400), pending,
         )
-        info = json.loads((chunk.session / "session.json").read_text(encoding="utf-8"))
-        await asyncio.to_thread(self._rebuild, chunk.session, info)
+        await self.rebuild(chunk.session)
 
     def _record_error(self, chunk: PendingChunk, message: str) -> None:
         path = error_path(chunk.session, chunk.entry["file"])
@@ -180,9 +184,23 @@ class TranscriptionWorker:
                   attempts, self.max_attempts, chunk.session.name, chunk.entry["file"], message)
         self.budget.block(60.0)
 
-    def _rebuild(self, session: Path, info: dict) -> None:
-        guild_id = info["guild_id"]
-        summary = build_session_transcript(session, lambda user_id: self.name_for(guild_id, user_id), self.tz)
+    async def rebuild(self, session: Path) -> None:
+        """Rewrite the session transcript, looking up names it lacks."""
+        info = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        names_file = session / "names.json"
+        names = json.loads(names_file.read_text(encoding="utf-8")) if names_file.exists() else {}
+        speakers = {entry["user_id"] for entry in self._entries(session)}
+        tts = session / "tts.jsonl"
+        if tts.exists():
+            speakers |= {json.loads(line)["user_id"] for line in tts.read_text(encoding="utf-8").splitlines() if line}
+        missing = [user_id for user_id in speakers if str(user_id) not in names]
+        for user_id in missing:
+            name = await self.name_for(info["guild_id"], user_id)
+            if name:
+                names[str(user_id)] = name
+        if missing:
+            names_file.write_text(json.dumps(names, ensure_ascii=False, indent=1), encoding="utf-8")
+        summary = await asyncio.to_thread(build_session_transcript, session, str, self.tz)
         log.debug("Transcript rebuilt session=%s %s", session.name, summary)
 
     @staticmethod

@@ -207,7 +207,10 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
     def worker(self, transcriber, **kw):
         budget = AudioBudget(self.root / "ledger.jsonl", per_hour=7200, per_day=28800, requests_per_minute=10**6)
-        return TranscriptionWorker(self.root, transcriber, budget, name_for=lambda g, u: f"user{u}", tz=UTC, **kw)
+        async def name_for(guild_id, user_id):
+            return f"user{user_id}" if user_id != 404 else None
+
+        return TranscriptionWorker(self.root, transcriber, budget, name_for=name_for, tz=UTC, **kw)
 
     async def test_transcribes_oldest_first_and_writes_transcript(self):
         rec = self.record_session(users=(6, 5))
@@ -222,7 +225,10 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         text = (rec.path / "transcript.md").read_text(encoding="utf-8")
         self.assertIn("user5: первый", text)
         self.assertIn("user6: второй", text)
+        self.assertEqual(await worker.step(), worker.scan_seconds)
         self.assertIn(rec.path, worker._finished)
+        names = json.loads((rec.path / "names.json").read_text(encoding="utf-8"))
+        self.assertEqual(names, {"5": "user5", "6": "user6"})
 
     async def test_rejected_file_is_retried_then_given_up(self):
         rec = self.record_session()
@@ -233,7 +239,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             for _ in range(3):
                 await worker.step()
         self.assertEqual(json.loads(error_path(rec.path, "5/0001.ogg").read_text())["attempts"], 3)
-        self.assertEqual(worker.scan(), [])
+        self.assertEqual(worker.scan(), ([], [rec.path]))
         self.assertEqual(len(fake.sent), 3)
 
     async def test_retryable_error_blocks_the_budget(self):
@@ -241,7 +247,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         worker = self.worker(FakeTranscriber([TranscriptionError("HTTP 429", retry=True, wait=40)]))
         with self.assertLogs("tts_bot", "WARNING"):
             await worker.step()
-        self.assertEqual(len(worker.scan()), 1)
+        self.assertEqual(len(worker.scan()[0]), 1)
         self.assertGreater(await worker.step(), 29)  # waits (capped at scan_seconds)
 
     async def test_crashed_session_is_recovered(self):
@@ -256,7 +262,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             writer.write(FRAME)
         pieces_path(writer.path).write_text(json.dumps([0.0, 1005.0]) + "\n")
         worker = self.worker(FakeTranscriber([groq_json((0, 1, "спасён"))]))
-        [chunk] = worker.scan()
+        [chunk], _ = worker.scan()
         self.assertEqual(chunk.entry["reason"], "recovered")
         self.assertEqual(chunk.entry["pieces"], [[0.0, 1005.0]])
         self.assertAlmostEqual(chunk.entry["audio_seconds"], 2.0)
@@ -267,7 +273,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         rec = self.record_session(end=False)
         self.addCleanup(rec.stop)
         worker = self.worker(FakeTranscriber([]))
-        self.assertEqual(worker.scan(), [])
+        self.assertEqual(worker.scan(), ([], []))
         self.assertIsNone(json.loads((rec.path / "session.json").read_text())["ended_at"])
 
 
