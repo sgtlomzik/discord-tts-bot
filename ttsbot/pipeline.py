@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover - optional dependency
     SynthesisConfig = None
 
 from ttsbot import voice_registry
-from ttsbot.elevenlabs import ElevenLabsError, ElevenLabsVoiceNotFoundError
+from ttsbot.elevenlabs import ElevenLabsError, ElevenLabsRequestError
 from ttsbot.errors import QuotaExhaustedError
 from ttsbot.fish import FishError
 from ttsbot.gemini import GeminiError
@@ -910,11 +910,12 @@ class SynthesisPipelineMixin:
             )
         if status == "ok":
             cb.record_success()
-        elif isinstance(prepared.error, ElevenLabsVoiceNotFoundError):
-            # One broken voice record must not pause every ElevenLabs voice.
+        elif isinstance(prepared.error, ElevenLabsRequestError):
+            # A missing voice or one too-long message must not pause every
+            # ElevenLabs voice.
             log.warning(
-                "ElevenLabs voice %s (%s) not found; Piper fallback without a breaker failure",
-                voice.name, params.voice_id,
+                "ElevenLabs cannot voice this message with %s (%s): %s; Piper fallback",
+                voice.name, params.voice_id, prepared.error,
             )
         elif status != "cancelled":
             self.tts_dispatcher.record_failure(cb, prepared.error)

@@ -49,7 +49,7 @@ from typing import (
 
 from ttsbot.errors import QuotaExhaustedError
 from ttsbot import config as bot_config
-from ttsbot.elevenlabs import ElevenLabsProvider, ElevenLabsVoiceNotFoundError
+from ttsbot.elevenlabs import ElevenLabsProvider, ElevenLabsRequestError
 from ttsbot.fish import FishProvider
 from ttsbot.gemini import GeminiProvider, write_wav
 from ttsbot.pcm import apply_gain, pcm_cache_header, read_pcm_cache
@@ -1527,7 +1527,7 @@ class TTSDispatcher:
         try:
             kind, rate, data = await asyncio.wait_for(self._elevenlabs.fetch(text, params), budget)
         except Exception as exc:
-            if not isinstance(exc, ElevenLabsVoiceNotFoundError):
+            if not isinstance(exc, ElevenLabsRequestError):
                 self.record_failure(self._elevenlabs_cb, exc)
             log.warning(
                 "ElevenLabs synthesis failed (%s: %s); falling back to Piper", type(exc).__name__, exc,

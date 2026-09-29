@@ -120,6 +120,9 @@ class BotConfigStore:
             fish_latency = raw_settings.get("fish_latency")
             if isinstance(fish_latency, str) and fish_latency in {"low", "balanced", "normal"}:
                 self.settings["fish_latency"] = fish_latency
+            elevenlabs_key = raw_settings.get("elevenlabs_key")
+            if isinstance(elevenlabs_key, str) and elevenlabs_key:
+                self.settings["elevenlabs_key"] = elevenlabs_key
         self._apply_settings()
 
     def _apply_settings(self) -> None:
@@ -151,6 +154,11 @@ class BotConfigStore:
             else:
                 self.settings["fish_latency"] = previous
             raise
+
+    def set_elevenlabs_key(self, fingerprint: str) -> None:
+        """Remember the active ElevenLabs key (its fingerprint, never the key)."""
+        self.settings["elevenlabs_key"] = fingerprint
+        self.save()
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

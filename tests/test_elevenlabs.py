@@ -18,9 +18,10 @@ from ttsbot import config
 from ttsbot.audio import PCM_FRAME_BYTES
 from ttsbot.elevenlabs import (
     ElevenLabsAuthError, ElevenLabsConfig, ElevenLabsError, ElevenLabsProvider,
-    ElevenLabsQuotaExhaustedError, ElevenLabsRateLimitError, ElevenLabsVoiceNotFoundError,
-    format_kind,
+    ElevenLabsMessageTooLongError, ElevenLabsQuotaExhaustedError, ElevenLabsRateLimitError,
+    ElevenLabsVoiceNotFoundError, format_kind, key_fingerprint,
 )
+from ttsbot.store import BotConfigStore
 from ttsbot.errors import QuotaExhaustedError
 from ttsbot.models import PreparedAudio, TTSJob
 from ttsbot.ogg_opus import opus_packet_samples
@@ -125,11 +126,13 @@ class ElevenLabsProviderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_errors_map_to_typed_exceptions(self):
         cases = [
-            (_error(401, "quota_exceeded"), ElevenLabsError),
+            # One key out of credits: the ring (of one) is exhausted.
+            (_error(401, "quota_exceeded"), ElevenLabsQuotaExhaustedError),
             (_error(402, "payment_required"), ElevenLabsQuotaExhaustedError),
             (_error(401, "invalid_api_key"), ElevenLabsAuthError),
             (_error(401, "missing_permissions"), ElevenLabsAuthError),
-            (_error(400, "invalid_api_key_length"), ElevenLabsError),
+            (_error(403, "some_plan_restriction"), ElevenLabsError),
+            (_error(400, "invalid_api_key_length"), ElevenLabsAuthError),
             (_error(404, "voice_not_found"), ElevenLabsVoiceNotFoundError),
             (httpx.Response(404, text="Not Found"), ElevenLabsError),
             (_error(429, "too_many_concurrent_requests", headers={"retry-after": "7"}), ElevenLabsRateLimitError),
@@ -242,6 +245,178 @@ class ElevenLabsProviderTests(unittest.IsolatedAsyncioTestCase):
             _config(language_code="ru").cache_key(ElevenLabsParams("v")),
         ):
             self.assertNotEqual(base, other)
+
+
+class ElevenLabsKeyRingTests(unittest.IsolatedAsyncioTestCase):
+    def _ring(self, handler, keys=("k1", "k2", "k3"), **kwargs):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://el.test")
+        self.addAsyncCleanup(client.aclose)
+        cfg = ElevenLabsConfig(api_key=keys[0], api_keys=tuple(keys[1:]), voice_id="v")
+        return ElevenLabsProvider(cfg, client, **kwargs)
+
+    async def test_cycles_through_keys_and_wraps_around(self):
+        empty = {"k1"}
+        used = []
+
+        def handle(request):
+            key = request.headers["xi-api-key"]
+            used.append(key)
+            if key in empty:
+                return _error(401, "quota_exceeded")
+            return _audio(b"OggS-" + key.encode(), cost="3")
+
+        switched = []
+        ring = self._ring(handle, on_key_switch=switched.append)
+        self.assertEqual((await ring.fetch("a"))[2], b"OggS-k2")
+        self.assertEqual((await ring.fetch("b"))[2], b"OggS-k2")  # stays on the working key
+        empty.add("k2")
+        self.assertEqual((await ring.fetch("c"))[2], b"OggS-k3")
+        empty.discard("k1")  # e.g. the month rolled over on the first account
+        empty.add("k3")
+        self.assertEqual((await ring.fetch("d"))[2], b"OggS-k1")  # after the last comes the first
+        self.assertEqual(used, ["k1", "k2", "k2", "k2", "k3", "k3", "k1"])
+        self.assertEqual(switched, [key_fingerprint(k) for k in ("k2", "k3", "k1")])
+        self.assertEqual(ring.active_key_index, 0)
+        self.assertEqual([c for _, c, _ in ring.key_usage()], [3, 6, 3])
+        self.assertEqual(ring.session_credits, 12)
+
+    async def test_all_keys_empty_raises_quota_exhausted_and_keeps_cycling(self):
+        used = []
+
+        def handle(request):
+            used.append(request.headers["xi-api-key"])
+            return _error(401, "quota_exceeded")
+
+        ring = self._ring(handle)
+        with self.assertRaises(ElevenLabsQuotaExhaustedError) as ctx:
+            await ring.fetch("x")
+        self.assertIn("No ElevenLabs key has credits left (3 tried)", str(ctx.exception))
+        self.assertEqual(used, ["k1", "k2", "k3"])
+        self.assertEqual(ring.active_key_index, 0)  # a full turn: back at the first key
+        self.assertEqual(ring.session_requests, 0)
+
+    async def test_invalid_key_is_skipped_but_other_errors_are_not(self):
+        responses = {"k1": _error(401, "invalid_api_key"), "k2": _error(404, "voice_not_found")}
+        used = []
+
+        def handle(request):
+            key = request.headers["xi-api-key"]
+            used.append(key)
+            return responses.get(key, _audio(b"OggS"))
+
+        ring = self._ring(handle)
+        with self.assertRaises(ElevenLabsVoiceNotFoundError):
+            await ring.fetch("x")
+        self.assertEqual(used, ["k1", "k2"])  # a missing voice is not the key's fault
+        self.assertEqual(ring.active_key_index, 1)
+
+        only_invalid = self._ring(lambda r: _error(401, "invalid_api_key"), keys=("k1", "k2"))
+        with self.assertRaises(ElevenLabsAuthError):
+            await only_invalid.fetch("x")
+
+    async def test_long_message_skips_a_key_without_moving_the_ring(self):
+        left = {"k1": 150, "k2": 30, "k3": 5000}
+        used = []
+
+        def handle(request):
+            key = request.headers["xi-api-key"]
+            used.append(key)
+            cost = len(json.loads(request.content)["text"]) // 2
+            if cost > left[key]:
+                return _error(401, "quota_exceeded", f"This request exceeds your quota of 10000. "
+                              f"You have {left[key]} credits remaining, while {cost} credits are required.")
+            return _audio(b"OggS", cost=str(cost))
+
+        switched = []
+        ring = self._ring(handle, on_key_switch=switched.append)
+        await ring.fetch("я" * 400)  # 200 credits: k1 (150 left) is skipped, k2 (30) is empty
+        self.assertEqual(used, ["k1", "k2", "k3"])
+        self.assertEqual(ring.active_key_index, 0)  # k1 still has credits: the ring stays on it
+        self.assertEqual(switched, [])
+        await ring.fetch("я" * 20)
+        self.assertEqual(used[-1], "k1")
+
+    async def test_message_too_long_for_every_key_is_not_a_quota_pause(self):
+        ring = self._ring(lambda r: _error(401, "quota_exceeded", "You have 1,200 credits remaining."))
+        with self.assertRaises(ElevenLabsMessageTooLongError):
+            await ring.fetch("x")
+        self.assertEqual(ring.active_key_index, 0)
+        self.assertFalse(issubclass(ElevenLabsMessageTooLongError, QuotaExhaustedError))
+
+    async def test_request_level_401_does_not_rotate(self):
+        used = []
+
+        def handle(request):
+            used.append(request.headers["xi-api-key"])
+            return _error(403, "voice_access_denied")
+
+        ring = self._ring(handle)
+        with self.assertRaises(ElevenLabsError):
+            await ring.fetch("x")
+        self.assertEqual((used, ring.active_key_index), (["k1"], 0))
+
+    async def test_concurrent_failures_move_the_ring_once(self):
+        async def handle(request):
+            await asyncio.sleep(0)
+            if request.headers["xi-api-key"] == "k1":
+                return _error(401, "quota_exceeded")
+            return _audio(b"OggS")
+
+        switched = []
+        ring = self._ring(handle, on_key_switch=switched.append)
+        await asyncio.gather(ring.fetch("a"), ring.fetch("b"))
+        self.assertEqual(ring.active_key_index, 1)
+        self.assertEqual(switched, [key_fingerprint("k2")])
+
+    async def test_resumes_at_the_saved_key_and_ignores_unknown_fingerprints(self):
+        used = []
+
+        def handle(request):
+            used.append(request.headers["xi-api-key"])
+            return _audio(b"OggS")
+
+        await self._ring(handle, active_key=key_fingerprint("k3")).fetch("x")
+        with self.assertLogs("tts_bot", "WARNING") as logs:
+            await self._ring(handle, active_key="no-such-key").fetch("x")
+        self.assertIn("no longer configured", "\n".join(logs.output))
+        self.assertEqual(used, ["k3", "k1"])
+
+    async def test_mask_hides_the_key(self):
+        ring = self._ring(lambda r: _audio(b"OggS"), keys=("sk_aaaaaaaa1111", "sk_bbbbbbbb2222"))
+        self.assertEqual(ring.key_usage(), [("…1111", 0, True), ("…2222", 0, False)])
+
+    def test_keys_from_env(self):
+        env = {"ELEVENLABS_API_KEY": "", "ELEVENLABS_API_KEYS": " k1, k2\nk3 ,k2 "}
+        with patch.dict(os.environ, env):
+            cfg = ElevenLabsConfig.from_env()
+        self.assertEqual((cfg.api_key, cfg.keys), ("k1", ("k1", "k2", "k3")))
+        with patch.dict(os.environ, {"ELEVENLABS_API_KEY": "k0", "ELEVENLABS_API_KEYS": "k1,k0"}):
+            self.assertEqual(ElevenLabsConfig.from_env().keys, ("k0", "k1"))
+        with patch.dict(os.environ, {"ELEVENLABS_API_KEY": "", "ELEVENLABS_API_KEYS": ""}):
+            self.assertEqual(ElevenLabsConfig.from_env().keys, ())
+
+    def test_store_persists_only_the_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            store = BotConfigStore(path, set())
+            store.set_elevenlabs_key(key_fingerprint("sk_secret"))
+            self.assertNotIn("sk_secret", path.read_text(encoding="utf-8"))
+            self.assertEqual(BotConfigStore(path, set()).settings["elevenlabs_key"], key_fingerprint("sk_secret"))
+
+
+class ElevenLabsTooLongPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_too_long_message_falls_back_without_a_breaker_failure(self):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: _error(401, "quota_exceeded", "You have 900 credits remaining.")), base_url="https://el.test")
+        self.addAsyncCleanup(client.aclose)
+        pipeline = SynthesisPipelineMixin()
+        pipeline.tts_dispatcher = TTSDispatcher(
+            local=MagicMock(), elevenlabs=ElevenLabsProvider(_config(), client),
+        )
+        for _ in range(5):
+            prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
+            self.assertEqual(await pipeline._generate_elevenlabs_stream_into(prepared, _voice()), "pre_audio")
+        self.assertEqual(pipeline.tts_dispatcher.elevenlabs_circuit_breaker.state, CircuitState.CLOSED)
 
 
 class ElevenLabsRegistryTests(unittest.TestCase):
@@ -456,17 +631,39 @@ class ElevenLabsPipelineTests(unittest.IsolatedAsyncioTestCase):
         provider = pipeline.tts_dispatcher.elevenlabs
         self.assertEqual((provider.session_requests, provider.session_credits), (1, 6))
 
-    async def test_missing_voice_or_short_quota_does_not_pause_other_voices(self):
-        for response in (_error(404, "voice_not_found"), _error(401, "quota_exceeded")):
-            pipeline = self._pipeline(lambda r, resp=response: resp)
-            for _ in range(5):
-                prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
-                self.assertEqual(await pipeline._generate_elevenlabs_stream_into(prepared, _voice()), "pre_audio")
-            breaker = pipeline.tts_dispatcher.elevenlabs_circuit_breaker
-            if isinstance(prepared.error, ElevenLabsVoiceNotFoundError):
-                self.assertEqual(breaker.state, CircuitState.CLOSED)
-            else:  # an ordinary failure: the short breaker, not the quota pause
-                self.assertLess(breaker.cooldown_remaining, 100)
+    async def test_missing_voice_does_not_pause_other_voices(self):
+        pipeline = self._pipeline(lambda r: _error(404, "voice_not_found"))
+        for _ in range(5):
+            prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
+            self.assertEqual(await pipeline._generate_elevenlabs_stream_into(prepared, _voice()), "pre_audio")
+        self.assertIsInstance(prepared.error, ElevenLabsVoiceNotFoundError)
+        self.assertEqual(pipeline.tts_dispatcher.elevenlabs_circuit_breaker.state, CircuitState.CLOSED)
+
+    async def test_ring_switches_key_before_audio_and_plays(self):
+        ogg = _ogg()
+        used = []
+
+        def handle(request):
+            key = request.headers["xi-api-key"]
+            used.append(key)
+            if key == "k1":
+                return _error(401, "quota_exceeded", "This request exceeds your quota.")
+            return _audio(ogg, cost="5")
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="https://el.test")
+        self.addAsyncCleanup(client.aclose)
+        switched = []
+        provider = ElevenLabsProvider(
+            ElevenLabsConfig(api_key="k1", api_keys=("k2",)), client, on_key_switch=switched.append,
+        )
+        pipeline = SynthesisPipelineMixin()
+        pipeline.tts_dispatcher = TTSDispatcher(local=MagicMock(), elevenlabs=provider)
+        prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
+        self.assertEqual(await pipeline._generate_elevenlabs_stream_into(prepared, _voice()), "ok")
+        self.assertTrue(await self._drain(prepared))
+        self.assertEqual(used, ["k1", "k2"])
+        self.assertEqual(switched, [key_fingerprint("k2")])
+        self.assertEqual(pipeline.tts_dispatcher.elevenlabs_circuit_breaker.consecutive_failures, 0)
 
     async def test_slow_first_audio_times_out_to_piper(self):
         async def slow(request):

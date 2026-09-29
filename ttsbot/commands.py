@@ -1064,6 +1064,15 @@ def build_commands(bot):
                 inline=True,
             )
         if elevenlabs is not None:
+            keys = elevenlabs.key_usage()
+            embed.add_field(
+                name=f"ElevenLabs ключи ({len(keys)})",
+                value="\n".join(
+                    f"{'▶' if active else '·'} #{i} `{masked}` — {_fmt_int(credits)} кр."
+                    for i, (masked, credits, active) in enumerate(keys, 1)
+                ) or "—",
+                inline=True,
+            )
             embed.add_field(
                 name="ElevenLabs запросы / символы / кредиты (сессия)",
                 value=(

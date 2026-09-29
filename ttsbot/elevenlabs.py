@@ -9,6 +9,13 @@ playback path:
   as Fish, so the packets go to Discord as-is (no decode, no ffmpeg);
 - ``pcm_*``: raw s16le mono at the rate in the format name, framed
   in-process by PcmFramer like Gemini.
+
+Several API keys form a ring (ELEVENLABS_API_KEYS). A key that is out of
+credits or no longer valid is skipped and the same request is sent with
+the next key, before any audio plays; after the last key comes the first.
+"Out of credits" is judged from the remaining balance ElevenLabs reports:
+a message that is merely longer than what a key has left goes to the next
+key without moving the ring off it.
 """
 
 from __future__ import annotations
@@ -18,10 +25,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 import httpx
 
@@ -36,11 +44,27 @@ DEFAULT_BASE_URL = "https://api.elevenlabs.io"
 OPUS_FORMATS = frozenset(f"opus_48000_{kbps}" for kbps in (32, 64, 96, 128, 192))
 PCM_RATES = frozenset({8000, 16000, 22050, 24000, 32000, 44100, 48000})
 _VOICE_LIST_TTL = 300.0
+# A key with fewer credits left than this counts as empty (~100 characters
+# on v4 Turbo); with more, a quota_exceeded only means "this message is too
+# long for what is left".
+EMPTY_KEY_CREDITS = 50
+_REMAINING_RE = re.compile(r"([\d,]+)\s+credits?\s+remaining", re.IGNORECASE)
+# 401/403 reasons that are about the key or its account, not the request.
+_KEY_REASONS = ("invalid_api_key", "missing_permissions", "detected_unusual_activity")
 
 
 def _env(name: str, default: str) -> str:
     """Env value with an empty string treated as unset (as in .env.example)."""
     return os.getenv(name, "").strip() or default
+
+
+def key_fingerprint(key: str) -> str:
+    """Stable id of a key for persistence; the key itself is never stored."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def mask_key(key: str) -> str:
+    return f"…{key[-4:]}" if len(key) > 8 else "…"
 
 
 def format_kind(output_format: str) -> tuple[str, int]:
@@ -59,6 +83,8 @@ def format_kind(output_format: str) -> tuple[str, int]:
 @dataclass(frozen=True)
 class ElevenLabsConfig:
     api_key: str
+    # More keys for the ring, tried after api_key in this order.
+    api_keys: tuple[str, ...] = ()
     model: str = DEFAULT_MODEL
     format: str = DEFAULT_FORMAT
     voice_id: str = ""
@@ -67,8 +93,11 @@ class ElevenLabsConfig:
 
     @classmethod
     def from_env(cls) -> "ElevenLabsConfig":
+        ring = tuple(k for k in _env("ELEVENLABS_API_KEYS", "").replace(",", " ").split() if k)
+        single = _env("ELEVENLABS_API_KEY", "")
         cfg = cls(
-            api_key=_env("ELEVENLABS_API_KEY", ""),
+            api_key=single or (ring[0] if ring else ""),
+            api_keys=ring,
             model=_env("ELEVENLABS_MODEL", DEFAULT_MODEL),
             format=_env("ELEVENLABS_FORMAT", DEFAULT_FORMAT).lower(),
             voice_id=_env("ELEVENLABS_VOICE_ID", ""),
@@ -81,6 +110,11 @@ class ElevenLabsConfig:
     @property
     def kind(self) -> str:
         return format_kind(self.format)[0]
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        """api_key then api_keys, without blanks and duplicates."""
+        return tuple(dict.fromkeys(k for k in (self.api_key, *self.api_keys) if k))
 
     def cache_key(self, params: object | None = None) -> str:
         """Include every setting that changes the audio the API returns."""
@@ -102,20 +136,51 @@ class ElevenLabsError(RuntimeError):
         self.status_code = status_code
 
 
-class ElevenLabsAuthError(ElevenLabsError):
-    """Invalid key or a key without the text_to_speech permission."""
+class ElevenLabsKeyError(ElevenLabsError):
+    """A problem of the API key, not of the request: try the next key."""
 
 
-class ElevenLabsVoiceNotFoundError(ElevenLabsError):
-    """HTTP 404 voice_not_found, or no voice_id at all.
+class ElevenLabsAuthError(ElevenLabsKeyError):
+    """Invalid or revoked key, or one without the text_to_speech permission."""
 
-    A problem of one voice record, not of the provider: the pipeline falls
-    back to Piper without counting it against the circuit breaker.
+
+class ElevenLabsCreditsError(ElevenLabsKeyError):
+    """The key's credits do not cover this request (quota_exceeded).
+
+    ``remaining`` is the balance ElevenLabs reported, None if it did not say.
     """
 
+    def __init__(self, message: str, status_code: int | None = None,
+                 remaining: int | None = None) -> None:
+        super().__init__(message, status_code)
+        self.remaining = remaining
 
-class ElevenLabsQuotaExhaustedError(ElevenLabsError, QuotaExhaustedError):
-    """The character quota or the balance is used up."""
+    @property
+    def key_empty(self) -> bool:
+        return self.remaining is None or self.remaining < EMPTY_KEY_CREDITS
+
+
+def _remaining_credits(message: str) -> int | None:
+    match = _REMAINING_RE.search(message)
+    return int(match.group(1).replace(",", "")) if match else None
+
+
+class ElevenLabsRequestError(ElevenLabsError):
+    """A problem of this request, not of the provider: the pipeline falls
+    back to Piper without counting it against the circuit breaker."""
+
+
+class ElevenLabsVoiceNotFoundError(ElevenLabsRequestError):
+    """HTTP 404 voice_not_found, or no voice_id at all."""
+
+
+class ElevenLabsMessageTooLongError(ElevenLabsRequestError):
+    """No key has enough credits left for this message, but some still have
+    credits for shorter ones."""
+
+
+class ElevenLabsQuotaExhaustedError(ElevenLabsKeyError, QuotaExhaustedError):
+    """HTTP 402, or every key in the ring is out of credits: pause the provider."""
 
 
 class ElevenLabsRateLimitError(ElevenLabsError):
@@ -149,18 +214,15 @@ def _http_error(response: httpx.Response, body: bytes) -> ElevenLabsError:
     elif isinstance(detail, str):
         message = detail
     text = f"ElevenLabs HTTP {status} {reason}: {message}".replace(" :", ":")
-    # quota_exceeded means "this request costs more than what is left": a
-    # shorter message may still fit, so it is an ordinary failure. Only 402
-    # (payment required) pauses the provider for the quota cooldown.
     if status == 402:
         return ElevenLabsQuotaExhaustedError(text, status)
     if reason == "quota_exceeded":
-        return ElevenLabsError(text, status)
+        return ElevenLabsCreditsError(text, status, _remaining_credits(message))
     if reason == "voice_not_found":
         return ElevenLabsVoiceNotFoundError(text, status)
     if status == 429:
         return ElevenLabsRateLimitError(text, status, _retry_after(response.headers.get("retry-after")))
-    if status in (401, 403) or reason in {"invalid_api_key", "missing_permissions"}:
+    if reason.startswith(_KEY_REASONS) or (status == 401 and not reason):
         return ElevenLabsAuthError(text, status)
     return ElevenLabsError(text, status)
 
@@ -194,7 +256,12 @@ class ElevenLabsAudioStream:
 class ElevenLabsProvider:
     name = "elevenlabs"
 
-    def __init__(self, config: ElevenLabsConfig, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self, config: ElevenLabsConfig, client: httpx.AsyncClient | None = None, *,
+        active_key: str = "", on_key_switch: Callable[[str], None] | None = None,
+    ) -> None:
+        """``active_key`` is a saved key_fingerprint to resume the ring at;
+        ``on_key_switch(fingerprint)`` is called whenever the ring moves."""
         self.config = config
         self._owns_client = client is None
         # One keep-alive client: the warm connection is what keeps the first
@@ -209,6 +276,16 @@ class ElevenLabsProvider:
         self._session_credits = 0
         self._voices: list[tuple[str, str]] = []
         self._voices_at = 0.0
+        self._voices_key = -1
+        keys = config.keys
+        self._key_credits = [0] * len(keys)
+        saved = next(
+            (i for i, key in enumerate(keys) if active_key and key_fingerprint(key) == active_key), None,
+        )
+        if active_key and saved is None:
+            log.warning("Saved ElevenLabs key is no longer configured; starting at key #1")
+        self._active = saved or 0
+        self._on_key_switch = on_key_switch
 
     @property
     def session_requests(self) -> int:
@@ -224,7 +301,42 @@ class ElevenLabsProvider:
         """Billed credits from the ``character-cost`` header (v4 Turbo: 0.5/char)."""
         return self._session_credits
 
-    def _count(self, text: str, cost: str | None) -> None:
+    @property
+    def active_key_index(self) -> int:
+        return self._active
+
+    def key_usage(self) -> list[tuple[str, int, bool]]:
+        """``[(masked key, session credits, active)]`` in ring order."""
+        return [
+            (mask_key(key), self._key_credits[i], i == self._active)
+            for i, key in enumerate(self.config.keys)
+        ]
+
+    def _key_label(self, index: int) -> str:
+        keys = self.config.keys
+        return f"#{index + 1}/{len(keys)} ({mask_key(keys[index])})"
+
+    def _advance_from(self, index: int, reason: str) -> bool:
+        """Move the ring past ``index`` unless another request already did."""
+        keys = self.config.keys
+        if self._active != index or len(keys) < 2:
+            return False
+        self._active = (index + 1) % len(keys)
+        log.warning(
+            "ElevenLabs key %s %s; switching to key %s",
+            self._key_label(index), reason, self._key_label(self._active),
+        )
+        return True
+
+    def _save_active(self) -> None:
+        if self._on_key_switch is None:
+            return
+        try:
+            self._on_key_switch(key_fingerprint(self.config.keys[self._active]))
+        except Exception:
+            log.exception("Could not save the active ElevenLabs key")
+
+    def _count(self, text: str, cost: str | None, key_index: int = 0) -> None:
         """Count an accepted (billed) request, even if it is read only in part."""
         self._session_requests += 1
         self._session_chars += len(text)
@@ -233,9 +345,11 @@ class ElevenLabsProvider:
         except ValueError:
             credits = 0
         self._session_credits += credits
+        if key_index < len(self._key_credits):
+            self._key_credits[key_index] += credits
         log.info(
-            "ElevenLabs usage credits=%d session_credits=%d text_len=%d",
-            credits, self._session_credits, len(text),
+            "ElevenLabs usage key=%s credits=%d session_credits=%d text_len=%d",
+            self._key_label(key_index), credits, self._session_credits, len(text),
         )
 
     async def aclose(self) -> None:
@@ -260,20 +374,65 @@ class ElevenLabsProvider:
     ) -> ElevenLabsAudioStream:
         """Send the request and return once the response headers are in.
 
-        Raises an ElevenLabsError subclass for a non-200 status. The caller
-        must ``aclose()`` the returned stream.
+        Walks the key ring from the active key and retries with the next key
+        on a key error. An empty or invalid key moves the ring on; a key that
+        only lacks credits for this long message is skipped for this request
+        alone. When no key took the request, raises:
+
+        - ElevenLabsMessageTooLongError if some key still has credits for
+          shorter messages (Piper speaks this one, no provider pause);
+        - ElevenLabsQuotaExhaustedError if the keys are empty (long pause);
+        - otherwise the last key error (invalid keys).
+
+        Other errors are raised as is. The caller must ``aclose()`` the stream.
         """
-        if not self.config.api_key:
+        keys = self.config.keys
+        if not keys:
             raise ElevenLabsAuthError("ELEVENLABS_API_KEY is not set")
         voice_id = getattr(params, "voice_id", "") or self.config.voice_id
         if not voice_id:
             raise ElevenLabsVoiceNotFoundError("No ElevenLabs voice_id")
         output_format = output_format or self.config.format
+        failures: list[ElevenLabsKeyError] = []
+        start = self._active
+        moved = False
+        try:
+            for step in range(len(keys)):
+                index = (start + step) % len(keys)
+                try:
+                    return await self._open_with_key(index, voice_id, text, params, output_format)
+                except ElevenLabsKeyError as exc:
+                    failures.append(exc)
+                    if isinstance(exc, ElevenLabsCreditsError) and not exc.key_empty:
+                        log.info(
+                            "ElevenLabs key %s has %d credits left, not enough for %d chars; "
+                            "trying the next key for this message only",
+                            self._key_label(index), exc.remaining, len(text),
+                        )
+                    else:
+                        moved |= self._advance_from(index, f"rejected ({type(exc).__name__})")
+        finally:
+            if moved and self._active != start:
+                self._save_active()  # once per request, not per step
+        last = failures[-1]
+        if any(isinstance(exc, ElevenLabsCreditsError) and not exc.key_empty for exc in failures):
+            raise ElevenLabsMessageTooLongError(
+                f"No ElevenLabs key has enough credits for {len(text)} chars: {last}", last.status_code,
+            )
+        if any(isinstance(exc, (ElevenLabsCreditsError, QuotaExhaustedError)) for exc in failures):
+            raise ElevenLabsQuotaExhaustedError(
+                f"No ElevenLabs key has credits left ({len(keys)} tried): {last}", last.status_code,
+            )
+        raise last
+
+    async def _open_with_key(
+        self, index: int, voice_id: str, text: str, params: object | None, output_format: str,
+    ) -> ElevenLabsAudioStream:
         request = self._client.build_request(
             "POST", f"/v1/text-to-speech/{voice_id}/stream",
             params={"output_format": output_format},
             json=self._body(text, params),
-            headers={"xi-api-key": self.config.api_key},
+            headers={"xi-api-key": self.config.keys[index]},
         )
         response = await self._client.send(request, stream=True)
         try:
@@ -287,7 +446,7 @@ class ElevenLabsProvider:
             raise
         # The cost header comes with the 200: the request is billed even when
         # the caller stops early (length limit, cancel, mid-stream error).
-        self._count(text, response.headers.get("character-cost"))
+        self._count(text, response.headers.get("character-cost"), index)
         return ElevenLabsAudioStream(self, response, text, output_format)
 
     async def stream_audio(self, text: str, params: object | None = None) -> AsyncIterator[bytes]:
@@ -333,12 +492,16 @@ class ElevenLabsProvider:
         are cached too, so autocomplete does not retry on every keystroke.
         Only the first 100 voices are listed.
         """
-        if self._voices_at and time.monotonic() - self._voices_at < _VOICE_LIST_TTL:
+        if (
+            self._voices_at and self._voices_key == self._active
+            and time.monotonic() - self._voices_at < _VOICE_LIST_TTL
+        ):
             return self._voices
+        self._voices_key = self._active
         try:
             response = await self._client.get(
                 "/v2/voices", params={"page_size": 100},
-                headers={"xi-api-key": self.config.api_key}, timeout=2.0,
+                headers={"xi-api-key": self.config.keys[self._active]}, timeout=2.0,
             )
             response.raise_for_status()
             voices = [

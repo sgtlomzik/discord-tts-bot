@@ -65,6 +65,47 @@ long. Usage per request is logged as
 `ElevenLabs usage credits=... session_credits=...` and shown in
 `/voicebot stats`.
 
+### Key ring
+
+`ELEVENLABS_API_KEYS=k1,k2,k3` (plus `ELEVENLABS_API_KEY`, which goes
+first) lets spending be split across accounts. A key error moves the
+ring to the next key and the same message is retried at once, before any
+audio plays (a rejected request is not billed and costs ~0.2 s):
+
+| Response | Meaning | Action |
+|---|---|---|
+| 401 `quota_exceeded`, under 50 credits left (or balance not stated) | key is empty | next key, ring moves |
+| 401 `quota_exceeded`, 50+ credits left | this message is too long for the key | next key for this message only, ring stays |
+| 402 | payment required | next key, ring moves |
+| `invalid_api_key*`, `missing_permissions`, `detected_unusual_activity`, bare 401 | revoked or wrong key | next key, ring moves |
+| 404 `voice_not_found`, other 401/403, 429, 5xx, timeouts | not the key's fault | no switch; normal fallback |
+
+The remaining balance is read from the error text ("You have N credits
+remaining"). If no key takes the message:
+
+- some key still has 50+ credits: the message was just too long, Piper
+  speaks it and nothing is paused (a request error, not a breaker failure);
+- every key is empty: Piper speaks and ElevenLabs pauses for
+  `TTS_QUOTA_COOLDOWN_SECONDS`; the next attempt starts where the ring
+  stopped (after a full turn, the same key);
+- only invalid keys: the last auth error, an ordinary breaker failure.
+
+After the last key comes the first, so a renewed account is picked up
+again. The active key is saved once per request that moved the ring, in
+`data/config.json` as `settings.elevenlabs_key` (a sha256 fingerprint,
+never the key), so a restart resumes on the same key; an unknown
+fingerprint (key list edited) logs a warning and starts at the first key.
+Logs name keys as `#2/3 (…c022)`; `/voicebot stats` shows session
+credits per key and the active one.
+
+Measured live: an invalid key #1 followed by the real key #2 gave first
+audio at 0.78 s (cold connection plus the rejected attempt), then 0.25 s
+for the next message on key #2.
+
+Caveat: cloned and Voice Library voices belong to one account. A voice
+missing in the account of the next key answers 404 `voice_not_found`,
+which does not rotate further; premade voices exist in every account.
+
 ## 4. Operator surface
 
 - `.env`: `ELEVENLABS_API_KEY` (enables the provider),

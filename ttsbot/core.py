@@ -134,7 +134,16 @@ class TTSBot(
                 raise  # ElevenLabs is wanted, so a bad setting must stop startup
             log.warning("Ignoring invalid ELEVENLABS_* settings; ElevenLabs is disabled: %s", exc)
             eleven_cfg = ElevenLabsConfig(api_key="")
-        self.elevenlabs_provider = ElevenLabsProvider(eleven_cfg) if eleven_cfg.api_key else None
+        saved_key = self.config_store.settings.get("elevenlabs_key")
+        self.elevenlabs_provider = ElevenLabsProvider(
+            eleven_cfg,
+            active_key=saved_key if isinstance(saved_key, str) else "",
+            on_key_switch=self.config_store.set_elevenlabs_key,
+        ) if eleven_cfg.api_key else None
+        if self.elevenlabs_provider is not None:
+            log.info("ElevenLabs enabled keys=%d active=#%d format=%s model=%s",
+                     len(eleven_cfg.keys), self.elevenlabs_provider.active_key_index + 1,
+                     eleven_cfg.format, eleven_cfg.model)
         if self.elevenlabs_provider is not None and eleven_cfg.voice_id:
             self._seed_elevenlabs_default(eleven_cfg.voice_id)
         self.piper_voices: dict[tuple[str, str], object] = {}
