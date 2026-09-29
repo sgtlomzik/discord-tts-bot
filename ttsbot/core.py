@@ -258,7 +258,7 @@ class TTSBot(
             log.warning("Unknown TRANSCRIPT_TIMEZONE=%s; using UTC", config.TRANSCRIPT_TIMEZONE)
             tz = zoneinfo.ZoneInfo("UTC")
         return TranscriptionWorker(config.RECORDING_DIR, self.transcriber, budget,
-                                   name_for=self.member_display_name, tz=tz)
+                                   name_for=self.member_display_name, tz=tz, ready=self.wait_until_ready)
 
     def member_display_name(self, guild_id: int, user_id: int) -> str:
         guild = self.get_guild(guild_id)

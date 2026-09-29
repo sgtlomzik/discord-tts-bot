@@ -461,7 +461,8 @@ A file stays open until `RECORDING_CHUNK_SECONDS` of speech or
 bills each file for at least 10 s. Pieces are also appended to
 `NNNN.pieces.jsonl` as they start, so a file left open by a crash or a
 restart is recovered (`recorder.recover_session`) with exact timestamps.
-Text the bot speaks for someone is logged to `tts.jsonl`.
+Text the bot speaks for someone is logged to `tts.jsonl`, and each
+speaker's display name to `names.json` (kept if they leave the server).
 
 ### 9.2 Transcription
 
@@ -475,7 +476,8 @@ time. The disk is the queue: a file in `chunks.jsonl` without a
 bucket refilling at 2 s per second (headers
 `x-ratelimit-remaining-audio-seconds` / `-reset-audio-seconds`); the
 budget follows the last response's level and falls back to its ledger
-(`RECORDING_DIR/groq_ledger.jsonl`) after a restart. The ledger also
+(`RECORDING_DIR/groq_ledger.jsonl`) after a restart or when a response
+lacks those headers (seen from httpx, HTTP/1.1). The ledger also
 enforces the day limit. A 429, 5xx or network error pauses sending for
 the time Groq asks (or 30-60 s); another 4xx writes `NNNN.error.json`,
 and the file is tried 3 times in all. A file over 25 MB is re-encoded to

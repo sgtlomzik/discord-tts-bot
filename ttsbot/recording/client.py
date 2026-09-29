@@ -60,6 +60,7 @@ class RecordingVoiceClient(discord.VoiceClient):
         self._pending: dict[int, collections.deque] = {}
         self._dave_failed_users: set[int] = set()
         self._dave_held: dict[int, collections.deque] = {}
+        self._named: set[int] = set()
         self._recorder: ChannelRecorder | None = None
         self._listening = False
         super().__init__(client, channel)
@@ -98,6 +99,7 @@ class RecordingVoiceClient(discord.VoiceClient):
         recorder = self._recorder
         if recorder is not None:
             try:
+                self._note_name(recorder, user_id, self.guild.get_member(user_id))
                 recorder.note_text(user_id, text)
             except OSError:
                 log.exception("Recording TTS note failed guild=%s", self.guild.id)
@@ -114,6 +116,7 @@ class RecordingVoiceClient(discord.VoiceClient):
         self._ssrc_users.clear()
         self._pending.clear()
         self._dave_held.clear()
+        self._named.clear()
 
     # -- voice websocket (event loop) ----------------------------------
 
@@ -166,6 +169,7 @@ class RecordingVoiceClient(discord.VoiceClient):
         if member is not None and member.bot:
             recorder.count("bot_packets")
             return
+        self._note_name(recorder, user_id, member)
         connection = self._connection
         session = connection.dave_session
         if session is None or not connection.dave_protocol_version:
@@ -198,6 +202,15 @@ class RecordingVoiceClient(discord.VoiceClient):
                 recorder.count("dave_recovered")
                 self._submit(recorder, user_id, old.timestamp, old_payload, old_wall)
         self._submit(recorder, user_id, packet.timestamp, payload, wall)
+
+    def _note_name(self, recorder: ChannelRecorder, user_id: int, member) -> None:
+        if member is None or user_id in self._named:
+            return
+        self._named.add(user_id)
+        try:
+            recorder.note_name(user_id, member.display_name)
+        except OSError:
+            log.exception("Recording name note failed guild=%s", self.guild.id)
 
     @staticmethod
     def _submit(recorder: ChannelRecorder, user_id: int, timestamp: int, payload: bytes, wall: float) -> None:

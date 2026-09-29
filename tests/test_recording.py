@@ -225,18 +225,22 @@ class ClientTests(unittest.TestCase):
         client._pending = {}
         client._dave_failed_users = set()
         client._dave_held = {}
+        client._named = set()
+        names = {}
         client._listening = True
         client._connection = types.SimpleNamespace(
             mode=rtp.SUPPORTED_MODE, secret_key=list(KEY), dave_session=dave,
             dave_protocol_version=1 if dave else 0,
         )
-        members = {uid: types.SimpleNamespace(bot=uid in bots) for uid in (5, 6, 99)}
+        members = {uid: types.SimpleNamespace(bot=uid in bots, display_name=f"n{uid}") for uid in (5, 6, 99)}
         client.channel = types.SimpleNamespace(guild=types.SimpleNamespace(id=1, get_member=members.get))
         submitted = []
         client._recorder = types.SimpleNamespace(
             submit=lambda *args: submitted.append(args),
             counters={"transport_errors": 0},
         )
+        client._recorder.note_name = names.__setitem__
+        client._recorder.names = names
         counters = client._recorder.counters
         client._recorder.count = lambda name, n=1: counters.__setitem__(name, counters.get(name, 0) + n)
         return client, submitted
@@ -253,6 +257,7 @@ class ClientTests(unittest.TestCase):
         client._on_packet(encrypt(FRAME, ssrc=7, timestamp=1060))
         self.assertEqual([(s[0], s[1], s[2]) for s in submitted], [(5, 100, FRAME[::-1]), (5, 1060, FRAME[::-1])])
         self.assertEqual(dave.calls, [5, 5])
+        self.assertEqual(client._recorder.names, {5: "n5"})
 
     def test_silence_bots_errors_and_disconnect(self):
         dave = FakeDave()

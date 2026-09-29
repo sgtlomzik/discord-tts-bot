@@ -121,7 +121,10 @@ def build_session_transcript(session: Path, name_for: Callable[[int], str], tz: 
     def clock(epoch: float, fmt: str = "%H:%M:%S") -> str:
         return dt.datetime.fromtimestamp(epoch, tz).strftime(fmt)
 
+    names_file = session / "names.json"
     names: dict[int, str] = {}
+    if names_file.exists():
+        names = {int(k): v for k, v in json.loads(names_file.read_text(encoding="utf-8")).items()}
     out = [f"# Запись голосового канала {info['channel_id']}", ""]
     ended = info.get("ended_at")
     out.append(f"{clock(info['started_at'], '%Y-%m-%d %H:%M')} — "

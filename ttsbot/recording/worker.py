@@ -20,7 +20,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable
 
 from ttsbot.recording import recorder
 from ttsbot.recording.groq import MAX_UPLOAD_BYTES, AudioBudget, GroqTranscriber, TranscriptionError
@@ -46,7 +46,7 @@ def error_path(session: Path, chunk_file: str) -> Path:
 class TranscriptionWorker:
     def __init__(self, root: Path, transcriber: GroqTranscriber, budget: AudioBudget, *,
                  name_for: Callable[[int, int], str], tz: dt.tzinfo, scan_seconds: float = 30.0,
-                 max_attempts: int = 3) -> None:
+                 max_attempts: int = 3, ready: Callable[[], Awaitable] | None = None) -> None:
         self.root = root
         self.transcriber = transcriber
         self.budget = budget
@@ -54,10 +54,13 @@ class TranscriptionWorker:
         self.tz = tz
         self.scan_seconds = scan_seconds
         self.max_attempts = max_attempts
+        self._ready = ready
         self._finished: set[Path] = set()  # ended sessions with nothing left to do
         self._waiting_logged: str | None = None
 
     async def run(self) -> None:
+        if self._ready is not None:
+            await self._ready()  # names come from the member cache
         log.info(
             "Transcription worker started root=%s model=%s per_hour=%.0f per_day=%.0f used_day_s=%.0f",
             self.root, self.transcriber.model, self.budget.per_hour, self.budget.per_day,
@@ -83,7 +86,8 @@ class TranscriptionWorker:
         seconds = chunk.entry["audio_seconds"]
         wait = self.budget.wait_for(seconds)
         if wait > 0:
-            if self._waiting_logged != chunk.entry["file"]:
+            # Waits up to a few seconds are the request spacing, not a limit.
+            if wait > 5 and self._waiting_logged != chunk.entry["file"]:
                 self._waiting_logged = chunk.entry["file"]
                 log.info(
                     "Transcription waiting for Groq budget wait_s=%.0f file=%s/%s audio_s=%.1f "

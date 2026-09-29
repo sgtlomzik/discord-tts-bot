@@ -159,7 +159,8 @@ class TranscriptTests(unittest.TestCase):
             stored = chunk_result(entry, results[entry["file"]], model="m", took=0.1)
             (session / entry["file"]).with_suffix(".json").write_text(json.dumps(stored))
         (session / "tts.jsonl").write_text(json.dumps({"user_id": 8, "at": 3655.0, "text": "го"}) + "\n")
-        summary = build_session_transcript(session, {5: "Аня", 6: "Боб", 8: "Вика"}.get, UTC)
+        (session / "names.json").write_text(json.dumps({"5": "Аня"}))  # noted while recording
+        summary = build_session_transcript(session, {5: "не это", 6: "Боб", 8: "Вика"}.get, UTC)
         self.assertEqual(summary, {"lines": 4, "pending": 1, "files": 3})
         text = (session / "transcript.md").read_text(encoding="utf-8")
         self.assertIn("Ещё не расшифровано файлов: 1", text)
@@ -285,7 +286,10 @@ class RecorderSidecarTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual([json.loads(l) for l in sidecar.read_text().splitlines()], [[0.0, 1000.0], [0.52, 1010.0]])
         rec.note_text(5, "привет", 1005.0)
+        rec.note_name(5, "Аня")
+        rec.note_name(6, "Боб")
         rec.stop()
+        self.assertEqual(json.loads((rec.path / "names.json").read_text(encoding="utf-8")), {"5": "Аня", "6": "Боб"})
         self.assertFalse(sidecar.exists())
         self.assertNotIn(rec.path, recorder_module.ACTIVE_SESSIONS)
         self.assertEqual(json.loads((rec.path / "tts.jsonl").read_text(encoding="utf-8")),

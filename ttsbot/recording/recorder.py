@@ -18,7 +18,8 @@ appended to ``NNNN.pieces.jsonl`` as they start, so a file left open by
 a crash can be recovered (``recover_session``).
 
 Text the bot spoke for someone (TTS) goes to ``tts.jsonl`` so the
-transcript can show it in place.
+transcript can show it in place, and each speaker's display name to
+``names.json``, so the transcript keeps it after they leave the server.
 """
 
 from __future__ import annotations
@@ -105,6 +106,13 @@ class ChannelRecorder:
 
     def count(self, name: str, amount: int = 1) -> None:
         self.counters[name] += amount
+
+    def note_name(self, user_id: int, name: str) -> None:
+        path = self.path / "names.json"
+        names = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if names.get(str(user_id)) != name:
+            names[str(user_id)] = name
+            path.write_text(json.dumps(names, ensure_ascii=False, indent=1), encoding="utf-8")
 
     def note_text(self, user_id: int, text: str, wall: float | None = None) -> None:
         """Record text the bot spoke for ``user_id`` (TTS) at ``wall``."""
