@@ -107,6 +107,17 @@ def limit_pcm_frames(frames: list[bytes], text: str, voice=None) -> list[bytes]:
     return frames[:limit]
 
 
+def _log_stream_done(label: str, job, status: str, frames: int, started: float) -> None:
+    """One line per provider stream: how long the whole download took next
+    to how long it plays. download_s well under audio_s means the next
+    message is generated long before this one finishes playing."""
+    log.info(
+        "%s stream done guild=%s job=%s status=%s frames=%d audio_s=%.2f download_s=%.3f",
+        label, job.guild_id, job.job_id, status, frames, frames * PCM_FRAME_MS / 1000,
+        time.perf_counter() - started,
+    )
+
+
 class SynthesisPipelineMixin:
     """TTS generation, streaming and worker loops; mixed into TTSBot."""
 
@@ -150,6 +161,46 @@ class SynthesisPipelineMixin:
             cfg.model, cfg.voice_id or "(per-record)", cfg.base_url, cfg.timeout_seconds,
         )
         return MiniMaxProvider(cfg)
+
+    def _keepalive_warmers(self) -> dict:
+        """Warmers of the cloud voices of allowed users in the bot's voice
+        channels, by provider name."""
+        warmers = {}
+        for vc in self.voice_clients:
+            channel = getattr(vc, "channel", None)
+            if not vc.is_connected() or not isinstance(channel, discord.VoiceChannel):
+                continue
+            guild_id = channel.guild.id
+            if not self.config_store.is_enabled(guild_id):
+                continue
+            for member in channel.members:
+                if member.bot or not self.config_store.is_allowed(guild_id, member.id):
+                    continue
+                record = self.voice_registry.get(self.config_store.voice_for_user(guild_id, member.id))
+                provider = self.tts_dispatcher.provider_for(getattr(record, "provider", None))
+                warmer = getattr(provider, "warmer", None)
+                if warmer is not None:
+                    warmers[warmer.name] = warmer
+        return warmers
+
+    async def _connection_keepalive_worker(self) -> None:
+        """Keep the cloud connections of present users open (see config)."""
+        await self.wait_until_ready()
+        active: set[str] = set()
+        while not self.is_closed():
+            try:
+                warmers = self._keepalive_warmers()
+                if set(warmers) != active:
+                    active = set(warmers)
+                    log.info(
+                        "Connection keep-alive providers=%s idle_s=%.0f",
+                        ",".join(sorted(active)) or "none", config.TTS_CONNECTION_KEEPALIVE_SECONDS,
+                    )
+                for warmer in warmers.values():
+                    warmer.maybe_warm("keepalive", idle=config.TTS_CONNECTION_KEEPALIVE_SECONDS)
+            except Exception:
+                log.exception("Connection keep-alive check failed")
+            await asyncio.sleep(10)
 
     def warm_tts_connection(self, guild_id: int, user_id: int):
         """Warm the HTTP connection of the user's cloud voice (on typing).
@@ -710,6 +761,12 @@ class SynthesisPipelineMixin:
                 # Backpressure: blocks here when we are already `lookahead`
                 # messages ahead of playback.
                 await self.ready_queue.put(prepared)
+                # wait_s: time in the queue before generation began (the
+                # previous message's download, or lookahead backpressure).
+                log.info(
+                    "Generation start guild=%s job=%s voice=%s wait_s=%.3f",
+                    job.guild_id, job.job_id, job.voice_profile, time.perf_counter() - job.queued_at,
+                )
                 await self._prepare_into(prepared)
             except asyncio.CancelledError:
                 raise
@@ -960,6 +1017,7 @@ class SynthesisPipelineMixin:
         status in ok/truncated/pre_audio/cancelled.
         """
         job = prepared.job
+        started = time.perf_counter()
         deadline = time.monotonic() + budget
         frame_limit = playback_frame_limit(job.text, voice)
         frames_count = 0
@@ -979,9 +1037,10 @@ class SynthesisPipelineMixin:
             if not frames:
                 return
             if frames_count == 0:
+                now = time.perf_counter()
                 log.info(
-                    "%s first frame guild=%s message_to_frame_s=%.3f chars=%d",
-                    label, job.guild_id, time.perf_counter() - job.message_ts, len(job.text),
+                    "%s first frame guild=%s job=%s message_to_frame_s=%.3f request_to_frame_s=%.3f chars=%d",
+                    label, job.guild_id, job.job_id, now - job.message_ts, now - started, len(job.text),
                 )
             await prepared.channel.put(frames)
             frames_count += len(frames)
@@ -1056,6 +1115,7 @@ class SynthesisPipelineMixin:
             log.warning("%s stream produced no audio; Piper fallback guild=%s", label, job.guild_id)
             prepared.error = RuntimeError(f"{label} returned no audio")
             status = "pre_audio"
+        _log_stream_done(label, job, status, frames_count, started)
         if part_path is not None:
             if status == "ok" and cache_final is not None and cache_part is not None:
                 try:
@@ -1124,6 +1184,7 @@ class SynthesisPipelineMixin:
         handed to the ffmpeg path instead of paying for a second request.
         """
         job = prepared.job
+        started = time.perf_counter()
         cache_key = ogg_cache_key + DISCORD_OPUS_CACHE_SUFFIX
         demuxer = OggOpusDemuxer()
         frame_limit = playback_frame_limit(job.text, voice)
@@ -1166,9 +1227,10 @@ class SynthesisPipelineMixin:
             if not packets:
                 return
             if frames_count == 0:
+                now = time.perf_counter()
                 log.info(
-                    "%s direct first packet guild=%s message_to_packet_s=%.3f",
-                    label, job.guild_id, time.perf_counter() - job.message_ts,
+                    "%s direct first packet guild=%s job=%s message_to_packet_s=%.3f request_to_packet_s=%.3f",
+                    label, job.guild_id, job.job_id, now - job.message_ts, now - started,
                 )
             if cache_part is not None:
                 try:
@@ -1246,6 +1308,7 @@ class SynthesisPipelineMixin:
         elif limit_hit:
             status = "truncated"
             log.warning("%s direct audio length limit hit guild=%s frames=%d", label, job.guild_id, frames_count)
+        _log_stream_done(label, job, status, frames_count, started)
         if part_path is not None:
             if status == "ok" and cache_final is not None and cache_part is not None:
                 try:

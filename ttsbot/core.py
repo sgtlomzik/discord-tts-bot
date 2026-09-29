@@ -231,9 +231,13 @@ class TTSBot(
                 self._playback_worker(), name="tts-playback")
         else:
             self.worker_task = asyncio.create_task(self.tts_worker(), name="tts-worker")
+        if config.TTS_CONNECTION_KEEPALIVE_SECONDS > 0:
+            self.keepalive_task = asyncio.create_task(
+                self._connection_keepalive_worker(), name="tts-connection-keepalive")
 
     async def close(self) -> None:
-        for task in (self.worker_task, self.generation_task, self.playback_task):
+        for task in (self.worker_task, self.generation_task, self.playback_task,
+                     getattr(self, "keepalive_task", None)):
             if task:
                 task.cancel()
 

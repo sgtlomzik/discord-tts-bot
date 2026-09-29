@@ -23,6 +23,9 @@ DEFAULT_WHITELIST = ""
 
 def setup_logging() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format=LOG_FORMAT)
+    # Every provider request gets a richer "<Provider> HTTP ..." line from
+    # ttsbot.httpclient (connection reuse, idle time, header latency).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def parse_user_ids(value: str) -> set[int]:
@@ -49,7 +52,7 @@ def reload() -> None:
     global TTS_PREROLL_MS, TTS_PREROLL_MODE, TTS_PREROLL_VOLUME_DB, TTS_SILENCE_TAIL_MS
     global TTS_CONTINUOUS_STREAM, TTS_STREAMING_ENABLED, TTS_STREAM_TTFA_TIMEOUT
     global FISH_TTFA_TIMEOUT, GEMINI_TTFA_TIMEOUT, GEMINI_TTFA_PER_CHAR
-    global ELEVENLABS_TTFA_TIMEOUT
+    global ELEVENLABS_TTFA_TIMEOUT, TTS_CONNECTION_KEEPALIVE_SECONDS
     global TTS_PREFETCH_ENABLED, TTS_PREFETCH_LOOKAHEAD
     global TTS_IDLE_FRAME_MODE, TTS_IDLE_VOLUME_DB, TTS_STREAM_TAIL_MS
     global TTS_MAX_CONTINUOUS_IDLE_SECONDS, IDLE_DISCONNECT_SECONDS
@@ -115,6 +118,11 @@ def reload() -> None:
     # ElevenLabs streams while it generates: first audio measured 0.22-0.26 s
     # (0.66 s on a cold connection) for 2-133 characters, so a flat budget.
     ELEVENLABS_TTFA_TIMEOUT = max(0.5, float(os.getenv("ELEVENLABS_TTFA_TIMEOUT", "3")))
+    # While an allowed user sits in the bot's voice channel, ping their cloud
+    # provider after this many idle seconds so the TLS connection stays open
+    # (a new one costs 0.3-0.5 s through the VPN). ~1 KB per ping, no
+    # credits. 0 disables; typing warm-ups still run.
+    TTS_CONNECTION_KEEPALIVE_SECONDS = max(0.0, float(os.getenv("TTS_CONNECTION_KEEPALIVE_SECONDS", "60")))
     # Prefetch: decouple generation from playback so message N+1 is synthesized
     # while N is still playing (cuts queue_wait under bursts). Playback stays
     # strictly sequential FIFO. TTS_PREFETCH_ENABLED=0 reverts to the proven

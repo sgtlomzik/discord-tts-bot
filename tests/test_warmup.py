@@ -81,7 +81,8 @@ class WarmerTests(unittest.IsolatedAsyncioTestCase):
             url = provider._client.build_request("GET", warmer._url).url
             self.assertEqual(url.host, hosts[name], name)
             # A request through the client counts as activity (event hook).
-            await provider._client.event_hooks["request"][-1](None)
+            hook = provider._client.event_hooks["request"][-1]
+            await hook(provider._client.build_request("GET", warmer._url))
             self.assertIsNone(warmer.maybe_warm(), name)
             await provider.aclose()
         self.assertIsNone(dispatcher.provider_for("piper"))

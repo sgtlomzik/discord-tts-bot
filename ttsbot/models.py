@@ -1,6 +1,7 @@
 """Core data types shared across the bot: voice profiles and job records."""
 
 import asyncio
+import itertools
 import logging
 import time
 from dataclasses import dataclass, field
@@ -10,6 +11,10 @@ import discord
 from ttsbot import config
 
 log = logging.getLogger("tts_bot")
+
+# Sequential job numbers: every log line of one message's path carries its
+# ``job=`` so queue, generation, HTTP and playback lines can be matched.
+_job_ids = itertools.count(1)
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,7 @@ class TTSJob:
     text_channel_id: int
     voice_profile: str
     message_ts: float = field(default_factory=time.perf_counter)
+    job_id: int = field(default_factory=lambda: next(_job_ids))
 
 
 @dataclass(eq=False)  # identity-based: each prepared item is unique (set member)

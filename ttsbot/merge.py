@@ -65,7 +65,7 @@ class MergeQueueMixin:
                 timeout=max(config.TTS_QUEUE_PUT_TIMEOUT_MS, 1) / 1000.0,
             )
             log.info(
-                "Queued TTS guild=%s text_channel=%s voice_channel=%s author=%s queue=%s chars=%s voice=%s",
+                "Queued TTS guild=%s text_channel=%s voice_channel=%s author=%s queue=%s chars=%s voice=%s job=%s",
                 voice_channel.guild.id,
                 text_channel_id,
                 voice_channel.id,
@@ -73,6 +73,7 @@ class MergeQueueMixin:
                 self.message_queue.qsize(),
                 len(text),
                 voice_profile,
+                job.job_id,
             )
             return True
         except (asyncio.QueueFull, TimeoutError):

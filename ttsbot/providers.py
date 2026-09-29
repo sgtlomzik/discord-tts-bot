@@ -503,11 +503,17 @@ class TTSPhraseCache:
             or (cfg.max_entries > 0 and len(self._entries) > cfg.max_entries)
         ):
             evicted_key, evicted_path = self._entries.popitem(last=False)
-            self._total_bytes -= self._sizes.pop(evicted_key, 0)
+            size = self._sizes.pop(evicted_key, 0)
+            self._total_bytes -= size
             try:
                 evicted_path.unlink()
             except OSError:
                 log.warning("TTS cache: failed to evict %s", evicted_path, exc_info=True)
+            else:
+                log.info(
+                    "TTS cache evicted file=%s bytes=%d entries=%d total_bytes=%d",
+                    evicted_path.name, size, len(self._entries), self._total_bytes,
+                )
 
     @staticmethod
     def hash_text(text: str, voice_name: str = "") -> str:
@@ -526,15 +532,21 @@ class TTSPhraseCache:
         cached = self._entries.get(key)
         if cached is None:
             self._record(False)
+            log.debug("TTS cache miss chars=%d voice=%s", len(text), voice_name[:40])
             return None
         if not cached.exists():
             # Cache file vanished (manual cleanup, disk full).
             self._drop(key)
             self._record(False)
+            log.info("TTS cache file vanished file=%s; regenerating", cached.name)
             return None
         # LRU touch: move to the back.
         self._entries.move_to_end(key)
         self._record(True)
+        log.info(
+            "TTS cache hit file=%s bytes=%d chars=%d hits=%d misses=%d",
+            cached.name, self._sizes.get(key, 0), len(text), self._hits, self._misses,
+        )
         return cached
 
     def store(self, text: str, source_path: Path, voice_name: str = "", suffix: str | None = None) -> Path:
@@ -609,6 +621,10 @@ class TTSPhraseCache:
         self._sizes[key] = size
         self._entries[key] = target
         self._entries.move_to_end(key)
+        log.info(
+            "TTS cache stored file=%s bytes=%d entries=%d total_bytes=%d",
+            target.name, size, len(self._entries), self._total_bytes,
+        )
         self._evict_to_fit()
         return target
 

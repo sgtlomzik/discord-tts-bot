@@ -590,6 +590,31 @@ provider host (no credits), at most once per 30 s of idleness, and skipped
 while the connection is in use. Measured through the VPN after a 125 s
 pause: first audio 0.20 s with the warm-up, 0.34 s without.
 
+While an allowed user whose voice is a cloud voice sits in the bot's voice
+channel, a background task pings that provider after
+`TTS_CONNECTION_KEEPALIVE_SECONDS` (60) idle seconds, so even a message
+after a long silence finds the connection open (~1 KB per ping, no
+credits; `0` disables). Measured 2026-09-29: ElevenLabs kept an idle
+connection open for 130 s, and pings every 40 s kept it for 150 s.
+
 `on_message` logs `Discord delivery ... delay_ms=`: the time from the
 message's Discord timestamp to the bot's handler, the one stage before
 `message_ts` that the other timings do not cover.
+
+### Latency log lines
+
+Every job gets a number, and each line on its path carries `job=`:
+
+| Line | What it measures |
+|---|---|
+| `Queued TTS ... job=` | message normalized and queued |
+| `Generation start ... wait_s=` | queue to start of generation (the previous message's download, or lookahead backpressure) |
+| `<Provider> HTTP <method> <path> status= conn=new/reused idle_before_s= headers_s=` | one per provider request (from `attach_warmer`); `conn=new` means a TLS handshake was paid |
+| `<Provider> direct first packet` / `first frame ... request_to_packet_s=` | first playable audio, from the message and from the request |
+| `<Provider> stream done ... audio_s= download_s=` | whole download against playing time |
+| `Audio start ... generation_wait_s=` | how long the player waited for this job after picking it up (0 when prefetched) |
+| `Playback finished ... provider=` | end of playback |
+| `TTS cache hit / stored / evicted` | repeat cache use; misses are DEBUG |
+
+httpx's own `HTTP Request:` lines are silenced (WARNING) because the
+provider line above carries the same request plus the connection data.

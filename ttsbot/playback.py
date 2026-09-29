@@ -88,22 +88,26 @@ class PlaybackMixin:
             total += len(batch)
             if first_ts is None:
                 first_ts = time.perf_counter()
+                # generation_wait_s: how long the player waited for this
+                # job's first frame after the previous one ended (0 when the
+                # prefetch had it ready).
                 log.info(
                     "Audio start guild=%s channel=%s provider=%s codec=%s queue_wait=%.3fs "
-                    "message_to_audio_s=%.3f queue_to_audio_s=%.3f",
+                    "message_to_audio_s=%.3f queue_to_audio_s=%.3f job=%s generation_wait_s=%.3f",
                     job.voice_channel.guild.id, job.voice_channel.id,
                     prepared.provider or "?",
                     "pcm" if len(batch[0]) == PCM_FRAME_BYTES else "opus",
                     pickup_ts - job.queued_at,
                     first_ts - job.message_ts, first_ts - job.queued_at,
+                    job.job_id, first_ts - pickup_ts,
                 )
         if total == 0 or source is None:
             return
         await source.wait_until_drained()
         log.info(
-            "Playback finished guild=%s channel=%s frames=%d total_since_queue=%.3fs",
+            "Playback finished guild=%s channel=%s frames=%d total_since_queue=%.3fs job=%s provider=%s",
             job.voice_channel.guild.id, job.voice_channel.id, total,
-            time.perf_counter() - job.queued_at,
+            time.perf_counter() - job.queued_at, job.job_id, prepared.provider or "?",
         )
         self.schedule_continuous_idle_stop(job.voice_channel.guild)
         self.schedule_idle_disconnect(job.voice_channel.guild)
