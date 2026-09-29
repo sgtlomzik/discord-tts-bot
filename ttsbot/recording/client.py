@@ -93,6 +93,15 @@ class RecordingVoiceClient(discord.VoiceClient):
             threading.Thread(target=recorder.stop, name="voice-recorder-stop", daemon=True).start()
         super().cleanup()
 
+    def note_spoken_text(self, user_id: int, text: str) -> None:
+        """The bot started speaking ``text`` for ``user_id``: put it in the transcript."""
+        recorder = self._recorder
+        if recorder is not None:
+            try:
+                recorder.note_text(user_id, text)
+            except OSError:
+                log.exception("Recording TTS note failed guild=%s", self.guild.id)
+
     def _start_recording(self) -> None:
         if self._recorder is None and self.channel is not None:
             self._recorder = ChannelRecorder(settings_from_config(), self.guild.id, self.channel.id)

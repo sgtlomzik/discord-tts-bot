@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import time
+import zoneinfo
 from dataclasses import replace
 from pathlib import Path
 
@@ -36,6 +37,8 @@ from ttsbot.messages import MergeBufferState
 from ttsbot.models import PreparedAudio, TTSJob, VOICE_PROFILES
 from ttsbot.pipeline import SynthesisPipelineMixin
 from ttsbot.playback import PlaybackMixin
+from ttsbot.recording.groq import AudioBudget, GroqTranscriber
+from ttsbot.recording.worker import TranscriptionWorker
 from ttsbot.store import BotConfigStore
 from ttsbot.voice_lifecycle import VoiceLifecycleMixin
 
@@ -234,12 +237,45 @@ class TTSBot(
         if config.TTS_CONNECTION_KEEPALIVE_SECONDS > 0:
             self.keepalive_task = asyncio.create_task(
                 self._connection_keepalive_worker(), name="tts-connection-keepalive")
+        if config.RECORDING_ENABLED and config.STT_ENABLED:
+            self.transcription_task = asyncio.create_task(
+                self._make_transcription_worker().run(), name="stt-worker")
+
+    def _make_transcription_worker(self) -> TranscriptionWorker:
+        config.RECORDING_DIR.mkdir(parents=True, exist_ok=True)
+        self.transcriber = GroqTranscriber(
+            config.GROQ_API_KEY, model=config.STT_MODEL, language=config.STT_LANGUAGE,
+            prompt=config.STT_PROMPT,
+        )
+        budget = AudioBudget(
+            config.RECORDING_DIR / "groq_ledger.jsonl",
+            per_hour=config.STT_AUDIO_SECONDS_PER_HOUR, per_day=config.STT_AUDIO_SECONDS_PER_DAY,
+            min_billed=config.STT_MIN_BILLED_SECONDS, requests_per_minute=config.STT_REQUESTS_PER_MINUTE,
+        )
+        try:
+            tz = zoneinfo.ZoneInfo(config.TRANSCRIPT_TIMEZONE)
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+            log.warning("Unknown TRANSCRIPT_TIMEZONE=%s; using UTC", config.TRANSCRIPT_TIMEZONE)
+            tz = zoneinfo.ZoneInfo("UTC")
+        return TranscriptionWorker(config.RECORDING_DIR, self.transcriber, budget,
+                                   name_for=self.member_display_name, tz=tz)
+
+    def member_display_name(self, guild_id: int, user_id: int) -> str:
+        guild = self.get_guild(guild_id)
+        member = guild.get_member(user_id) if guild else None
+        if member is not None:
+            return member.display_name
+        user = self.get_user(user_id)
+        return user.display_name if user is not None else str(user_id)
 
     async def close(self) -> None:
         for task in (self.worker_task, self.generation_task, self.playback_task,
-                     getattr(self, "keepalive_task", None)):
+                     getattr(self, "keepalive_task", None), getattr(self, "transcription_task", None)):
             if task:
                 task.cancel()
+        transcriber = getattr(self, "transcriber", None)
+        if transcriber is not None:
+            await transcriber.aclose()
 
         for task in self.idle_disconnect_tasks.values():
             task.cancel()

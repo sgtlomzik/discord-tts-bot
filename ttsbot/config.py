@@ -75,6 +75,9 @@ def reload() -> None:
     global WHITELIST_USERS
     global RECORDING_ENABLED, RECORDING_DIR, RECORDING_CHUNK_SECONDS
     global RECORDING_IDLE_CLOSE_SECONDS, RECORDING_PAUSE_MS, RECORDING_VAD_AGGRESSIVENESS
+    global STT_ENABLED, GROQ_API_KEY, STT_MODEL, STT_LANGUAGE, STT_PROMPT
+    global STT_AUDIO_SECONDS_PER_HOUR, STT_AUDIO_SECONDS_PER_DAY, STT_MIN_BILLED_SECONDS
+    global STT_REQUESTS_PER_MINUTE, TRANSCRIPT_TIMEZONE
 
     TMP_DIR = Path(os.getenv("TTS_TMP_DIR", "/dev/shm"))
     BOT_CONFIG_PATH = Path(os.getenv("BOT_CONFIG_PATH", "/app/data/config.json"))
@@ -197,9 +200,24 @@ def reload() -> None:
     RECORDING_ENABLED = _flag("RECORDING_ENABLED", "0")
     RECORDING_DIR = Path(os.getenv("RECORDING_DIR", str(BOT_CONFIG_PATH.parent / "recordings")))
     RECORDING_CHUNK_SECONDS = max(10.0, float(os.getenv("RECORDING_CHUNK_SECONDS", "600")))
-    RECORDING_IDLE_CLOSE_SECONDS = max(5.0, float(os.getenv("RECORDING_IDLE_CLOSE_SECONDS", "60")))
+    # 15 min: Groq bills every file for at least 10 s, and a 60 s close
+    # produced 0.5 s files from a single word.
+    RECORDING_IDLE_CLOSE_SECONDS = max(5.0, float(os.getenv("RECORDING_IDLE_CLOSE_SECONDS", "900")))
     RECORDING_PAUSE_MS = max(0, int(os.getenv("RECORDING_PAUSE_MS", "500")))
     RECORDING_VAD_AGGRESSIVENESS = min(3, max(-1, int(os.getenv("RECORDING_VAD_AGGRESSIVENESS", "3"))))
+    # Transcription of recorded chunks with Groq Whisper (ttsbot/recording/
+    # worker.py); runs while recording is on and GROQ_API_KEY is set. The
+    # limits are Groq's free plan; results stay on disk next to the audio.
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+    STT_ENABLED = _flag("STT_ENABLED", "1") and bool(GROQ_API_KEY)
+    STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3").strip()
+    STT_LANGUAGE = os.getenv("STT_LANGUAGE", "ru").strip()
+    STT_PROMPT = os.getenv("STT_PROMPT", "").strip()
+    STT_AUDIO_SECONDS_PER_HOUR = max(60.0, float(os.getenv("STT_AUDIO_SECONDS_PER_HOUR", "7200")))
+    STT_AUDIO_SECONDS_PER_DAY = max(60.0, float(os.getenv("STT_AUDIO_SECONDS_PER_DAY", "28800")))
+    STT_MIN_BILLED_SECONDS = max(0.0, float(os.getenv("STT_MIN_BILLED_SECONDS", "10")))
+    STT_REQUESTS_PER_MINUTE = max(1, int(os.getenv("STT_REQUESTS_PER_MINUTE", "20")))
+    TRANSCRIPT_TIMEZONE = os.getenv("TRANSCRIPT_TIMEZONE", "UTC").strip() or "UTC"
 
     VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
     # One knob for bare-metal runs: point PIPER_MODELS_DIR at ./models and

@@ -59,7 +59,8 @@ The active runtime pieces are:
   - `recording/` - voice receive (off unless `RECORDING_ENABLED=1`):
     `client.py` (a `VoiceClient` subclass), `rtp.py` (transport
     decryption), `recorder.py` (per-user chunk files), `ogg.py` (Ogg
-    Opus writer).
+    Opus writer), `vad.py` (speech filter); transcription: `groq.py`
+    (client and audio budget), `worker.py` (queue), `transcript.py`.
   - `merge.py` - the enqueue boundary and legacy/selective-hold merge
     decisions.
   - `pipeline.py` - Piper/MiniMax/Fish synthesis, the streaming fast path,
@@ -454,6 +455,42 @@ filtered out),
 `filled_ms` short gaps kept as silence, `unknown_ssrc_packets`,
 `dave_errors` (failed first attempts), `dave_recovered` / `dave_lost`,
 `transport_errors`, `late_packets`, `bot_packets`, `vad_errors`.
+
+A file stays open until `RECORDING_CHUNK_SECONDS` of speech or
+`RECORDING_IDLE_CLOSE_SECONDS` (15 min) of that user's silence: Groq
+bills each file for at least 10 s. Pieces are also appended to
+`NNNN.pieces.jsonl` as they start, so a file left open by a crash or a
+restart is recovered (`recorder.recover_session`) with exact timestamps.
+Text the bot speaks for someone is logged to `tts.jsonl`.
+
+### 9.2 Transcription
+
+With `GROQ_API_KEY` set, `recording.worker.TranscriptionWorker` (task
+`stt-worker`) sends closed files to Groq Whisper (`STT_MODEL`,
+`STT_LANGUAGE`, `verbose_json` with segments), oldest first, one at a
+time. The disk is the queue: a file in `chunks.jsonl` without a
+`NNNN.json` next to it is pending, so restarts lose nothing.
+
+`groq.AudioBudget` keeps the plan's limits. The hourly audio limit is a
+bucket refilling at 2 s per second (headers
+`x-ratelimit-remaining-audio-seconds` / `-reset-audio-seconds`); the
+budget follows the last response's level and falls back to its ledger
+(`RECORDING_DIR/groq_ledger.jsonl`) after a restart. The ledger also
+enforces the day limit. A 429, 5xx or network error pauses sending for
+the time Groq asks (or 30-60 s); another 4xx writes `NNNN.error.json`,
+and the file is tried 3 times in all. A file over 25 MB is re-encoded to
+32 kb/s mono first.
+
+`NNNN.json` holds Groq's kept segments with `at`/`until` in wall-clock
+time (through the chunk's pieces) and the dropped ones: known Whisper
+hallucinations ("Субтитры сделал DimaTorzok", "Продолжение следует"),
+no-speech and repetition loops. After each result the session's
+`transcript.md` (`[HH:MM:SS] Name: text` in `TRANSCRIPT_TIMEZONE`, a
+speaker's lines less than 2 s apart merged, TTS lines as `Name (TTS)`)
+and `transcript.jsonl` are rebuilt. Log lines: `Transcription worker
+started`, `Transcription done ... audio_s= took= groq_remaining_s=
+day_used_s= pending=`, `Transcription waiting for Groq budget`,
+`Transcription failed, retry in` and `Transcription rejected`.
 
 ## 10. Persistence and Guild State
 

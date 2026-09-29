@@ -13,7 +13,12 @@ as silence from the RTP timestamps. A file is closed once it holds ``chunk_secon
 the next utterance boundary) or after ``idle_close_seconds`` of silence
 from that user, and a line in ``chunks.jsonl`` then records its pieces
 as ``[offset in the file (s), wall-clock start (epoch s)]``: that is what
-maps transcript timestamps back to real time.
+maps transcript timestamps back to real time. Until then the pieces are
+appended to ``NNNN.pieces.jsonl`` as they start, so a file left open by
+a crash can be recovered (``recover_session``).
+
+Text the bot spoke for someone (TTS) goes to ``tts.jsonl`` so the
+transcript can show it in place.
 """
 
 from __future__ import annotations
@@ -36,6 +41,9 @@ log = logging.getLogger("tts_bot")
 
 _STOP = object()
 _STATS_INTERVAL = 60.0
+
+# Session folders a recorder in this process is still writing to.
+ACTIVE_SESSIONS: set[Path] = set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +95,7 @@ class ChannelRecorder:
 
     def start(self) -> None:
         self.path.mkdir(parents=True, exist_ok=True)
+        ACTIVE_SESSIONS.add(self.path)
         self._write_session(ended_at=None)
         self._thread.start()
         log.info("Recording started guild=%s channel=%s path=%s", self.guild_id, self.channel_id, self.path)
@@ -97,12 +106,19 @@ class ChannelRecorder:
     def count(self, name: str, amount: int = 1) -> None:
         self.counters[name] += amount
 
+    def note_text(self, user_id: int, text: str, wall: float | None = None) -> None:
+        """Record text the bot spoke for ``user_id`` (TTS) at ``wall``."""
+        entry = {"user_id": user_id, "at": round(time.time() if wall is None else wall, 3), "text": text}
+        with (self.path / "tts.jsonl").open("a", encoding="utf-8") as out:
+            out.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
     def stop(self, timeout: float = 10.0) -> None:
         if not self._thread.is_alive():
             return
         self._queue.put(_STOP)
         self._thread.join(timeout)
         self._write_session(ended_at=time.time())
+        ACTIVE_SESSIONS.discard(self.path)
         self._log_stats(final=True)
 
     # -- writer thread -------------------------------------------------
@@ -188,7 +204,7 @@ class ChannelRecorder:
             self._open_chunk(track, wall)
         elif new_piece:
             track.writer.write_silence(pause)
-            track.pieces.append([round(track.writer.seconds, 3), round(wall, 3)])
+            self._add_piece(track, round(track.writer.seconds, 3), round(wall, 3))
         elif gap > 0:
             track.writer.write_silence(gap)
             self.count("filled_ms", gap // 48)
@@ -206,9 +222,16 @@ class ChannelRecorder:
         track.index += 1
         path = folder / f"{track.index:04d}.ogg"
         track.writer = OggOpusWriter(path, serial=(track.user_id ^ track.index))
-        track.pieces = [[0.0, round(wall, 3)]]
+        track.pieces = []
         track.started_at = wall
         track.packets = 0
+        self._add_piece(track, 0.0, round(wall, 3))
+
+    @staticmethod
+    def _add_piece(track: _Track, offset: float, wall: float) -> None:
+        track.pieces.append([offset, wall])
+        with pieces_path(track.writer.path).open("a", encoding="utf-8") as out:
+            out.write(json.dumps([offset, wall]) + "\n")
 
     def _close_idle(self, now: float) -> None:
         for track in self._tracks.values():
@@ -234,6 +257,7 @@ class ChannelRecorder:
         }
         with (self.path / "chunks.jsonl").open("a", encoding="utf-8") as manifest:
             manifest.write(json.dumps(entry) + "\n")
+        pieces_path(writer.path).unlink(missing_ok=True)
         log.info(
             "Recording chunk closed guild=%s user=%s file=%s audio_s=%.1f pieces=%d bytes=%d reason=%s",
             self.guild_id, track.user_id, entry["file"], writer.seconds, len(track.pieces),
@@ -260,3 +284,61 @@ class ChannelRecorder:
             "finished" if final else "stats", self.guild_id, self.channel_id, len(self._tracks),
             " ".join(f"{name}={value}" for name, value in sorted(counters.items())) or "packets=0",
         )
+
+
+def pieces_path(chunk: Path) -> Path:
+    return chunk.with_name(chunk.stem + ".pieces.jsonl")
+
+
+def recover_session(path: Path) -> int:
+    """Close the books on a session a crash left open; return files recovered.
+
+    Every ``.ogg`` without a ``chunks.jsonl`` line gets one from its
+    ``.pieces.jsonl`` and its last Ogg page (the file itself stays as it
+    is: players and Groq read it without the end-of-stream page), and
+    ``session.json`` gets an end time.
+    """
+    from ttsbot.recording.ogg import ogg_duration
+
+    manifest = path / "chunks.jsonl"
+    listed = set()
+    if manifest.exists():
+        listed = {json.loads(line)["file"] for line in manifest.read_text(encoding="utf-8").splitlines() if line}
+    recovered = 0
+    last_mtime = 0.0
+    for chunk in sorted(path.glob("*/*.ogg")):
+        last_mtime = max(last_mtime, chunk.stat().st_mtime)
+        name = str(chunk.relative_to(path))
+        if name in listed:
+            continue
+        sidecar = pieces_path(chunk)
+        pieces = []
+        if sidecar.exists():
+            pieces = [json.loads(line) for line in sidecar.read_text(encoding="utf-8").splitlines() if line]
+        seconds = ogg_duration(chunk)
+        if not pieces or seconds <= 0:
+            log.warning("Recording recovery skipped file=%s/%s (no pieces or audio)", path.name, name)
+            continue
+        entry = {
+            "user_id": int(chunk.parent.name),
+            "file": name,
+            "started_at": pieces[0][1],
+            "ended_at": round(pieces[-1][1] + seconds - pieces[-1][0], 3),
+            "audio_seconds": round(seconds, 3),
+            "bytes": chunk.stat().st_size,
+            "packets": None,
+            "pieces": pieces,
+            "reason": "recovered",
+        }
+        with manifest.open("a", encoding="utf-8") as out:
+            out.write(json.dumps(entry) + "\n")
+        sidecar.unlink(missing_ok=True)
+        recovered += 1
+        log.info("Recording chunk recovered file=%s/%s audio_s=%.1f pieces=%d", path.name, name, seconds, len(pieces))
+    session_file = path / "session.json"
+    session = json.loads(session_file.read_text(encoding="utf-8"))
+    if session.get("ended_at") is None:
+        session["ended_at"] = round(last_mtime or session["started_at"], 3)
+        session["recovered"] = True
+        session_file.write_text(json.dumps(session, indent=2), encoding="utf-8")
+    return recovered

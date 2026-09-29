@@ -93,3 +93,21 @@ class OggOpusWriter:
         self._file.flush()
         self._sequence += 1
         self.bytes_written += len(page)
+
+
+def ogg_duration(path: Path) -> float:
+    """Seconds of audio in an Ogg Opus file: the last page's granule position.
+
+    Stops at the first damaged page, so a file cut off by a crash reports
+    what can be played.
+    """
+    data = path.read_bytes()
+    pos, granule = 0, 0
+    while pos + 27 <= len(data) and data[pos:pos + 4] == b"OggS":
+        segments = data[pos + 26]
+        end = pos + 27 + segments + sum(data[pos + 27:pos + 27 + segments])
+        if end > len(data):
+            break
+        granule = max(granule, struct.unpack_from("<q", data, pos + 6)[0])
+        pos = end
+    return granule / 48000
