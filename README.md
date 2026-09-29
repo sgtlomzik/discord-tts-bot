@@ -24,8 +24,9 @@ failures fall back to Piper.
   decoding or re-encoding. One continuous Opus player serves every engine
   (Piper, MiniMax and Gemini PCM is encoded in place), so switching voices
   never restarts it.
-  A keep-alive HTTP client is reused, and the next message is synthesized
-  while the previous plays.
+  Cloud connections stay open for 120 s and are warmed while an allowed
+  user is typing, so a message after a pause skips the TLS handshake. The
+  next message is synthesized while the previous plays.
 - **Smart message merging** — short bursts of messages from one user are
   merged into a single natural phrase (`selective_hold_v2`), while reactions,
   emoji and questions play immediately.

@@ -1,12 +1,13 @@
 """Discord gateway event handlers.
 
-``register_events(bot)`` attaches on_ready / on_message /
+``register_events(bot)`` attaches on_ready / on_message / on_typing /
 on_voice_state_update to *bot* and returns them in a dict so the
 composition root can re-export them (the tests reference the handlers
 as module globals of bot.py).
 """
 
 import logging
+from datetime import datetime
 
 import discord
 
@@ -71,6 +72,15 @@ def register_events(bot):
             and message.author.voice
             and isinstance(message.author.voice.channel, discord.VoiceChannel)
         ):
+            created_at = getattr(message, "created_at", None)
+            if isinstance(created_at, datetime):
+                # Gateway delivery: Discord's message timestamp -> this handler
+                # (the host clock is NTP-synced; message_ts starts here).
+                log.info(
+                    "Discord delivery guild=%s author=%s message=%s delay_ms=%d",
+                    message.guild.id, message.author.id, message.id,
+                    (discord.utils.utcnow() - created_at).total_seconds() * 1000,
+                )
             fixed_phrase = bot.config_store.fixed_phrase_for_user(message.guild.id, message.author.id)
             await bot.queue_or_merge_message(
                 fixed_phrase if fixed_phrase is not None else message.content,
@@ -81,6 +91,23 @@ def register_events(bot):
             )
 
         await bot.process_commands(message)
+
+
+    @bot.event
+    async def on_typing(channel, user, when) -> None:
+        """Open the cloud TTS connection while an allowed user is typing.
+
+        Typing starts seconds before the message, which is plenty for a TLS
+        handshake, so a message after a long pause does not pay for one.
+        """
+        guild = getattr(channel, "guild", None)
+        if guild is None or getattr(user, "bot", False):
+            return
+        if not (bot.config_store.is_enabled(guild.id) and bot.config_store.is_allowed(guild.id, user.id)):
+            return
+        if not isinstance(getattr(getattr(user, "voice", None), "channel", None), discord.VoiceChannel):
+            return
+        bot.warm_tts_connection(guild.id, user.id)
 
 
     @bot.event
@@ -115,5 +142,6 @@ def register_events(bot):
     return {
         "on_ready": on_ready,
         "on_message": on_message,
+        "on_typing": on_typing,
         "on_voice_state_update": on_voice_state_update,
     }

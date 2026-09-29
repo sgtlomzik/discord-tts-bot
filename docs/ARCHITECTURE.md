@@ -571,6 +571,25 @@ If the goal is to add a new voice engine, the architecture points that matter mo
 3. preserve `TTSJob`, queueing, and worker flow;
 4. make engine selection a profile-level concern, not a scattered global `if`;
 5. keep playback and voice lifecycle unchanged unless the new engine genuinely needs a different artifact format;
-6. add tests around engine selection, fallback, and missing-model behavior.
+6. add tests around engine selection, fallback, and missing-model behavior;
+7. for a cloud engine, build the httpx client with `provider_limits()` and
+   call `attach_warmer()` on it (`ttsbot/httpclient.py`), and return the
+   provider from `TTSDispatcher.provider_for()`. That gives it the 120 s
+   keep-alive and the typing warm-up with no other code.
 
 That is the smallest clean seam in the current codebase.
+
+### Connection keep-alive and typing warm-up
+
+httpx closes idle connections after 5 s by default, so a message after a
+pause used to pay a new TLS handshake (ElevenLabs first audio 0.33 s
+instead of 0.18-0.20 s). Every cloud client now keeps idle connections for
+120 s (`KEEPALIVE_EXPIRY`). For longer pauses, `on_typing` warms the
+connection of the typing user's voice: an unauthenticated `GET` on the
+provider host (no credits), at most once per 30 s of idleness, and skipped
+while the connection is in use. Measured through the VPN after a 125 s
+pause: first audio 0.20 s with the warm-up, 0.34 s without.
+
+`on_message` logs `Discord delivery ... delay_ms=`: the time from the
+message's Discord timestamp to the bot's handler, the one stage before
+`message_ts` that the other timings do not cover.

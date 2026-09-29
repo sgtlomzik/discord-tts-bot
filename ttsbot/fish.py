@@ -15,7 +15,7 @@ from typing import AsyncIterator
 import httpx
 
 from ttsbot.errors import QuotaExhaustedError
-from ttsbot.httpclient import provider_limits
+from ttsbot.httpclient import attach_warmer, provider_limits
 
 log = logging.getLogger("tts_bot")
 
@@ -132,6 +132,7 @@ class FishProvider:
             timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
             limits=provider_limits(),
         )
+        self.warmer = attach_warmer(self._client, "Fish")
         self._flights: dict[str, _Flight] = {}
         self._flight_lock = asyncio.Lock()
         self._session_requests = 0

@@ -52,7 +52,7 @@ from ttsbot import config as bot_config
 from ttsbot.elevenlabs import ElevenLabsProvider, ElevenLabsRequestError
 from ttsbot.fish import FishProvider
 from ttsbot.gemini import GeminiProvider, write_wav
-from ttsbot.httpclient import provider_limits
+from ttsbot.httpclient import attach_warmer, provider_limits
 from ttsbot.pcm import apply_gain, pcm_cache_header, read_pcm_cache
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -741,6 +741,8 @@ class MiniMaxProvider:
             timeout=httpx.Timeout(config.timeout_seconds),
             limits=provider_limits(max_connections=8, max_keepalive_connections=4),
         )
+        # This client has no base_url, so the warm-up targets the API host.
+        self.warmer = attach_warmer(self._client, "MiniMax", config.base_url.rstrip("/") + "/")
         # Cumulative chars billed this process lifetime. Logged on
         # every successful synthesis for quota monitoring.
         self._session_chars: int = 0
@@ -1331,6 +1333,17 @@ class TTSDispatcher:
     @property
     def elevenlabs_circuit_breaker(self) -> CircuitBreaker:
         return self._elevenlabs_cb
+
+    def provider_for(self, provider: str | None):
+        """The configured provider object for a voice record's ``provider``
+        value, or None (Piper, unknown, or not configured). Register every
+        new cloud provider here so typing warm-ups reach it."""
+        return {
+            "minimax": self._cloud,
+            "fish": self._fish,
+            "gemini": self._gemini,
+            "elevenlabs": self._elevenlabs,
+        }.get(provider or "")
 
     @property
     def cache(self) -> Optional[TTSPhraseCache]:

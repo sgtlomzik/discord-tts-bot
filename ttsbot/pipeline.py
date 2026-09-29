@@ -151,6 +151,17 @@ class SynthesisPipelineMixin:
         )
         return MiniMaxProvider(cfg)
 
+    def warm_tts_connection(self, guild_id: int, user_id: int):
+        """Warm the HTTP connection of the user's cloud voice (on typing).
+
+        Returns the warm-up task, or None when the voice is local or its
+        connection was used in the last 30 s.
+        """
+        record = self.voice_registry.get(self.config_store.voice_for_user(guild_id, user_id))
+        provider = self.tts_dispatcher.provider_for(getattr(record, "provider", None))
+        warmer = getattr(provider, "warmer", None)
+        return warmer.maybe_warm() if warmer is not None else None
+
     def _resolve_piper_profile(self, voice_profile: str | None) -> VoiceProfile:
         """Resolve a voice name to a Piper ``VoiceProfile`` via the registry.
 
