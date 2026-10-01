@@ -333,7 +333,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.prune_audio(now=later)[0], 1)
         self.assertEqual(worker.prune_audio(now=later), (0, 0))
 
-    # -- when the sweep runs: once, as the worker starts --
+    # -- when the sweep runs: at startup, then every prune_seconds --
 
     async def run_until(self, worker, condition, timeout=3.0):
         """Run the worker's loop until ``condition()`` holds (or the timeout), then stop it."""
@@ -344,15 +344,22 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
-    async def test_step_never_prunes(self):
+    def count_prunes(self, worker):
+        calls = []
+        worker.prune = lambda now=None: calls.append(time.monotonic())
+        return calls
+
+    async def test_step_alone_never_prunes(self):
+        # Only run() arms the schedule (startup sweep, then the interval).
         self.record_session()
         worker = self.worker(FakeTranscriber([groq_json((0, 1, "слово"))]),
-                             keep_audio_days=90, keep_transcript_days=30)
+                             keep_audio_days=90, keep_transcript_days=30, prune_seconds=0.01)
         calls = []
         for name in ("prune", "prune_audio", "prune_transcripts"):
             setattr(worker, name, lambda *a, _name=name, **kw: calls.append(_name) or (0, 0))
         for _ in range(3):  # transcribe, rebuild the transcript, idle
             await worker.step()
+            await asyncio.sleep(0.02)
         self.assertEqual(calls, [])
 
     async def test_run_prunes_audio_at_startup(self):
@@ -368,17 +375,57 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         await self.run_until(worker, lambda: not old.exists())
         self.assertFalse(old.exists())
 
-    async def test_run_prunes_only_once(self):
-        old = self.make_session("20260101-000000Z-2", ended_at=1000.0, chunks=[("5/0001.ogg", True)])
-        worker = self.worker(FakeTranscriber([]), keep_transcript_days=30, keep_audio_days=90)
-        calls = []
-        worker.prune = lambda now=None: calls.append(now)
+    async def test_run_prunes_again_every_interval(self):
+        worker = self.worker(FakeTranscriber([]), keep_audio_days=90, scan_seconds=0.02, prune_seconds=0.15)
+        calls = self.count_prunes(worker)
+        await self.run_until(worker, lambda: len(calls) >= 3, timeout=3.0)
+        self.assertGreaterEqual(len(calls), 3)  # startup + two intervals
+        gaps = [b - a for a, b in zip(calls, calls[1:])]
+        self.assertTrue(all(gap >= 0.12 for gap in gaps), gaps)  # spaced by the interval, not every scan
+
+    async def test_default_interval_is_a_day(self):
+        worker = self.worker(FakeTranscriber([]))
+        self.assertEqual(worker.prune_seconds, 86400.0)
+        calls = self.count_prunes(worker)
         task = asyncio.create_task(worker.run())
-        await asyncio.sleep(0.3)  # several scan loops would pass if it ran on each
+        await asyncio.sleep(0.3)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(len(calls), 1)  # just the startup sweep
+
+    async def test_zero_interval_prunes_only_at_startup(self):
+        worker = self.worker(FakeTranscriber([]), scan_seconds=0.02, prune_seconds=0)
+        calls = self.count_prunes(worker)
+        await self.run_until(worker, lambda: False, timeout=0.4)
         self.assertEqual(len(calls), 1)
-        self.assertTrue(old.exists())  # the stubbed prune deleted nothing
+
+    async def test_interval_sweep_catches_audio_transcribed_after_startup(self):
+        # At startup the chunk has no result yet, so its audio is kept; once the loop
+        # has transcribed it, a later sweep (not the startup one) deletes it.
+        rec = self.record_session()
+        ogg = rec.path / "5" / "0001.ogg"
+        worker = self.worker(FakeTranscriber([groq_json((0, 1, "слово"))]), keep_audio_days=90,
+                             scan_seconds=0.02, prune_seconds=0.15)
+        await self.run_until(worker, lambda: not ogg.exists())
+        self.assertFalse(ogg.exists())
+        self.assertTrue((rec.path / "5" / "0001.json").exists())
+        self.assertIn("слово", (rec.path / "transcript.md").read_text(encoding="utf-8"))
+
+    async def test_failing_sweep_does_not_stop_transcription(self):
+        rec = self.record_session()
+        worker = self.worker(FakeTranscriber([groq_json((0, 1, "слово"))]), keep_audio_days=90,
+                             scan_seconds=0.02, prune_seconds=0.05)
+        attempts = []
+
+        def broken(now=None):
+            attempts.append(1)
+            raise RuntimeError("disk on fire")
+
+        worker.prune = broken
+        result = rec.path / "5" / "0001.json"
+        await self.run_until(worker, lambda: result.exists() and len(attempts) >= 2)
+        self.assertTrue(result.exists())  # transcribed despite the failing sweeps
+        self.assertGreaterEqual(len(attempts), 2)  # and the sweep is retried next interval
 
     # -- transcript retention: a whole old session folder goes --
 
@@ -497,6 +544,22 @@ class RecordingConfigTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"RECORDING_AUDIO_KEEP_DAYS": raw}):
                 config.reload()
                 self.assertEqual(config.RECORDING_AUDIO_KEEP_DAYS, expected, raw)
+
+    def test_prune_interval_defaults_to_a_day(self):
+        from ttsbot import config
+        env = {k: v for k, v in os.environ.items() if k != "RECORDING_PRUNE_INTERVAL_HOURS"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            config.reload()
+            self.assertEqual(config.RECORDING_PRUNE_INTERVAL_HOURS, 24.0)
+        self.addCleanup(config.reload)
+
+    def test_prune_interval_from_env_and_clamped(self):
+        from ttsbot import config
+        self.addCleanup(config.reload)
+        for raw, expected in (("6", 6.0), ("0.5", 0.5), ("0", 0.0), ("-3", 0.0)):
+            with mock.patch.dict(os.environ, {"RECORDING_PRUNE_INTERVAL_HOURS": raw}):
+                config.reload()
+                self.assertEqual(config.RECORDING_PRUNE_INTERVAL_HOURS, expected, raw)
 
     def test_transcript_keep_days_defaults_to_forever(self):
         from ttsbot import config

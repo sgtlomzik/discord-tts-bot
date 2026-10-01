@@ -494,9 +494,11 @@ started`, `Transcription done ... audio_s= took= groq_remaining_s=
 day_used_s= pending=`, `Transcription waiting for Groq budget`,
 `Transcription failed, retry in` and `Transcription rejected`.
 
-Retention: the worker applies two independent limits once, as it
-starts (i.e. on a bot restart; there is no periodic sweep), transcripts
-first, then audio. 0 turns a limit off.
+Retention: the worker applies two independent limits as it starts and
+then every `RECORDING_PRUNE_INTERVAL_HOURS` (default 24; 0 = only at
+start), transcripts first, then audio. A sweep runs off the event loop; a
+failing one is logged and retried at the next interval. 0 turns a limit
+off.
 
 - `RECORDING_AUDIO_KEEP_DAYS` (default 90) deletes the Ogg file of every
   chunk older than that; age is the chunk's `ended_at` in `chunks.jsonl`.
@@ -584,7 +586,8 @@ Main groups:
 - Piper model path and tuning;
 - voice recording and transcription (`RECORDING_*`, `STT_*`,
   `TRANSCRIPT_TIMEZONE`), including `RECORDING_AUDIO_KEEP_DAYS` and
-  `RECORDING_TRANSCRIPT_KEEP_DAYS` for how long audio and transcripts are kept.
+  `RECORDING_TRANSCRIPT_KEEP_DAYS` for how long audio and transcripts are kept and
+  `RECORDING_PRUNE_INTERVAL_HOURS` for how often that is applied.
 
 The important current engine-specific values are:
 

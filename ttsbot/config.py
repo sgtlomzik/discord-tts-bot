@@ -75,7 +75,7 @@ def reload() -> None:
     global WHITELIST_USERS
     global RECORDING_ENABLED, RECORDING_DIR, RECORDING_CHUNK_SECONDS
     global RECORDING_IDLE_CLOSE_SECONDS, RECORDING_PAUSE_MS, RECORDING_VAD_AGGRESSIVENESS
-    global RECORDING_AUDIO_KEEP_DAYS, RECORDING_TRANSCRIPT_KEEP_DAYS
+    global RECORDING_AUDIO_KEEP_DAYS, RECORDING_TRANSCRIPT_KEEP_DAYS, RECORDING_PRUNE_INTERVAL_HOURS
     global STT_ENABLED, GROQ_API_KEY, STT_MODEL, STT_LANGUAGE, STT_PROMPT
     global STT_AUDIO_SECONDS_PER_HOUR, STT_AUDIO_SECONDS_PER_DAY, STT_MIN_BILLED_SECONDS
     global STT_REQUESTS_PER_MINUTE, TRANSCRIPT_TIMEZONE
@@ -206,12 +206,14 @@ def reload() -> None:
     RECORDING_IDLE_CLOSE_SECONDS = max(5.0, float(os.getenv("RECORDING_IDLE_CLOSE_SECONDS", "900")))
     RECORDING_PAUSE_MS = max(0, int(os.getenv("RECORDING_PAUSE_MS", "500")))
     RECORDING_VAD_AGGRESSIVENESS = min(3, max(-1, int(os.getenv("RECORDING_VAD_AGGRESSIVENESS", "3"))))
-    # Retention, applied once as the STT worker starts (so it needs the
-    # worker): transcribed Ogg files older than RECORDING_AUDIO_KEEP_DAYS are
-    # deleted, transcripts stay; finished sessions (transcripts and all)
-    # older than RECORDING_TRANSCRIPT_KEEP_DAYS are deleted. 0 = keep forever.
+    # Retention, run by the STT worker (so it needs the worker) as it starts
+    # and then every RECORDING_PRUNE_INTERVAL_HOURS (0 = only at start):
+    # transcribed Ogg files older than RECORDING_AUDIO_KEEP_DAYS are deleted,
+    # transcripts stay; finished sessions (transcripts and all) older than
+    # RECORDING_TRANSCRIPT_KEEP_DAYS are deleted. 0 = keep forever.
     RECORDING_AUDIO_KEEP_DAYS = max(0, int(os.getenv("RECORDING_AUDIO_KEEP_DAYS", "90")))
     RECORDING_TRANSCRIPT_KEEP_DAYS = max(0, int(os.getenv("RECORDING_TRANSCRIPT_KEEP_DAYS", "0")))
+    RECORDING_PRUNE_INTERVAL_HOURS = max(0.0, float(os.getenv("RECORDING_PRUNE_INTERVAL_HOURS", "24")))
     # Transcription of recorded chunks with Groq Whisper (ttsbot/recording/
     # worker.py); runs while recording is on and GROQ_API_KEY is set. The
     # limits are Groq's free plan; results stay on disk next to the audio.

@@ -8,10 +8,10 @@ The worker waits whenever ``AudioBudget`` says the next file would go
 over Groq's limits, and rebuilds the session transcript after each
 result and once more when the session has ended.
 
-As it starts (once, not periodically) it also applies the retention
-limits: ``keep_audio_days`` deletes the Ogg files of transcribed chunks
-older than that, ``keep_transcript_days`` deletes whole finished
-sessions older than that; 0 keeps everything.
+It also applies the retention limits as it starts and then every
+``prune_seconds`` (0: only at start): ``keep_audio_days`` deletes the Ogg
+files of transcribed chunks older than that, ``keep_transcript_days``
+deletes whole finished sessions older than that; 0 keeps everything.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import datetime as dt
 import contextlib
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -55,7 +56,8 @@ class TranscriptionWorker:
                  name_for: Callable[[int, int], Awaitable[str | None]], tz: dt.tzinfo,
                  scan_seconds: float = 30.0, max_attempts: int = 3,
                  ready: Callable[[], Awaitable] | None = None,
-                 keep_audio_days: int = 0, keep_transcript_days: int = 0) -> None:
+                 keep_audio_days: int = 0, keep_transcript_days: int = 0,
+                 prune_seconds: float = 86400.0) -> None:
         self.root = root
         self.transcriber = transcriber
         self.budget = budget
@@ -66,6 +68,8 @@ class TranscriptionWorker:
         self._ready = ready
         self.keep_audio_days = keep_audio_days
         self.keep_transcript_days = keep_transcript_days
+        self.prune_seconds = prune_seconds
+        self._next_prune = math.inf  # time.monotonic() of the next sweep; run() arms it
         self._finished: set[Path] = set()  # ended sessions with nothing left to do
         self._waiting_logged: str | None = None
 
@@ -77,10 +81,7 @@ class TranscriptionWorker:
             self.root, self.transcriber.model, self.budget.per_hour, self.budget.per_day,
             self.budget.used(86400),
         )
-        try:
-            await asyncio.to_thread(self.prune)
-        except Exception:
-            log.exception("Recording retention sweep failed")
+        await self._sweep()
         while True:
             try:
                 delay = await self.step()
@@ -98,6 +99,8 @@ class TranscriptionWorker:
         for session in ended:
             await self.rebuild(session)
             self._finished.add(session)
+        if time.monotonic() >= self._next_prune:
+            await self._sweep()
         if not pending:
             return self.scan_seconds
         chunk = pending[0]
@@ -135,6 +138,14 @@ class TranscriptionWorker:
                 ended.append(session)
         pending.sort(key=lambda chunk: chunk.entry["started_at"])
         return pending, ended
+
+    async def _sweep(self) -> None:
+        """One retention sweep, off the event loop; schedules the next one."""
+        self._next_prune = time.monotonic() + self.prune_seconds if self.prune_seconds > 0 else math.inf
+        try:
+            await asyncio.to_thread(self.prune)
+        except Exception:
+            log.exception("Recording retention sweep failed")
 
     def prune(self, now: float | None = None) -> None:
         """Apply both retention limits: old sessions first, then old audio."""
