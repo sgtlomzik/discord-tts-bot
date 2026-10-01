@@ -333,24 +333,152 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.prune_audio(now=later)[0], 1)
         self.assertEqual(worker.prune_audio(now=later), (0, 0))
 
-    async def test_step_prunes_through_the_worker_loop(self):
-        rec = self.record_session()
-        # prune_seconds=0: sweep on every step; the real time is far past the 1970 chunk.
-        worker = self.worker(FakeTranscriber([groq_json((0, 1, "слово"))]), keep_audio_days=90, prune_seconds=0)
-        await worker.step()  # transcribes (audio was still untranscribed during this step's sweep)
-        self.assertTrue((rec.path / "5" / "0001.ogg").exists())
-        await worker.step()
-        self.assertFalse((rec.path / "5" / "0001.ogg").exists())
-        self.assertTrue((rec.path / "5" / "0001.json").exists())
+    # -- when the sweep runs: once, as the worker starts --
 
-    async def test_sweep_runs_at_most_once_per_interval(self):
+    async def run_until(self, worker, condition, timeout=3.0):
+        """Run the worker's loop until ``condition()`` holds (or the timeout), then stop it."""
+        task = asyncio.create_task(worker.run())
+        deadline = time.monotonic() + timeout
+        while not condition() and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def test_step_never_prunes(self):
         self.record_session()
-        worker = self.worker(FakeTranscriber([groq_json((0, 1, "слово"))]), keep_audio_days=90)
+        worker = self.worker(FakeTranscriber([groq_json((0, 1, "слово"))]),
+                             keep_audio_days=90, keep_transcript_days=30)
         calls = []
-        worker.prune_audio = lambda now=None: calls.append(now) or (0, 0)
-        await worker.step()
-        await worker.step()
+        for name in ("prune", "prune_audio", "prune_transcripts"):
+            setattr(worker, name, lambda *a, _name=name, **kw: calls.append(_name) or (0, 0))
+        for _ in range(3):  # transcribe, rebuild the transcript, idle
+            await worker.step()
+        self.assertEqual(calls, [])
+
+    async def test_run_prunes_audio_at_startup(self):
+        rec, worker = await self.transcribed_session(keep_audio_days=90)
+        await self.run_until(worker, lambda: not self.ogg.exists())
+        self.assertFalse(self.ogg.exists())
+        self.assertTrue((rec.path / "5" / "0001.json").exists())
+        self.assertTrue((rec.path / "transcript.md").exists())
+
+    async def test_run_prunes_transcripts_at_startup(self):
+        old = self.make_session("20260101-000000Z-2", ended_at=1000.0, chunks=[("5/0001.ogg", True)])
+        worker = self.worker(FakeTranscriber([]), keep_transcript_days=30)
+        await self.run_until(worker, lambda: not old.exists())
+        self.assertFalse(old.exists())
+
+    async def test_run_prunes_only_once(self):
+        old = self.make_session("20260101-000000Z-2", ended_at=1000.0, chunks=[("5/0001.ogg", True)])
+        worker = self.worker(FakeTranscriber([]), keep_transcript_days=30, keep_audio_days=90)
+        calls = []
+        worker.prune = lambda now=None: calls.append(now)
+        task = asyncio.create_task(worker.run())
+        await asyncio.sleep(0.3)  # several scan loops would pass if it ran on each
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         self.assertEqual(len(calls), 1)
+        self.assertTrue(old.exists())  # the stubbed prune deleted nothing
+
+    # -- transcript retention: a whole old session folder goes --
+
+    def make_session(self, name, ended_at, chunks=(), guild="1", error_attempts=None):
+        """A finished session folder; ``chunks`` is [(file, transcribed)]."""
+        session = self.root / guild / name
+        session.mkdir(parents=True)
+        (session / "session.json").write_text(json.dumps(
+            {"guild_id": int(guild), "channel_id": 2, "started_at": 1000.0, "ended_at": ended_at}))
+        (session / "transcript.md").write_text("[10:00:00] Аня: привет\n", encoding="utf-8")
+        manifest = []
+        for file, transcribed in chunks:
+            (session / file).parent.mkdir(exist_ok=True)
+            (session / file).write_bytes(b"OggS" + bytes(500))
+            if transcribed:
+                (session / file).with_suffix(".json").write_text(json.dumps({"segments": []}))
+            elif error_attempts is not None:
+                (session / file).with_suffix(".error.json").write_text(json.dumps({"attempts": error_attempts}))
+            manifest.append(json.dumps({"user_id": 5, "file": file, "started_at": 1000.0, "ended_at": 1002.0,
+                                        "audio_seconds": 2.0, "pieces": [[0.0, 1000.0]], "reason": "idle"}))
+        (session / "chunks.jsonl").write_text("".join(line + "\n" for line in manifest))
+        return session
+
+    async def test_old_session_is_deleted_whole(self):
+        old = self.make_session("20260101-000000Z-2", ended_at=1000.0, chunks=[("5/0001.ogg", True)])
+        worker = self.worker(FakeTranscriber([]), keep_transcript_days=30)
+        sessions, freed = worker.prune_transcripts(now=1000.0 + 31 * DAY)
+        self.assertEqual(sessions, 1)
+        self.assertGreater(freed, 500)
+        self.assertFalse(old.exists())
+        self.assertFalse(old.parent.exists())  # the guild folder it emptied goes too
+
+    async def test_session_younger_than_the_limit_is_kept(self):
+        old = self.make_session("20260101-000000Z-2", ended_at=1000.0, chunks=[("5/0001.ogg", True)])
+        worker = self.worker(FakeTranscriber([]), keep_transcript_days=30)
+        self.assertEqual(worker.prune_transcripts(now=1000.0 + 29 * DAY), (0, 0))
+        self.assertTrue((old / "transcript.md").exists())
+
+    async def test_only_old_sessions_go(self):
+        old = self.make_session("20260101-000000Z-2", ended_at=1000.0)
+        new = self.make_session("20260131-000000Z-2", ended_at=1000.0 + 30 * DAY)
+        worker = self.worker(FakeTranscriber([]), keep_transcript_days=30)
+        self.assertEqual(worker.prune_transcripts(now=1000.0 + 31 * DAY)[0], 1)
+        self.assertFalse(old.exists())
+        self.assertTrue((new / "transcript.md").exists())
+
+    async def test_session_with_a_chunk_still_to_transcribe_is_kept(self):
+        old = self.make_session("20260101-000000Z-2", ended_at=1000.0,
+                                chunks=[("5/0001.ogg", True), ("5/0002.ogg", False)])
+        worker = self.worker(FakeTranscriber([]), keep_transcript_days=30)
+        self.assertEqual(worker.prune_transcripts(now=1000.0 + 400 * DAY), (0, 0))
+        self.assertTrue((old / "5" / "0002.ogg").exists())
+
+    async def test_chunk_given_up_on_does_not_keep_the_session(self):
+        old = self.make_session("20260101-000000Z-2", ended_at=1000.0,
+                                chunks=[("5/0001.ogg", False)], error_attempts=3)
+        worker = self.worker(FakeTranscriber([]), keep_transcript_days=30)
+        self.assertEqual(worker.prune_transcripts(now=1000.0 + 31 * DAY)[0], 1)
+        self.assertFalse(old.exists())
+
+    async def test_unfinished_session_is_kept(self):
+        old = self.make_session("20260101-000000Z-2", ended_at=None, chunks=[("5/0001.ogg", True)])
+        worker = self.worker(FakeTranscriber([]), keep_transcript_days=30)
+        self.assertEqual(worker.prune_transcripts(now=1000.0 + 400 * DAY), (0, 0))
+        self.assertTrue(old.exists())
+
+    async def test_active_session_transcript_is_kept(self):
+        old = self.make_session("20260101-000000Z-2", ended_at=1000.0)
+        recorder_module.ACTIVE_SESSIONS.add(old)
+        self.addCleanup(recorder_module.ACTIVE_SESSIONS.discard, old)
+        worker = self.worker(FakeTranscriber([]), keep_transcript_days=30)
+        self.assertEqual(worker.prune_transcripts(now=1000.0 + 400 * DAY), (0, 0))
+        self.assertTrue(old.exists())
+
+    async def test_zero_transcript_days_keeps_everything(self):
+        old = self.make_session("20260101-000000Z-2", ended_at=1000.0, chunks=[("5/0001.ogg", True)])
+        worker = self.worker(FakeTranscriber([]))  # default: keep forever
+        self.assertEqual(worker.keep_transcript_days, 0)
+        self.assertEqual(worker.prune_transcripts(now=1000.0 + 10_000 * DAY), (0, 0))
+        self.assertTrue(old.exists())
+
+    async def test_non_session_files_in_the_root_are_left_alone(self):
+        ledger = self.root / "groq_ledger.jsonl"
+        ledger.write_text("{}\n")
+        (self.root / "1").mkdir()
+        (self.root / "1" / "stray.txt").write_text("x")  # not a session folder
+        worker = self.worker(FakeTranscriber([]), keep_transcript_days=30)
+        worker.prune_transcripts(now=1000.0 + 400 * DAY)
+        self.assertTrue(ledger.exists())
+        self.assertTrue((self.root / "1" / "stray.txt").exists())
+
+    async def test_audio_and_transcripts_have_separate_limits(self):
+        session = self.make_session("20260101-000000Z-2", ended_at=1000.0, chunks=[("5/0001.ogg", True)])
+        worker = self.worker(FakeTranscriber([]), keep_audio_days=90, keep_transcript_days=365)
+        worker.prune(now=1000.0 + 100 * DAY)  # past the audio limit only
+        self.assertFalse((session / "5" / "0001.ogg").exists())
+        self.assertTrue((session / "transcript.md").exists())
+        self.assertTrue((session / "5" / "0001.json").exists())
+        worker.prune(now=1000.0 + 366 * DAY)  # past the transcript limit too
+        self.assertFalse(session.exists())
 
 
 class RecordingConfigTests(unittest.TestCase):
@@ -369,6 +497,22 @@ class RecordingConfigTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"RECORDING_AUDIO_KEEP_DAYS": raw}):
                 config.reload()
                 self.assertEqual(config.RECORDING_AUDIO_KEEP_DAYS, expected, raw)
+
+    def test_transcript_keep_days_defaults_to_forever(self):
+        from ttsbot import config
+        env = {k: v for k, v in os.environ.items() if k != "RECORDING_TRANSCRIPT_KEEP_DAYS"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            config.reload()
+            self.assertEqual(config.RECORDING_TRANSCRIPT_KEEP_DAYS, 0)
+        self.addCleanup(config.reload)
+
+    def test_transcript_keep_days_from_env_and_clamped(self):
+        from ttsbot import config
+        self.addCleanup(config.reload)
+        for raw, expected in (("365", 365), ("0", 0), ("-5", 0)):
+            with mock.patch.dict(os.environ, {"RECORDING_TRANSCRIPT_KEEP_DAYS": raw}):
+                config.reload()
+                self.assertEqual(config.RECORDING_TRANSCRIPT_KEEP_DAYS, expected, raw)
 
 
 class RecorderSidecarTests(unittest.TestCase):

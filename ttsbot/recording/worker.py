@@ -8,18 +8,21 @@ The worker waits whenever ``AudioBudget`` says the next file would go
 over Groq's limits, and rebuilds the session transcript after each
 result and once more when the session has ended.
 
-With ``keep_audio_days`` set it also deletes, at most once per
-``prune_seconds``, the Ogg files of transcribed chunks older than that;
-the transcripts stay.
+As it starts (once, not periodically) it also applies the retention
+limits: ``keep_audio_days`` deletes the Ogg files of transcribed chunks
+older than that, ``keep_transcript_days`` deletes whole finished
+sessions older than that; 0 keeps everything.
 """
 
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import contextlib
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass
@@ -52,7 +55,7 @@ class TranscriptionWorker:
                  name_for: Callable[[int, int], Awaitable[str | None]], tz: dt.tzinfo,
                  scan_seconds: float = 30.0, max_attempts: int = 3,
                  ready: Callable[[], Awaitable] | None = None,
-                 keep_audio_days: int = 0, prune_seconds: float = 3600.0) -> None:
+                 keep_audio_days: int = 0, keep_transcript_days: int = 0) -> None:
         self.root = root
         self.transcriber = transcriber
         self.budget = budget
@@ -62,8 +65,7 @@ class TranscriptionWorker:
         self.max_attempts = max_attempts
         self._ready = ready
         self.keep_audio_days = keep_audio_days
-        self.prune_seconds = prune_seconds
-        self._next_prune = 0.0  # time.monotonic() of the next audio sweep
+        self.keep_transcript_days = keep_transcript_days
         self._finished: set[Path] = set()  # ended sessions with nothing left to do
         self._waiting_logged: str | None = None
 
@@ -75,6 +77,10 @@ class TranscriptionWorker:
             self.root, self.transcriber.model, self.budget.per_hour, self.budget.per_day,
             self.budget.used(86400),
         )
+        try:
+            await asyncio.to_thread(self.prune)
+        except Exception:
+            log.exception("Recording retention sweep failed")
         while True:
             try:
                 delay = await self.step()
@@ -92,7 +98,6 @@ class TranscriptionWorker:
         for session in ended:
             await self.rebuild(session)
             self._finished.add(session)
-        await self._maybe_prune()
         if not pending:
             return self.scan_seconds
         chunk = pending[0]
@@ -131,11 +136,48 @@ class TranscriptionWorker:
         pending.sort(key=lambda chunk: chunk.entry["started_at"])
         return pending, ended
 
-    async def _maybe_prune(self) -> None:
-        if self.keep_audio_days <= 0 or time.monotonic() < self._next_prune:
-            return
-        self._next_prune = time.monotonic() + self.prune_seconds
-        await asyncio.to_thread(self.prune_audio)
+    def prune(self, now: float | None = None) -> None:
+        """Apply both retention limits: old sessions first, then old audio."""
+        self.prune_transcripts(now)
+        self.prune_audio(now)
+
+    def prune_transcripts(self, now: float | None = None) -> tuple[int, int]:
+        """Delete finished sessions older than ``keep_transcript_days``; return (sessions, bytes).
+
+        The whole session folder goes (results, transcripts and any audio
+        left). A session is kept while it is being recorded, has not ended,
+        or still has a chunk waiting for transcription.
+        """
+        if self.keep_transcript_days <= 0:
+            return 0, 0
+        cutoff = (time.time() if now is None else now) - self.keep_transcript_days * 86400
+        sessions = freed = 0
+        for session in sorted(self.root.glob("*/*/")):
+            if session in recorder.ACTIVE_SESSIONS:
+                continue
+            try:
+                info = json.loads((session / "session.json").read_text(encoding="utf-8"))
+                ended = info.get("ended_at")
+                if ended is None or ended >= cutoff:
+                    continue
+                if any(self._needs_work(session, entry) for entry in self._entries(session)):
+                    continue
+                size = sum(path.stat().st_size for path in session.rglob("*") if path.is_file())
+                shutil.rmtree(session)
+            except FileNotFoundError:
+                continue  # not a session folder
+            except (OSError, ValueError, KeyError):
+                log.exception("Transcript pruning failed session=%s", session.name)
+                continue
+            self._finished.discard(session)
+            sessions += 1
+            freed += size
+            with contextlib.suppress(OSError):
+                session.parent.rmdir()  # the guild folder, once it is empty
+        if sessions:
+            log.info("Recording sessions pruned sessions=%d freed_mb=%.1f keep_days=%d",
+                     sessions, freed / 1_048_576, self.keep_transcript_days)
+        return sessions, freed
 
     def prune_audio(self, now: float | None = None) -> tuple[int, int]:
         """Delete Ogg files older than ``keep_audio_days``; return (files, bytes).

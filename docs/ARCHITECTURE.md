@@ -494,15 +494,28 @@ started`, `Transcription done ... audio_s= took= groq_remaining_s=
 day_used_s= pending=`, `Transcription waiting for Groq budget`,
 `Transcription failed, retry in` and `Transcription rejected`.
 
-Audio retention: the same worker deletes, once an hour (and at start),
-the Ogg file of every chunk older than `RECORDING_AUDIO_KEEP_DAYS`
-(default 90; 0 keeps everything). Age is the chunk's `ended_at` in
-`chunks.jsonl`. A file goes only when its `NNNN.json` exists, so audio
-that was never transcribed (Groq rejected it, STT was off) is kept, and
-sessions still being recorded are skipped. `NNNN.json`, `chunks.jsonl`,
-`transcript.*` stay; the log line is `Recording audio pruned files=
-freed_mb= keep_days=`. Because it runs inside the worker, nothing is
-pruned while `GROQ_API_KEY` is unset or `STT_ENABLED=0`.
+Retention: the worker applies two independent limits once, as it
+starts (i.e. on a bot restart; there is no periodic sweep), transcripts
+first, then audio. 0 turns a limit off.
+
+- `RECORDING_AUDIO_KEEP_DAYS` (default 90) deletes the Ogg file of every
+  chunk older than that; age is the chunk's `ended_at` in `chunks.jsonl`.
+  A file goes only when its `NNNN.json` exists, so audio that was never
+  transcribed (Groq rejected it, STT was off) is kept, and sessions still
+  being recorded are skipped. `NNNN.json`, `chunks.jsonl` and
+  `transcript.*` stay. Log line: `Recording audio pruned files=
+  freed_mb= keep_days=`.
+- `RECORDING_TRANSCRIPT_KEEP_DAYS` (default 0, keep forever) deletes the
+  whole folder of a finished session older than that (`session.json`
+  `ended_at`): transcripts, results, manifest and any audio still in it,
+  so it also overrides the audio limit. It skips sessions being recorded,
+  not yet ended, or with a chunk still waiting for transcription (one
+  given up on after 3 tries does not count), and removes a guild folder
+  it empties. Log line: `Recording sessions pruned sessions= freed_mb=
+  keep_days=`.
+
+Both run inside the worker, so nothing is pruned while `GROQ_API_KEY` is
+unset or `STT_ENABLED=0`.
 
 ## 10. Persistence and Guild State
 
@@ -570,8 +583,8 @@ Main groups:
 - selective hold settings;
 - Piper model path and tuning;
 - voice recording and transcription (`RECORDING_*`, `STT_*`,
-  `TRANSCRIPT_TIMEZONE`), including `RECORDING_AUDIO_KEEP_DAYS` for how long
-  transcribed audio is kept.
+  `TRANSCRIPT_TIMEZONE`), including `RECORDING_AUDIO_KEEP_DAYS` and
+  `RECORDING_TRANSCRIPT_KEEP_DAYS` for how long audio and transcripts are kept.
 
 The important current engine-specific values are:
 
