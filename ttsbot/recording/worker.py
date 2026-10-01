@@ -7,6 +7,10 @@ restarts. A chunk Groq rejects for good (a 4xx other than 429) gets an
 The worker waits whenever ``AudioBudget`` says the next file would go
 over Groq's limits, and rebuilds the session transcript after each
 result and once more when the session has ended.
+
+With ``keep_audio_days`` set it also deletes, at most once per
+``prune_seconds``, the Ogg files of transcribed chunks older than that;
+the transcripts stay.
 """
 
 from __future__ import annotations
@@ -47,7 +51,8 @@ class TranscriptionWorker:
     def __init__(self, root: Path, transcriber: GroqTranscriber, budget: AudioBudget, *,
                  name_for: Callable[[int, int], Awaitable[str | None]], tz: dt.tzinfo,
                  scan_seconds: float = 30.0, max_attempts: int = 3,
-                 ready: Callable[[], Awaitable] | None = None) -> None:
+                 ready: Callable[[], Awaitable] | None = None,
+                 keep_audio_days: int = 0, prune_seconds: float = 3600.0) -> None:
         self.root = root
         self.transcriber = transcriber
         self.budget = budget
@@ -56,6 +61,9 @@ class TranscriptionWorker:
         self.scan_seconds = scan_seconds
         self.max_attempts = max_attempts
         self._ready = ready
+        self.keep_audio_days = keep_audio_days
+        self.prune_seconds = prune_seconds
+        self._next_prune = 0.0  # time.monotonic() of the next audio sweep
         self._finished: set[Path] = set()  # ended sessions with nothing left to do
         self._waiting_logged: str | None = None
 
@@ -84,6 +92,7 @@ class TranscriptionWorker:
         for session in ended:
             await self.rebuild(session)
             self._finished.add(session)
+        await self._maybe_prune()
         if not pending:
             return self.scan_seconds
         chunk = pending[0]
@@ -121,6 +130,53 @@ class TranscriptionWorker:
                 ended.append(session)
         pending.sort(key=lambda chunk: chunk.entry["started_at"])
         return pending, ended
+
+    async def _maybe_prune(self) -> None:
+        if self.keep_audio_days <= 0 or time.monotonic() < self._next_prune:
+            return
+        self._next_prune = time.monotonic() + self.prune_seconds
+        await asyncio.to_thread(self.prune_audio)
+
+    def prune_audio(self, now: float | None = None) -> tuple[int, int]:
+        """Delete Ogg files older than ``keep_audio_days``; return (files, bytes).
+
+        Only a chunk whose result ``NNNN.json`` exists goes (the audio of an
+        untranscribed chunk is the only copy of that speech), and never one
+        of a session still being recorded. Results, manifest and transcripts
+        are kept.
+        """
+        if self.keep_audio_days <= 0:
+            return 0, 0
+        cutoff = (time.time() if now is None else now) - self.keep_audio_days * 86400
+        files = freed = 0
+        for session in sorted(self.root.glob("*/*/")):
+            if session in recorder.ACTIVE_SESSIONS or not (session / "session.json").exists():
+                continue
+            try:
+                entries = self._entries(session)
+            except (OSError, ValueError):
+                log.exception("Audio pruning could not read the manifest session=%s", session.name)
+                continue
+            for entry in entries:
+                ended = entry.get("ended_at", entry["started_at"] + entry.get("audio_seconds", 0.0))
+                if ended >= cutoff or not result_path(session, entry["file"]).exists():
+                    continue
+                audio = session / entry["file"]
+                try:
+                    size = audio.stat().st_size
+                    audio.unlink()
+                except FileNotFoundError:
+                    continue  # deleted by an earlier sweep
+                except OSError:
+                    log.exception("Audio pruning failed file=%s/%s", session.name, entry["file"])
+                    continue
+                recorder.pieces_path(audio).unlink(missing_ok=True)
+                files += 1
+                freed += size
+        if files:
+            log.info("Recording audio pruned files=%d freed_mb=%.1f keep_days=%d",
+                     files, freed / 1_048_576, self.keep_audio_days)
+        return files, freed
 
     @staticmethod
     def _entries(session: Path) -> list[dict]:

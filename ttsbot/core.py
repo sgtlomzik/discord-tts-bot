@@ -258,7 +258,8 @@ class TTSBot(
             log.warning("Unknown TRANSCRIPT_TIMEZONE=%s; using UTC", config.TRANSCRIPT_TIMEZONE)
             tz = zoneinfo.ZoneInfo("UTC")
         return TranscriptionWorker(config.RECORDING_DIR, self.transcriber, budget,
-                                   name_for=self.member_display_name, tz=tz, ready=self.wait_until_ready)
+                                   name_for=self.member_display_name, tz=tz, ready=self.wait_until_ready,
+                                   keep_audio_days=config.RECORDING_AUDIO_KEEP_DAYS)
 
     async def member_display_name(self, guild_id: int, user_id: int) -> str | None:
         """Server nickname or global name, from the cache or Discord's API

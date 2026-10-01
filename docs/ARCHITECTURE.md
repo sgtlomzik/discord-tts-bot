@@ -494,6 +494,16 @@ started`, `Transcription done ... audio_s= took= groq_remaining_s=
 day_used_s= pending=`, `Transcription waiting for Groq budget`,
 `Transcription failed, retry in` and `Transcription rejected`.
 
+Audio retention: the same worker deletes, once an hour (and at start),
+the Ogg file of every chunk older than `RECORDING_AUDIO_KEEP_DAYS`
+(default 90; 0 keeps everything). Age is the chunk's `ended_at` in
+`chunks.jsonl`. A file goes only when its `NNNN.json` exists, so audio
+that was never transcribed (Groq rejected it, STT was off) is kept, and
+sessions still being recorded are skipped. `NNNN.json`, `chunks.jsonl`,
+`transcript.*` stay; the log line is `Recording audio pruned files=
+freed_mb= keep_days=`. Because it runs inside the worker, nothing is
+pruned while `GROQ_API_KEY` is unset or `STT_ENABLED=0`.
+
 ## 10. Persistence and Guild State
 
 Persistent bot settings live in `data/config.json` and are managed by `BotConfigStore`.
@@ -558,7 +568,10 @@ Main groups:
 - idle disconnect timings;
 - merge policy;
 - selective hold settings;
-- Piper model path and tuning.
+- Piper model path and tuning;
+- voice recording and transcription (`RECORDING_*`, `STT_*`,
+  `TRANSCRIPT_TIMEZONE`), including `RECORDING_AUDIO_KEEP_DAYS` for how long
+  transcribed audio is kept.
 
 The important current engine-specific values are:
 

@@ -3,11 +3,13 @@
 import asyncio
 import datetime as dt
 import json
+import os
 import shutil
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 
@@ -20,6 +22,8 @@ from ttsbot.recording.worker import TranscriptionWorker, error_path
 
 FRAME = b"\xfc" + bytes(40)
 UTC = dt.timezone.utc
+DAY = 86400
+CHUNK_END = 1005.0 + 2.0  # the recorded test chunk ends about here (a 1970 timestamp)
 
 
 def groq_json(*segments):
@@ -275,6 +279,96 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         worker = self.worker(FakeTranscriber([]))
         self.assertEqual(worker.scan(), ([], []))
         self.assertIsNone(json.loads((rec.path / "session.json").read_text())["ended_at"])
+
+
+    # -- audio retention: old ogg files go once transcribed, text stays --
+
+    async def transcribed_session(self, **kw):
+        rec = self.record_session()
+        worker = self.worker(FakeTranscriber([groq_json((0, 1, "слово"))]), **kw)
+        await worker.step()
+        self.ogg = rec.path / "5" / "0001.ogg"
+        self.assertTrue((rec.path / "5" / "0001.json").exists())
+        self.assertTrue(self.ogg.exists())
+        return rec, worker
+
+    async def test_old_transcribed_audio_is_deleted_and_text_kept(self):
+        rec, worker = await self.transcribed_session(keep_audio_days=90)
+        size = self.ogg.stat().st_size
+        sidecar = pieces_path(self.ogg)
+        sidecar.write_text("[0.0, 1005.0]\n")
+        self.assertEqual(worker.prune_audio(now=CHUNK_END + 91 * DAY), (1, size))
+        self.assertFalse(self.ogg.exists())
+        self.assertFalse(sidecar.exists())
+        for kept in ("5/0001.json", "chunks.jsonl", "session.json", "transcript.md"):
+            self.assertTrue((rec.path / kept).exists(), kept)
+        self.assertIn("слово", (rec.path / "transcript.md").read_text(encoding="utf-8"))
+
+    async def test_audio_younger_than_the_limit_is_kept(self):
+        _, worker = await self.transcribed_session(keep_audio_days=90)
+        self.assertEqual(worker.prune_audio(now=CHUNK_END + 89 * DAY), (0, 0))
+        self.assertTrue(self.ogg.exists())
+
+    async def test_untranscribed_audio_is_never_deleted(self):
+        rec = self.record_session()
+        worker = self.worker(FakeTranscriber([]), keep_audio_days=90)
+        self.assertEqual(worker.prune_audio(now=CHUNK_END + 400 * DAY), (0, 0))
+        self.assertTrue((rec.path / "5" / "0001.ogg").exists())
+
+    async def test_active_session_is_not_pruned(self):
+        rec, worker = await self.transcribed_session(keep_audio_days=90)
+        recorder_module.ACTIVE_SESSIONS.add(rec.path)
+        self.addCleanup(recorder_module.ACTIVE_SESSIONS.discard, rec.path)
+        self.assertEqual(worker.prune_audio(now=CHUNK_END + 400 * DAY), (0, 0))
+        self.assertTrue(self.ogg.exists())
+
+    async def test_zero_days_keeps_audio_forever(self):
+        _, worker = await self.transcribed_session(keep_audio_days=0)
+        self.assertEqual(worker.prune_audio(now=CHUNK_END + 10_000 * DAY), (0, 0))
+        self.assertTrue(self.ogg.exists())
+
+    async def test_already_deleted_audio_is_skipped(self):
+        _, worker = await self.transcribed_session(keep_audio_days=90)
+        later = CHUNK_END + 91 * DAY
+        self.assertEqual(worker.prune_audio(now=later)[0], 1)
+        self.assertEqual(worker.prune_audio(now=later), (0, 0))
+
+    async def test_step_prunes_through_the_worker_loop(self):
+        rec = self.record_session()
+        # prune_seconds=0: sweep on every step; the real time is far past the 1970 chunk.
+        worker = self.worker(FakeTranscriber([groq_json((0, 1, "слово"))]), keep_audio_days=90, prune_seconds=0)
+        await worker.step()  # transcribes (audio was still untranscribed during this step's sweep)
+        self.assertTrue((rec.path / "5" / "0001.ogg").exists())
+        await worker.step()
+        self.assertFalse((rec.path / "5" / "0001.ogg").exists())
+        self.assertTrue((rec.path / "5" / "0001.json").exists())
+
+    async def test_sweep_runs_at_most_once_per_interval(self):
+        self.record_session()
+        worker = self.worker(FakeTranscriber([groq_json((0, 1, "слово"))]), keep_audio_days=90)
+        calls = []
+        worker.prune_audio = lambda now=None: calls.append(now) or (0, 0)
+        await worker.step()
+        await worker.step()
+        self.assertEqual(len(calls), 1)
+
+
+class RecordingConfigTests(unittest.TestCase):
+    def test_audio_keep_days_defaults_to_three_months(self):
+        from ttsbot import config
+        env = {k: v for k, v in os.environ.items() if k != "RECORDING_AUDIO_KEEP_DAYS"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            config.reload()
+            self.assertEqual(config.RECORDING_AUDIO_KEEP_DAYS, 90)
+        self.addCleanup(config.reload)
+
+    def test_audio_keep_days_from_env_and_clamped(self):
+        from ttsbot import config
+        self.addCleanup(config.reload)
+        for raw, expected in (("30", 30), ("0", 0), ("-5", 0)):
+            with mock.patch.dict(os.environ, {"RECORDING_AUDIO_KEEP_DAYS": raw}):
+                config.reload()
+                self.assertEqual(config.RECORDING_AUDIO_KEEP_DAYS, expected, raw)
 
 
 class RecorderSidecarTests(unittest.TestCase):
