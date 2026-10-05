@@ -19,9 +19,9 @@ from pathlib import Path
 
 from aiohttp import web
 
-from ttsbot.archive.media import BuildFailed, MediaCache
+from ttsbot.archive.media import BuildFailed, MediaCache, TooBusy
 from ttsbot.archive.retention import RetentionPolicy
-from ttsbot.archive.service import API_PREFIX, ArchiveService, AudioUnavailable
+from ttsbot.archive.service import API_PREFIX, ArchiveService, AudioUnavailable, SessionRecording
 from ttsbot.archive.store import RecordingStore, SessionNotFound
 
 log = logging.getLogger("tts_web")
@@ -55,8 +55,12 @@ async def errors_middleware(request: web.Request, handler) -> web.StreamResponse
         return _error(404, "session_not_found", "No such session")
     except AudioUnavailable:
         return _error(404, "audio_unavailable", "This session has no audio left")
-    except BuildFailed as exc:
-        return _error(503, "audio_build_failed", str(exc), {"Retry-After": "300"})
+    except BuildFailed:  # details are in the log, not for clients
+        return _error(503, "audio_build_failed", "The audio could not be prepared", {"Retry-After": "300"})
+    except TooBusy:
+        return _error(503, "busy", "Too many audio files are being prepared", {"Retry-After": "30"})
+    except SessionRecording:
+        return _error(409, "session_recording", "Available once the recording has ended")
     except web.HTTPException as exc:
         if not request.path.startswith("/api/") or exc.status < 400:
             raise
@@ -100,7 +104,7 @@ def cors_middleware(origins: tuple[str, ...]):
     @web.middleware
     async def middleware(request: web.Request, handler) -> web.StreamResponse:
         origin = request.headers.get("Origin", "").rstrip("/")
-        allowed = origin and ("*" in origins or origin in origins) and request.path.startswith("/api/")
+        allowed = origin and origin in origins and request.path.startswith("/api/")
         if allowed and request.method == "OPTIONS":
             response: web.StreamResponse = web.Response(status=204)
         else:
@@ -191,8 +195,11 @@ async def session(request: web.Request) -> web.Response:
 
 
 async def audio(request: web.Request) -> web.StreamResponse:
-    path = await request.app[SERVICE].audio_file(_session_id(request))
-    return _file(request, path, "audio/ogg", f"{request.match_info['session']}.ogg")
+    found = await request.app[SERVICE].audio_file(_session_id(request), request.query.get("v"))
+    # A versioned URL always gets the same bytes: cache it for good. The
+    # plain URL follows the latest mix, so the browser has to revalidate.
+    cache = "private, max-age=604800, immutable" if found.exact else "private, no-cache"
+    return _file(request, found.path, "audio/ogg", f"{request.match_info['session']}.ogg", cache)
 
 
 async def audio_mp3(request: web.Request) -> web.StreamResponse:
@@ -200,16 +207,16 @@ async def audio_mp3(request: web.Request) -> web.StreamResponse:
     if path is None:
         response = web.json_response({"status": "building"}, status=202, headers={"Retry-After": "10"})
         return response
-    return _file(request, path, "audio/mpeg", f"{request.match_info['session']}.mp3")
+    return _file(request, path, "audio/mpeg", f"{request.match_info['session']}.mp3", "private, no-cache")
 
 
 async def transcript_markdown(request: web.Request) -> web.StreamResponse:
     path = await request.app[SERVICE].transcript_markdown(_session_id(request))
-    return _file(request, path, "text/markdown; charset=utf-8", f"{request.match_info['session']}.md")
+    return _file(request, path, "text/markdown; charset=utf-8", f"{request.match_info['session']}.md", "no-store")
 
 
-def _file(request: web.Request, path: Path, content_type: str, filename: str) -> web.FileResponse:
-    headers = {"Content-Type": content_type, "Cache-Control": "private, max-age=3600"}
+def _file(request: web.Request, path: Path, content_type: str, filename: str, cache: str) -> web.FileResponse:
+    headers = {"Content-Type": content_type, "Cache-Control": cache}
     if request.query.get("download"):
         headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     return web.FileResponse(path, headers=headers)
@@ -302,7 +309,12 @@ def build_from_config() -> web.Application:
     cache = MediaCache(config.WEB_CACHE_DIR, max_bytes=config.WEB_CACHE_MAX_MB * 1_048_576)
     service = ArchiveService(RecordingStore(config.RECORDING_DIR), cache, RetentionPolicy.from_config(),
                              tz=tz, gap_ms=config.WEB_MIX_GAP_MS)
+    if "*" in config.WEB_CORS_ORIGINS:
+        raise SystemExit("WEB_CORS_ORIGINS=* would let any website read the recordings: list the origins")
     if not config.WEB_PASSWORD:
+        if not config.WEB_ALLOW_ANONYMOUS:
+            raise SystemExit("WEB_PASSWORD is empty: set it, or WEB_ALLOW_ANONYMOUS=1 if only trusted "
+                             "machines can reach the port")
         log.warning("WEB_PASSWORD is empty: anyone who can reach port %s can read the recordings", config.WEB_PORT)
     log.info("Recordings web root=%s cache=%s cache_max_mb=%d static=%s cors=%s",
              config.RECORDING_DIR, config.WEB_CACHE_DIR, config.WEB_CACHE_MAX_MB,

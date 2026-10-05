@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Callable
 
 from ttsbot.ogg_opus import UnsupportedOpusStream, opus_packet_samples
+from ttsbot.recording.fsutil import write_atomic
 from ttsbot.recording.ogg import OggOpusWriter
 from ttsbot.recording.vad import DetectorFactory, SpeechGate
 
@@ -115,7 +116,7 @@ class ChannelRecorder:
         names = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         if names.get(str(user_id)) != name:
             names[str(user_id)] = name
-            path.write_text(json.dumps(names, ensure_ascii=False, indent=1), encoding="utf-8")
+            write_atomic(path, json.dumps(names, ensure_ascii=False, indent=1))
 
     def note_text(self, user_id: int, text: str, wall: float | None = None) -> None:
         """Record text the bot spoke for ``user_id`` (TTS) at ``wall``."""
@@ -287,9 +288,7 @@ class ChannelRecorder:
             data["guild_name"] = self.guild_name
         if self.channel_name:
             data["channel_name"] = self.channel_name
-        tmp = self.path / "session.json.tmp"
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.path / "session.json")  # readers never see a half-written file
+        write_atomic(self.path / "session.json", json.dumps(data, indent=2))
 
     def _log_stats(self, final: bool = False) -> None:
         counters = dict(self.counters)
@@ -358,5 +357,5 @@ def recover_session(path: Path) -> int:
     if session.get("ended_at") is None:
         session["ended_at"] = round(last_mtime or session["started_at"], 3)
         session["recovered"] = True
-        session_file.write_text(json.dumps(session, indent=2), encoding="utf-8")
+        write_atomic(session_file, json.dumps(session, indent=2))
     return recovered

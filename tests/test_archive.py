@@ -10,9 +10,9 @@ import unittest
 from pathlib import Path
 
 from ttsbot.archive import mix as mixing
-from ttsbot.archive.media import BuildFailed, MediaCache
+from ttsbot.archive.media import BuildFailed, MediaCache, TooBusy, run_in_thread
 from ttsbot.archive.retention import DAY, RetentionPolicy
-from ttsbot.archive.service import ArchiveService, AudioUnavailable
+from ttsbot.archive.service import ArchiveService, AudioUnavailable, SessionRecording
 from ttsbot.archive.store import RecordingStore, SessionKey, SessionNotFound
 from ttsbot.ogg_opus import UnsupportedOpusStream
 from ttsbot.recording.ogg import OggOpusWriter, OggPacketIndex, ogg_crc
@@ -244,7 +244,16 @@ class MixTests(TempDirCase):
         self.assertEqual(heard(plan.position_in_file("5/0001.ogg", 1.6)), 2)  # "Я вернулся."
         self.assertEqual(plan.position_in_file("5/0001.ogg", 1.6), 2.6)
         self.assertEqual(heard(plan.position_in_file("6/0001.ogg", 0.2)), 3)
-        self.assertEqual(plan.position_in_file("5/0001.ogg", 1.2), 1.0)  # in the cut pause: end of piece
+        # In the pause the mix cut out (user 6 sits between the two pieces
+        # in the mix): a start goes to the speech after it, an end to the
+        # speech before it.
+        self.assertEqual(plan.position_in_file("5/0001.ogg", 1.2), 2.5)
+        self.assertEqual(plan.position_in_file("5/0001.ogg", 1.45), 2.5)
+        self.assertEqual(heard(plan.position_in_file("5/0001.ogg", 1.49)), 2)
+        self.assertEqual(plan.position_in_file("5/0001.ogg", 1.2, end=True), 1.0)
+        self.assertEqual(plan.span("5/0001.ogg", 0.0, 0.9), (0.0, 0.9))
+        self.assertEqual(plan.span("5/0001.ogg", 0.5, 1.3), (0.5, 1.0))
+        self.assertIsNone(plan.span("8/0001.ogg", 0.0, 1.0))
         self.assertIsNone(plan.position_in_file("8/0001.ogg", 0.0))
         self.assertEqual(plan.position_at(1005.2), 1.7)  # during C
         self.assertEqual(plan.position_at(1003.0), 1.5)  # silence: what was said next
@@ -311,7 +320,7 @@ class MediaCacheTests(TempDirCase):
     def setUp(self):
         super().setUp()
         self.now = 0.0
-        self.cache = MediaCache(self.dir / "cache", max_bytes=10_000, clock=lambda: self.now)
+        self.cache = MediaCache(self.dir / "cache", max_bytes=10_000, grace=0, clock=lambda: self.now)
         self.cache.setup()
         self.builds = 0
 
@@ -346,11 +355,83 @@ class MediaCacheTests(TempDirCase):
         await self.cache.ensure("1/s", "mix", "aaa", self.builder())
         self.assertEqual(self.builds, 2)
 
-    async def test_new_fingerprint_replaces_the_old_one(self):
+    async def test_old_fingerprint_goes_at_the_next_collect(self):
         old = await self.cache.ensure("1/s", "mix", "aaa", self.builder())
         new = await self.cache.ensure("1/s", "mix", "bbb", self.builder())
+        self.assertTrue(old.exists())  # a player may still be streaming it
+        self.assertEqual(self.cache.newest("1/s", "mix")[0], "bbb")
+        self.cache.collect({"1/s": {"mix-bbb"}})
         self.assertFalse(old.exists())
         self.assertTrue(new.exists())
+
+    async def test_recently_used_and_building_artifacts_are_spared(self):
+        cache = MediaCache(self.dir / "cache2", max_bytes=1, grace=600)
+        cache.setup()
+        used = await cache.ensure("1/s", "mix", "aaa", self.builder(4000))
+        self.assertTrue(used.exists())  # over the limit, but just used
+        cache.collect({})
+        self.assertTrue(used.exists())
+        os.utime(used, (1, 1))  # unused for long
+        started = asyncio.Event()
+        release = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def slow(folder):
+            loop.call_soon_threadsafe(started.set)
+            asyncio.run_coroutine_threadsafe(release.wait(), loop).result()
+            (folder / "file.bin").write_bytes(b"y")
+
+        building = asyncio.create_task(cache.ensure("1/s", "mix", "bbb", slow))
+        await started.wait()
+        cache.collect({})  # the scope is building: left alone
+        self.assertTrue(used.exists())
+        release.set()
+        await building
+        cache.collect({})
+        self.assertFalse(used.exists())
+
+    async def test_background_builds_are_capped(self):
+        cache = MediaCache(self.dir / "cache2", max_bytes=10**6, max_background=1)
+        release = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def slow(folder):
+            asyncio.run_coroutine_threadsafe(release.wait(), loop).result()
+
+        cache.ensure_in_background("1/s", "mp3", "aaa", slow)
+        cache.ensure_in_background("1/s", "mp3", "aaa", slow)  # the same one: fine
+        with self.assertRaises(TooBusy):
+            cache.ensure_in_background("1/t", "mp3", "aaa", slow)
+        self.assertTrue(cache.building("1/s", "mp3", "aaa"))
+        release.set()
+        await asyncio.gather(*cache._background.values())
+        self.assertIsNotNone(cache.peek("1/s", "mp3", "aaa"))
+
+    async def test_cancelled_caller_still_waits_for_its_thread(self):
+        done = []
+        release = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def work():
+            asyncio.run_coroutine_threadsafe(release.wait(), loop).result()
+            done.append(True)
+
+        lock = asyncio.Lock()
+
+        async def guarded():
+            async with lock:
+                await run_in_thread(work)
+
+        task = asyncio.create_task(guarded())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        self.assertTrue(lock.locked())  # the thread still runs: the lock is still held
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(done, [True])
+        self.assertFalse(lock.locked())
 
     async def test_collect_and_size_limit(self):
         a = await self.cache.ensure("1/a", "mix", "f1", self.builder(4000))
@@ -372,7 +453,8 @@ class MediaCacheTests(TempDirCase):
         self.assertFalse(tmp.exists())
 
     def test_artifact_names_are_validated(self):
-        for scope, kind, fp in [("1/../x", "mix", "a"), ("1", "mix", "a"), ("1/s", "../m", "a"), ("1/s", "mix", "")]:
+        for scope, kind, fp in [("1/../x", "mix", "a"), ("1", "mix", "a"), ("1/s", "../m", "a"), ("1/s", "mix", ""),
+                                ("1/s", "mix-peaks", "a"), ("1/s", "mix", "a-b")]:
             with self.assertRaises(ValueError):
                 self.cache.path(scope, kind, fp)
 
@@ -381,7 +463,7 @@ class ServiceTests(TempDirCase):
     def setUp(self):
         super().setUp()
         self.now = 1020.0 + DAY
-        self.cache = MediaCache(self.dir / "cache", max_bytes=10**8)
+        self.cache = MediaCache(self.dir / "cache", max_bytes=10**8, grace=0)
         self.cache.setup()
         self.service = ArchiveService(RecordingStore(self.root), self.cache,
                                       RetentionPolicy(audio_days=90), clock=lambda: self.now)
@@ -418,16 +500,20 @@ class ServiceTests(TempDirCase):
         doc = await self.service.session(f"{GUILD}/{NAME}")
         self.assertEqual(doc["audio"]["status"], "ready")
         self.assertEqual(doc["audio"]["duration"], 3.5)
-        rows = [(l["name"], l["kind"], l["text"], l["position"], l["exact"]) for l in doc["lines"]]
+        rows = [(l["name"], l["kind"], l["text"], l["position"], l["position_end"], l["exact"]) for l in doc["lines"]]
         self.assertEqual(rows, [
-            ("Аня", "voice", "Привет.", 0.0, True),
-            ("Боб", "voice", "Норм.", 1.6, True),
-            ("Вика", "tts", "го", 1.7, False),
-            ("Аня", "voice", "Я вернулся.", 2.6, True),
+            ("Аня", "voice", "Привет.", 0.0, 0.9, True),
+            ("Боб", "voice", "Норм.", 1.6, 1.9, True),
+            ("Вика", "tts", "го", 1.7, 1.7, False),
+            ("Аня", "voice", "Я вернулся.", 2.6, 3.4, True),
         ])
         self.assertEqual(doc["lines"][0]["user_id"], "5")
-        path = await self.service.audio_file(f"{GUILD}/{NAME}")
-        self.assertEqual(path.name, "mix.ogg")
+        version = doc["audio"]["version"]
+        self.assertTrue(doc["audio"]["url"].endswith(f"/audio?v={version}"))
+        found = await self.service.audio_file(f"{GUILD}/{NAME}", version)
+        self.assertEqual((found.path.name, found.exact), ("mix.ogg", True))
+        latest = await self.service.audio_file(f"{GUILD}/{NAME}", "0123abc")
+        self.assertEqual((latest.version, latest.exact), (version, False))
 
     async def test_document_follows_new_results(self):
         fx = SessionFixture(self.root, transcribe=False)
@@ -461,6 +547,26 @@ class ServiceTests(TempDirCase):
             doc = await self.service.session(f"{GUILD}/{NAME}")
         self.assertEqual(len(doc["lines"]), 4)
         self.assertEqual(doc["audio"]["status"], "none")  # nothing playable
+
+    async def test_live_session_reuses_a_fresh_mix(self):
+        fx = SessionFixture(self.root, ended=False)
+        sid = f"{GUILD}/{NAME}"
+        first = (await self.service.session(sid))["audio"]["version"]
+        write_ogg(fx.path / "6/0002.ogg", [(4, 10)])  # another file closes a minute later
+        entry = {"user_id": 6, "file": "6/0002.ogg", "started_at": 1015.0, "ended_at": 1015.2,
+                 "audio_seconds": 0.2, "pieces": [[0.0, 1015.0]]}
+        with (fx.path / "chunks.jsonl").open("a") as manifest:
+            manifest.write(json.dumps(entry) + "\n")
+        doc = await self.service.session(sid)
+        self.assertEqual(doc["audio"]["version"], first)  # not rebuilt for every page view
+        self.assertIsNone(doc["audio"]["mp3_url"])
+        with self.assertRaises(SessionRecording):
+            await self.service.mp3_file(sid)
+        info = json.loads((fx.path / "session.json").read_text(encoding="utf-8"))
+        (fx.path / "session.json").write_text(json.dumps({**info, "ended_at": 1020.0}), encoding="utf-8")
+        doc = await self.service.session(sid)
+        self.assertNotEqual(doc["audio"]["version"], first)  # ended: the full mix
+        self.assertEqual(doc["audio"]["duration"], 4.2)
 
     async def test_missing_session(self):
         with self.assertRaises(SessionNotFound):

@@ -45,6 +45,21 @@ def _flag(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() not in {"0", "false", "no"}
 
 
+def _number(name: str, default, kind, low=None, high=None):
+    """A numeric setting; a malformed one logs a warning and uses ``default``."""
+    raw = os.getenv(name, "").strip()
+    try:
+        value = kind(raw) if raw else default
+    except ValueError:
+        log.warning("Ignoring invalid %s=%r; using %s", name, raw, default)
+        value = default
+    if low is not None:
+        value = max(low, value)
+    if high is not None:
+        value = min(high, value)
+    return value
+
+
 def reload() -> None:
     """(Re)read every tunable from the environment into module globals."""
     global TMP_DIR, BOT_CONFIG_PATH, VOICES_REGISTRY_PATH, DEFAULT_VOICE_PROFILE
@@ -82,7 +97,7 @@ def reload() -> None:
     global STT_REQUESTS_PER_MINUTE, TRANSCRIPT_TIMEZONE
     global WEB_HOST, WEB_PORT, WEB_CACHE_DIR, WEB_CACHE_MAX_MB, WEB_STATIC_DIR
     global WEB_USERNAME, WEB_PASSWORD, WEB_CORS_ORIGINS, WEB_MIX_GAP_MS
-    global WEB_MAINTENANCE_SECONDS, WEB_PREBUILD_RECENT
+    global WEB_MAINTENANCE_SECONDS, WEB_PREBUILD_RECENT, WEB_ALLOW_ANONYMOUS
 
     TMP_DIR = Path(os.getenv("TTS_TMP_DIR", "/dev/shm"))
     BOT_CONFIG_PATH = Path(os.getenv("BOT_CONFIG_PATH", "/app/data/config.json"))
@@ -243,19 +258,22 @@ def reload() -> None:
     # separate process that only reads RECORDING_DIR. Derived audio (the
     # joined session mix, MP3) is cached in WEB_CACHE_DIR, least recently
     # used first out over WEB_CACHE_MAX_MB. WEB_PASSWORD turns on HTTP
-    # Basic auth; WEB_CORS_ORIGINS (comma-separated) lets a frontend dev
-    # server on another origin call the API.
+    # Basic auth (required unless WEB_ALLOW_ANONYMOUS=1); WEB_CORS_ORIGINS
+    # (comma-separated) lets a frontend dev server on another origin call
+    # the API. The bot shares this module but never uses these, so a bad
+    # value only logs a warning and falls back to the default.
     WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0").strip() or "0.0.0.0"
-    WEB_PORT = int(os.getenv("WEB_PORT", "8095"))
+    WEB_PORT = _number("WEB_PORT", 8095, int, 1, 65535)
     WEB_CACHE_DIR = Path(os.getenv("WEB_CACHE_DIR", "/app/cache"))
-    WEB_CACHE_MAX_MB = max(64, int(os.getenv("WEB_CACHE_MAX_MB", "2048")))
+    WEB_CACHE_MAX_MB = _number("WEB_CACHE_MAX_MB", 2048, int, 64)
     WEB_STATIC_DIR = os.getenv("WEB_STATIC_DIR", "").strip()
     WEB_USERNAME = os.getenv("WEB_USERNAME", "").strip()
     WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
+    WEB_ALLOW_ANONYMOUS = _flag("WEB_ALLOW_ANONYMOUS", "0")
     WEB_CORS_ORIGINS = tuple(o.strip().rstrip("/") for o in os.getenv("WEB_CORS_ORIGINS", "").split(",") if o.strip())
-    WEB_MIX_GAP_MS = min(5000, max(0, int(os.getenv("WEB_MIX_GAP_MS", "500"))))
-    WEB_MAINTENANCE_SECONDS = max(30.0, float(os.getenv("WEB_MAINTENANCE_SECONDS", "300")))
-    WEB_PREBUILD_RECENT = max(0, int(os.getenv("WEB_PREBUILD_RECENT", "3")))
+    WEB_MIX_GAP_MS = _number("WEB_MIX_GAP_MS", 500, int, 0, 5000)
+    WEB_MAINTENANCE_SECONDS = _number("WEB_MAINTENANCE_SECONDS", 300.0, float, 30.0)
+    WEB_PREBUILD_RECENT = _number("WEB_PREBUILD_RECENT", 3, int, 0)
 
     VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
     # One knob for bare-metal runs: point PIPER_MODELS_DIR at ./models and

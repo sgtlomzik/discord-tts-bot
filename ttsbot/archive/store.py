@@ -26,7 +26,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ttsbot.recording.worker import MAX_ATTEMPTS
+from ttsbot.recording.transcript import MAX_ATTEMPTS
 
 log = logging.getLogger("tts_web")
 
@@ -191,7 +191,7 @@ class RecordingStore:
                     chunk.result = {**chunk.result, "segments": valid}
             error = audio.with_suffix(".error.json")
             chunk.error = self._json(data, error)
-            if chunk.error is not None:
+            if chunk.error is not None or error.exists():  # watched even while unreadable
                 error_files.append(str(error.relative_to(path)).replace(os.sep, "/"))
             try:
                 stat = audio.stat()

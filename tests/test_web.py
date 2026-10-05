@@ -1,6 +1,7 @@
 """Recordings website: HTTP routes, errors, auth, CORS, static frontend."""
 
 import base64
+import os
 import shutil
 import tempfile
 import unittest
@@ -12,7 +13,7 @@ from ttsbot.archive.media import MediaCache
 from ttsbot.archive.retention import RetentionPolicy
 from ttsbot.archive.service import ArchiveService
 from ttsbot.archive.store import RecordingStore
-from ttsbot.web.app import create_app
+from ttsbot.web.app import build_from_config, create_app
 
 from tests.test_archive import GUILD, NAME, SessionFixture
 
@@ -68,12 +69,17 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_audio_supports_ranges(self):
         client = await self.client()
-        full = await client.get(f"{SESSION}/audio")
+        doc = await (await client.get(SESSION)).json()
+        full = await client.get(doc["audio"]["url"])
         self.assertEqual(full.status, 200)
         self.assertEqual(full.headers["Content-Type"], "audio/ogg")
+        self.assertIn("immutable", full.headers["Cache-Control"])  # versioned: same bytes for good
+        plain = await client.get(f"{SESSION}/audio")
+        self.assertEqual(plain.headers["Cache-Control"], "private, no-cache")
+        self.assertEqual(await plain.read(), await full.read())
         body = await full.read()
         self.assertEqual(body[:4], b"OggS")
-        part = await client.get(f"{SESSION}/audio", headers={"Range": "bytes=10-19"})
+        part = await client.get(doc["audio"]["url"], headers={"Range": "bytes=10-19"})
         self.assertEqual(part.status, 206)
         self.assertEqual(await part.read(), body[10:20])
         download = await client.get(f"{SESSION}/audio?download=1")
@@ -91,6 +97,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         client = await self.client()
         response = await client.get(f"{SESSION}/transcript.md")
         self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")  # changes while transcribing
         self.assertEqual(await response.text(), "# Запись\n")
 
     async def test_basic_auth(self):
@@ -116,6 +123,14 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         other = await client.get("/api/v1/health", headers={"Origin": "http://evil.example"})
         self.assertNotIn("Access-Control-Allow-Origin", other.headers)
 
+    async def test_mp3_waits_for_the_end_of_the_recording(self):
+        live = "20261005-000000Z-333"
+        SessionFixture(self.root, name=live, ended=False)
+        client = await self.client()
+        response = await client.get(f"/api/v1/sessions/{GUILD}/{live}/audio.mp3")
+        self.assertEqual(response.status, 409)
+        self.assertEqual((await response.json())["error"]["code"], "session_recording")
+
     async def test_static_frontend_with_page_fallback(self):
         static = self.dir / "static"
         (static / "assets").mkdir(parents=True)
@@ -129,6 +144,40 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await (await client.get("/../secret.txt")).text(), "<html>app</html>")
         api_miss = await client.get("/api/v1/nothing")
         self.assertEqual(api_miss.status, 404)
+
+
+class StartupTests(unittest.TestCase):
+    def setUp(self):
+        from ttsbot import config
+
+        self.config = config
+        self.saved = {k: os.environ.get(k) for k in ("WEB_PASSWORD", "WEB_ALLOW_ANONYMOUS", "WEB_CORS_ORIGINS")}
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        for key, value in self.saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.config.reload()
+
+    def start(self, **env):
+        for key in self.saved:
+            os.environ.pop(key, None)
+        os.environ.update(env)
+        self.config.reload()
+        return build_from_config()
+
+    def test_refuses_to_serve_recordings_to_anyone_by_default(self):
+        with self.assertRaises(SystemExit):
+            self.start()
+        self.start(WEB_ALLOW_ANONYMOUS="1")
+        self.start(WEB_PASSWORD="secret")
+
+    def test_refuses_a_wildcard_cors_origin(self):
+        with self.assertRaises(SystemExit):
+            self.start(WEB_PASSWORD="secret", WEB_CORS_ORIGINS="*")
 
 
 if __name__ == "__main__":

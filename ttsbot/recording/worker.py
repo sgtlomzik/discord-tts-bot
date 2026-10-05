@@ -32,12 +32,10 @@ from typing import Awaitable, Callable
 
 from ttsbot.recording import recorder
 from ttsbot.recording.groq import MAX_UPLOAD_BYTES, AudioBudget, GroqTranscriber, TranscriptionError
-from ttsbot.recording.transcript import build_session_transcript, chunk_result, result_path
+from ttsbot.recording.fsutil import write_atomic
+from ttsbot.recording.transcript import MAX_ATTEMPTS, build_session_transcript, chunk_result, result_path
 
 log = logging.getLogger("tts_bot")
-
-# Attempts at a chunk Groq keeps rejecting before it is given up on.
-MAX_ATTEMPTS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,8 +288,8 @@ class TranscriptionWorker:
         attempts = 1
         if path.exists():
             attempts = json.loads(path.read_text(encoding="utf-8")).get("attempts", 0) + 1
-        path.write_text(json.dumps({"attempts": attempts, "error": message, "at": round(time.time(), 3)},
-                                   ensure_ascii=False), encoding="utf-8")
+        write_atomic(path, json.dumps({"attempts": attempts, "error": message, "at": round(time.time(), 3)},
+                                      ensure_ascii=False))
         log.error("Transcription rejected attempt=%d/%d file=%s/%s: %s",
                   attempts, self.max_attempts, chunk.session.name, chunk.entry["file"], message)
         self.budget.block(60.0)
@@ -311,7 +309,7 @@ class TranscriptionWorker:
             if name:
                 names[str(user_id)] = name
         if missing:
-            names_file.write_text(json.dumps(names, ensure_ascii=False, indent=1), encoding="utf-8")
+            write_atomic(names_file, json.dumps(names, ensure_ascii=False, indent=1))
         summary = await asyncio.to_thread(build_session_transcript, session, str, self.tz)
         log.debug("Transcript rebuilt session=%s %s", session.name, summary)
 

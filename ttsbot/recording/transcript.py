@@ -16,8 +16,13 @@ import re
 from pathlib import Path
 from typing import Callable
 
+from ttsbot.recording.fsutil import write_atomic
+
 # Whisper's well-known inventions on noise or silence, mostly learned from
 # subtitles; a segment matching one is dropped (kept under "dropped").
+# Attempts at a chunk Groq keeps rejecting before it is given up on.
+MAX_ATTEMPTS = 3
+
 _HALLUCINATIONS = re.compile(
     r"субтитр|dimatorzok|продолжение следует|спасибо за просмотр|"
     r"подпис\w* на (наш |мой )?канал|ставьте лайк|amara\.org",
@@ -87,8 +92,8 @@ def utterances(entries: list[dict], results: dict[str, dict], tts: list[dict]) -
     """Every kept segment and TTS line of a session, in time order.
 
     ``results`` maps a chunk file to its ``NNNN.json``; a voice line also
-    says where it is in that file (``file``, ``offset`` in seconds), so a
-    player can find it.
+    says where it is in that file (``file``, ``offset`` / ``offset_end``
+    in seconds), so a player can find it.
     """
     lines: list[dict] = []
     for entry in entries:
@@ -97,8 +102,8 @@ def utterances(entries: list[dict], results: dict[str, dict], tts: list[dict]) -
             continue
         for segment in result["segments"]:
             lines.append({"user_id": entry["user_id"], "kind": "voice", "at": segment["at"],
-                          "until": segment["until"], "text": segment["text"],
-                          "file": entry["file"], "offset": segment["start"]})
+                          "until": segment["until"], "text": segment["text"], "file": entry["file"],
+                          "offset": segment["start"], "offset_end": segment.get("end", segment["start"])})
     for item in tts:
         lines.append({"user_id": item["user_id"], "kind": "tts", "at": item["at"],
                       "until": item["at"], "text": item["text"]})
@@ -163,9 +168,10 @@ def build_session_transcript(session: Path, name_for: Callable[[int], str], tz: 
         name = names.setdefault(line["user_id"], name_for(line["user_id"]))
         label = f"{name} (TTS)" if line["kind"] == "tts" else name
         out.append(f"[{clock(line['at'])}] {label}: {line['text']}")
-    (session / "transcript.md").write_text("\n".join(out) + "\n", encoding="utf-8")
-    with (session / "transcript.jsonl").open("w", encoding="utf-8") as jsonl:
-        for line in merged:
-            row = {key: line[key] for key in ("user_id", "kind", "at", "until", "text")}
-            jsonl.write(json.dumps({**row, "name": names[line["user_id"]]}, ensure_ascii=False) + "\n")
+    write_atomic(session / "transcript.md", "\n".join(out) + "\n")
+    rows = []
+    for line in merged:
+        row = {key: line[key] for key in ("user_id", "kind", "at", "until", "text")}
+        rows.append(json.dumps({**row, "name": names[line["user_id"]]}, ensure_ascii=False) + "\n")
+    write_atomic(session / "transcript.jsonl", "".join(rows))
     return {"lines": len(merged), "pending": pending, "files": len(entries)}

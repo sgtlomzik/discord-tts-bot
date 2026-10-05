@@ -69,15 +69,31 @@ class MixPlan:
     def empty(self) -> bool:
         return not self.pieces
 
-    def position_in_file(self, file: str, offset: float) -> float | None:
-        """Mix position of ``offset`` seconds into chunk ``file`` (None: not in the mix)."""
+    def position_in_file(self, file: str, offset: float, *, end: bool = False) -> float | None:
+        """Mix position of ``offset`` seconds into chunk ``file`` (None: not in the mix).
+
+        An offset in a pause the mix cut out (between two pieces of the
+        file; other speakers may sit between them in the mix) maps to the
+        start of the speech after it, or with ``end`` to the end of the
+        speech before it.
+        """
         pieces = self._by_file.get(file)
         if not pieces:
             return None
         i = max(0, bisect.bisect_right(self._file_starts[file], offset + 1e-6) - 1)
         piece = pieces[i]
-        inside = min(max(0.0, offset - piece.file_start), piece.duration)
-        return round(piece.start + inside, 3)
+        inside = offset - piece.file_start
+        if inside > piece.duration and not end and i + 1 < len(pieces):
+            return pieces[i + 1].start
+        return round(piece.start + min(max(0.0, inside), piece.duration), 3)
+
+    def span(self, file: str, start: float, stop: float) -> tuple[float, float] | None:
+        """Mix positions of a segment ``start``-``stop`` seconds into ``file``."""
+        first = self.position_in_file(file, start)
+        if first is None:
+            return None
+        last = self.position_in_file(file, stop, end=True)
+        return first, max(first, last)
 
     def position_at(self, wall: float) -> float | None:
         """Mix position of a wall-clock moment: inside the piece being said
@@ -114,11 +130,6 @@ def fingerprint(chunks: Iterable[Chunk], gap_ms: int) -> str:
         if chunk.audio is not None:
             digest.update(f"|{chunk.file}:{chunk.audio[0]}:{chunk.audio[1]}".encode())
     return digest.hexdigest()[:20]
-
-
-def fingerprint_of(artifact: Path) -> str:
-    """The fingerprint in a cached mix folder's name (``mix-<fingerprint>``)."""
-    return artifact.name.split("-", 1)[1]
 
 
 def build_mix(session: Path, chunks: list[Chunk], out: Path, gap_ms: int) -> MixPlan:

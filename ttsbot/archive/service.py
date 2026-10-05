@@ -9,6 +9,10 @@ session still being recorded) are added per call, never cached.
 Discord ids are strings in every document: they do not fit a JavaScript
 number. Times are epoch seconds (UTC); ``info()`` names the timezone the
 transcripts use. Positions are seconds into the session's audio mix.
+
+Audio URLs in documents carry the mix version (``?v=<fingerprint>``):
+a player keeps getting the same bytes for as long as it plays, and the
+positions in the document always belong to the audio at that URL.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ from typing import Callable
 from urllib.parse import quote
 
 from ttsbot.archive import mix as mixing
-from ttsbot.archive.media import BuildFailed, MediaCache
+from ttsbot.archive.media import BuildFailed, MediaCache, run_in_thread
 from ttsbot.archive.retention import RetentionFacts, RetentionPolicy
 from ttsbot.archive.store import RecordingStore, SessionData, SessionKey, SessionNotFound
 from ttsbot.recording.transcript import merge_lines, utterances
@@ -39,10 +43,17 @@ MIX_FILE = "mix.ogg"
 PLAN_FILE = "plan.json"
 MP3_FILE = "audio.mp3"
 MP3_TIMEOUT_SECONDS = 1800
+# While a session is being recorded its files close every minute or so;
+# a mix this fresh is reused instead of rebuilding for every page view.
+LIVE_MIX_MAX_AGE_SECONDS = 120.0
 
 
 class AudioUnavailable(LookupError):
     """The session has no audio left to play (deleted by retention, or none recorded)."""
+
+
+class SessionRecording(RuntimeError):
+    """Not available until the session has ended."""
 
 
 @dataclass(slots=True)
@@ -55,12 +66,20 @@ class _Indexed:
     facts: RetentionFacts
     participants: frozenset[str]
     started_at: float
+    live: bool  # still being recorded
     mix_fingerprint: str | None  # None: no audio to mix
+
+
+@dataclass(frozen=True, slots=True)
+class AudioFile:
+    path: Path
+    version: str  # the mix fingerprint
+    exact: bool  # the version that was asked for (safe to cache for good)
 
 
 class ArchiveService:
     def __init__(self, store: RecordingStore, cache: MediaCache, retention: RetentionPolicy, *,
-                 tz: dt.tzinfo = dt.timezone.utc, gap_ms: int = 500, detail_cache_size: int = 8,
+                 tz: dt.tzinfo = dt.timezone.utc, gap_ms: int = 500, detail_cache_size: int = 4,
                  clock: Callable[[], float] = time.time) -> None:
         self.store = store
         self.cache = cache
@@ -70,8 +89,10 @@ class ArchiveService:
         self.clock = clock
         self._index: dict[SessionKey, _Indexed] = {}
         self._index_lock = asyncio.Lock()
-        self._details: collections.OrderedDict[SessionKey, tuple[tuple, dict]] = collections.OrderedDict()
+        self._details: collections.OrderedDict[SessionKey, tuple[tuple, str | None, dict]] = \
+            collections.OrderedDict()
         self._detail_cache_size = detail_cache_size
+        self._prebuild_failed: set[str] = set()
 
     # -- documents -----------------------------------------------------
 
@@ -116,44 +137,60 @@ class ArchiveService:
         cached = self._details.get(key)
         if cached is not None and cached[0] == entry.signature:
             self._details.move_to_end(key)
-            document = cached[1]
+            document = cached[2]
         else:
-            data = await asyncio.to_thread(self.store.read, key)
-            plan, audio = await self._mix(key, data, entry.mix_fingerprint)
+            data = await run_in_thread(self.store.read, key)
+            plan, audio, version = await self._mix(key, entry, data)
             document = {**entry.summary, "audio": audio, "lines": self._lines(data, plan)}
+            if audio["status"] == "none":
+                document["links"] = {**document["links"], "audio": None, "audio_mp3": None}
             if audio["status"] != "error":  # retry a failed mix on the next request
-                self._details[key] = (entry.signature, document)
+                self._details[key] = (entry.signature, version, document)
                 while len(self._details) > self._detail_cache_size:
                     self._details.popitem(last=False)
-        now = self.clock()
-        return {**document, **self._dynamic(entry, now)}
+        return {**document, **self._dynamic(entry, self.clock())}
 
-    async def audio_file(self, session_id: str) -> Path:
-        """The session's mix (Ogg Opus), built first if needed."""
+    async def audio_file(self, session_id: str, version: str | None = None) -> AudioFile:
+        """The session's mix (Ogg Opus): the ``version`` asked for while it
+        is still cached, else the current one, built first if needed."""
         key = SessionKey.from_id(session_id)
+        if version:
+            try:
+                folder = self.cache.peek(key.id, "mix", version)
+            except ValueError:
+                folder = None  # not a fingerprint
+            if folder is not None and (folder / MIX_FILE).is_file():
+                return AudioFile(folder / MIX_FILE, version, True)
         entry = await self._refresh_one(key)
-        if entry.mix_fingerprint is None:
-            raise AudioUnavailable(key.id)
-        folder = await self.cache.ensure(key.id, "mix", entry.mix_fingerprint,
-                                         self._mix_builder(key), lane="mix")
+        current, folder = await self._mix_folder(key, entry)
         path = folder / MIX_FILE
         if not path.is_file():
             raise AudioUnavailable(key.id)
-        return path
+        return AudioFile(path, current, current == version)
 
     async def mp3_file(self, session_id: str) -> Path | None:
-        """The mix as MP3, or None while it is being made (in the background)."""
+        """The mix as MP3, or None while it is being made (in the background).
+
+        Only for finished sessions: a live one changes every minute.
+        """
         key = SessionKey.from_id(session_id)
-        source = await self.audio_file(session_id)
-        fingerprint = mixing.fingerprint_of(source.parent)
-        folder = self.cache.peek(key.id, "mp3", fingerprint)
+        entry = await self._refresh_one(key)
+        if entry.live:
+            raise SessionRecording(key.id)
+        mix = await self.audio_file(session_id)
+        folder = self.cache.peek(key.id, "mp3", mix.version)
         if folder is not None:
             return folder / MP3_FILE
-        message = self.cache.failure(key.id, "mp3", fingerprint)
-        if message is not None:
-            raise BuildFailed(message)
-        self.cache.ensure_in_background(key.id, "mp3", fingerprint,
-                                        lambda out: _transcode_mp3(source, out / MP3_FILE), lane="transcode")
+        if self.cache.failure(key.id, "mp3", mix.version) is not None:
+            raise BuildFailed(self.cache.failure(key.id, "mp3", mix.version))
+        source = self.cache.path(key.id, "mix", mix.version) / MIX_FILE
+
+        def build(out: Path) -> None:
+            if not source.is_file():  # evicted while this build waited in the queue
+                raise FileNotFoundError("the mix to transcode is gone")
+            _transcode_mp3(source, out / MP3_FILE)
+
+        self.cache.ensure_in_background(key.id, "mp3", mix.version, build, lane="transcode")
         return None
 
     async def transcript_markdown(self, session_id: str) -> Path:
@@ -165,7 +202,7 @@ class ArchiveService:
 
     async def health(self) -> dict:
         readable = self.store.root.is_dir()
-        stats = await asyncio.to_thread(self.cache.stats)
+        stats = await run_in_thread(self.cache.stats)
         return {"status": "ok" if readable else "degraded", "recordings_readable": readable,
                 "sessions_indexed": len(self._index), "cache": stats}
 
@@ -177,37 +214,33 @@ class ArchiveService:
         their pages open at once."""
         entries = await self._refresh_index()
         live = {}
-        for key, entry in self._index.items():
-            fp = entry.mix_fingerprint
-            live[key.id] = {f"mix-{fp}", f"mp3-{fp}"} if fp else set()
-        await asyncio.to_thread(self.cache.collect, live)
-        built = 0
         for entry in entries:
-            if built >= prebuild_recent:
-                break
-            if entry.mix_fingerprint is None or entry.summary["ended_at"] is None:
+            fp = entry.mix_fingerprint
+            live[entry.summary["id"]] = {f"mix-{fp}", f"mp3-{fp}"} if fp else set()
+        await run_in_thread(self.cache.collect, live)
+        candidates = [e for e in entries if e.mix_fingerprint is not None and not e.live][:prebuild_recent]
+        for entry in candidates:
+            fp = entry.mix_fingerprint
+            if fp in self._prebuild_failed or self.cache.peek(entry.summary["id"], "mix", fp) is not None:
                 continue
-            key = SessionKey.from_id(entry.summary["id"])
-            built += 1
-            if self.cache.peek(key.id, "mix", entry.mix_fingerprint) is None:
-                try:
-                    await self.audio_file(key.id)
-                except (BuildFailed, AudioUnavailable, SessionNotFound):
-                    pass  # logged by the cache; the page reports it
-        await asyncio.to_thread(self.cache.enforce_limit)
+            try:
+                await self.audio_file(entry.summary["id"])
+            except (BuildFailed, AudioUnavailable, SessionNotFound):
+                self._prebuild_failed.add(fp)  # a request may still retry it; upkeep will not
+        await run_in_thread(self.cache.enforce_limit)
 
     # -- index ---------------------------------------------------------
 
     async def _refresh_index(self) -> list[_Indexed]:
         async with self._index_lock:  # the index is only changed under this lock
-            entries = await asyncio.to_thread(self._refresh_all)
+            entries = await run_in_thread(self._refresh_all)
         for gone in [key for key in self._details if key not in self._index]:
             del self._details[gone]
         return entries
 
     async def _refresh_one(self, key: SessionKey) -> _Indexed:
         async with self._index_lock:
-            entry = await asyncio.to_thread(self._refresh, key)
+            entry = await run_in_thread(self._refresh, key)
         if entry is None:
             self._details.pop(key, None)
             raise SessionNotFound(key.id)
@@ -267,7 +300,8 @@ class ArchiveService:
             doc["speech_seconds"] = round(doc["speech_seconds"], 1)
         statuses = collections.Counter(chunk.status for chunk in data.chunks)
         last_activity = max([info["started_at"]] + [c.ended_at for c in data.chunks] + [t["at"] for t in data.tts])
-        if info.get("ended_at") is None:
+        live = info.get("ended_at") is None
+        if live:
             status = "recording"
         elif statuses["pending"]:
             status = "transcribing"
@@ -275,7 +309,7 @@ class ArchiveService:
             status = "partial"
         else:
             status = "done"
-        base = f"{API_PREFIX}/sessions/{quote(key.guild)}/{quote(key.name)}"
+        base = _base(key)
         has_audio = any(chunk.audio is not None for chunk in data.chunks)
         summary = {
             "id": key.id,
@@ -296,14 +330,14 @@ class ArchiveService:
             "links": {
                 "self": base,
                 "audio": f"{base}/audio" if has_audio else None,
-                "audio_mp3": f"{base}/audio.mp3" if has_audio else None,
+                "audio_mp3": f"{base}/audio.mp3" if has_audio and not live else None,
                 "transcript_markdown": f"{base}/transcript.md",
             },
         }
         return _Indexed(
             signature=signature, error_files=data.error_files, summary=summary,
             facts=self.retention.facts(data), participants=frozenset(p["user_id"] for p in people.values()),
-            started_at=info["started_at"],
+            started_at=info["started_at"], live=live,
             mix_fingerprint=mixing.fingerprint(data.chunks, self.gap_ms) if has_audio else None,
         )
 
@@ -317,25 +351,42 @@ class ArchiveService:
 
     # -- session document ----------------------------------------------
 
-    async def _mix(self, key: SessionKey, data: SessionData,
-                   fingerprint: str | None) -> tuple[mixing.MixPlan | None, dict]:
-        audio = {"status": "none", "url": None, "mp3_url": None, "duration": None,
+    async def _mix_folder(self, key: SessionKey, entry: _Indexed,
+                          data: SessionData | None = None) -> tuple[str, Path]:
+        """(fingerprint, folder) of the mix to use, built first if needed."""
+        if entry.mix_fingerprint is None:
+            raise AudioUnavailable(key.id)
+        if entry.live:
+            newest = self.cache.newest(key.id, "mix")
+            if newest is not None and newest[2] < LIVE_MIX_MAX_AGE_SECONDS:
+                folder = self.cache.peek(key.id, "mix", newest[0])
+                if folder is not None:
+                    return newest[0], folder
+        folder = await self.cache.ensure(key.id, "mix", entry.mix_fingerprint,
+                                         self._mix_builder(key, data), lane="mix")
+        return entry.mix_fingerprint, folder
+
+    async def _mix(self, key: SessionKey, entry: _Indexed,
+                   data: SessionData) -> tuple[mixing.MixPlan | None, dict, str | None]:
+        audio = {"status": "none", "url": None, "mp3_url": None, "version": None, "duration": None,
                  "missing_files": sum(1 for c in data.chunks if c.audio is None), "damaged_files": [],
                  "error": None}
-        if fingerprint is None:
-            return None, audio
+        if entry.mix_fingerprint is None:
+            return None, audio, None
         try:
-            folder = await self.cache.ensure(key.id, "mix", fingerprint, self._mix_builder(key, data), lane="mix")
-            plan = await asyncio.to_thread(mixing.load_plan, folder / PLAN_FILE)
+            version, folder = await self._mix_folder(key, entry, data)
+            plan = await run_in_thread(mixing.load_plan, folder / PLAN_FILE)
         except (BuildFailed, OSError, ValueError) as exc:
-            audio.update(status="error", error=str(exc)[:300])
-            return None, audio
+            log.warning("Session %s audio unavailable: %s", key.id, exc)
+            audio.update(status="error", error="build_failed")
+            return None, audio, None
         if plan.empty:
-            return None, audio
-        base = f"{API_PREFIX}/sessions/{quote(key.guild)}/{quote(key.name)}"
-        audio.update(status="ready", url=f"{base}/audio", mp3_url=f"{base}/audio.mp3",
+            return None, audio, version
+        base = _base(key)
+        audio.update(status="ready", url=f"{base}/audio?v={version}", version=version,
+                     mp3_url=None if entry.live else f"{base}/audio.mp3",
                      duration=plan.duration, damaged_files=plan.damaged_files)
-        return plan, audio
+        return plan, audio, version
 
     def _mix_builder(self, key: SessionKey, data: SessionData | None = None) -> Callable[[Path], None]:
         def build(folder: Path) -> None:
@@ -351,15 +402,16 @@ class ArchiveService:
         for index, line in enumerate(merge_lines(utterances([c.entry for c in data.chunks], results, data.tts))):
             segments = []
             for part in line["parts"]:
-                if plan is None:
-                    position = None
-                elif part["kind"] == "voice":
-                    position = plan.position_in_file(part["file"], part["offset"])
-                else:
-                    position = plan.position_at(part["at"])
+                span = None
+                if plan is not None and part["kind"] == "voice":
+                    span = plan.span(part["file"], part["offset"], part["offset_end"])
+                elif plan is not None:
+                    at = plan.position_at(part["at"])
+                    span = None if at is None else (at, at)
                 segments.append({"at": part["at"], "until": part["until"], "text": part["text"],
-                                 "position": position})
-            position = next((s["position"] for s in segments if s["position"] is not None), None)
+                                 "position": span[0] if span else None,
+                                 "position_end": span[1] if span else None})
+            placed = [s for s in segments if s["position"] is not None]
             lines.append({
                 "index": index,
                 "user_id": str(line["user_id"]),
@@ -368,12 +420,17 @@ class ArchiveService:
                 "at": line["at"],
                 "until": line["until"],
                 "text": line["text"],
-                "position": position,
+                "position": placed[0]["position"] if placed else None,
+                "position_end": placed[-1]["position_end"] if placed else None,
                 # TTS is not in the recording: its position is the moment it was spoken at
                 "exact": line["kind"] == "voice",
                 "segments": segments,
             })
         return lines
+
+
+def _base(key: SessionKey) -> str:
+    return f"{API_PREFIX}/sessions/{quote(key.guild)}/{quote(key.name)}"
 
 
 def _transcode_mp3(source: Path, target: Path) -> None:

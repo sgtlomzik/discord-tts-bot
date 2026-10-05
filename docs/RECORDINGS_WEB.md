@@ -26,8 +26,16 @@ frontend builds on.
   `docker-compose.yml`), not the bot's `.env` with Discord/API tokens.
 - **Disk is the database.** No index to keep in sync: the session folders
   are the source of truth, re-read only when their files change.
-- **Bounded.** `mem_limit: 512m`, read-only root filesystem, one mix build
-  and one MP3 transcode at a time, cache capped at `WEB_CACHE_MAX_MB`.
+- **Bounded.** `mem_limit: 512m` (the process itself uses ~80 MB; the
+  rest is reclaimable page cache), read-only root filesystem, one mix
+  build and one MP3 transcode at a time, at most 4 queued transcodes,
+  cache capped at `WEB_CACHE_MAX_MB`.
+- **Private by default.** It refuses to start without `WEB_PASSWORD`
+  unless `WEB_ALLOW_ANONYMOUS=1` says the port is reachable only from
+  trusted machines; `WEB_CORS_ORIGINS=*` is refused.
+- **The bot's files are written atomically** (`ttsbot/recording/fsutil.py:
+  write_atomic`): `session.json`, `names.json`, `transcript.*` and
+  `.error.json` are replaced whole, so a reader never sees half a file.
 
 ### Layers
 
@@ -65,7 +73,8 @@ The bot is writing while the site reads, so nothing is trusted:
 - an Ogg file cut off by a crash or corrupted (bad CRC) contributes the
   part before the damage; an unreadable one is left out of the mix;
 - a session is re-read only when its `signature` (mtimes and sizes of its
-  files and folders) changes.
+  files and folders, and of the `.error.json` files, which change in
+  place) changes.
 
 ## 3. The session audio (mix)
 
@@ -79,14 +88,26 @@ other. Opus packets are copied, never re-encoded: a 6.5 h session with
 `MixPlan` (stored next to the mix as `plan.json`) remembers where each
 utterance landed, and turns:
 
-- a transcript segment (file + offset) into an exact position;
+- a transcript segment (file + offset) into an exact position; a segment
+  starting in a pause the mix cut out goes to the speech after the pause
+  (other speakers can sit between the two parts in the mix);
 - any wall-clock moment (used for TTS lines, which are not in the
   recording) into the position of what was being said then, or said next.
 
-The mix is cached under a fingerprint of the audio files it was built
-from: when retention deletes audio, the next request builds a new mix and
-the old one is deleted (the cache never keeps audio the bot has pruned for
-longer than one upkeep cycle, `WEB_MAINTENANCE_SECONDS`).
+The mix is cached under a fingerprint (its *version*) of the audio files
+it was built from. When files change (a new file closes, retention deletes
+audio) the next request builds a new version; the old one stays while it
+may be in use and is deleted by the upkeep once unused for 10 minutes
+(so audio the bot has pruned leaves the cache within about 15 minutes).
+Nothing is deleted while its session is building.
+
+While a session is being recorded, a mix less than 2 minutes old is
+reused rather than rebuilt for every page view: lines from files closed
+since then have `position: null` until the next build.
+
+Because utterances that overlapped in time are played one after the other,
+lines in time order are not always in mix order: a line can start before
+the previous one in the mix.
 
 `WEB_PREBUILD_RECENT` newest finished sessions are built ahead of time by
 the upkeep task, so their pages open at once. MP3 (for downloads) is
@@ -104,7 +125,11 @@ Base path `/api/v1`. All JSON. Conventions:
   with the matching HTTP status.
 - **Links:** documents carry ready-made `links` / `url`s; the client should
   follow them instead of building paths.
-- Responses are `Cache-Control: no-store` (audio: `private, max-age=3600`).
+- Responses are `Cache-Control: no-store`; versioned audio (`?v=`) is
+  `immutable`, the plain audio URL `no-cache`.
+- Error codes: `session_not_found`, `audio_unavailable` (404),
+  `bad_parameter` (400), `unauthorized` (401), `session_recording` (409),
+  `audio_build_failed`, `busy` (503, with `Retry-After`), `internal_error`.
 
 ### `GET /api/v1/info`
 
@@ -172,6 +197,8 @@ Session summary:
   happens at the bot's next sweep after the date (`prune_interval_hours`).
 - `channel.name` / `guild.name` are recorded from now on; older sessions
   have `null` there.
+- `links.audio` is the always-latest mix (use `audio.url` from the session
+  document for playback); `links.audio_mp3` is `null` while recording.
 
 ### `GET /api/v1/sessions/{guild}/{session}`
 
@@ -179,30 +206,39 @@ The summary plus:
 
 ```json
 {
-  "audio": {"status": "ready", "url": "/api/v1/sessions/…/audio", "mp3_url": "…/audio.mp3",
+  "audio": {"status": "ready", "url": "/api/v1/sessions/…/audio?v=378e8f5f0d6cb8d92ef4",
+            "version": "378e8f5f0d6cb8d92ef4", "mp3_url": "…/audio.mp3",
             "duration": 1570.1, "missing_files": 0, "damaged_files": [], "error": null},
   "lines": [
     {"index": 0, "user_id": "4491…", "name": "KEKWait", "kind": "voice",
      "at": 1791108842.986, "until": 1791108845.526, "text": "Вулканский салют.",
-     "position": 2.42, "exact": true,
-     "segments": [{"at": 1791108842.986, "until": 1791108845.526, "text": "Вулканский салют.", "position": 2.42}]}
+     "position": 2.42, "position_end": 4.96, "exact": true,
+     "segments": [{"at": 1791108842.986, "until": 1791108845.526, "text": "Вулканский салют.",
+                   "position": 2.42, "position_end": 4.96}]}
   ]
 }
 ```
 
 - `audio.status`: `ready`, `none` (no audio left: deleted by retention or
-  nothing playable), `error` (build failed; `error` says why; retried after
-  5 minutes). The transcript is always there regardless.
+  nothing playable), `error` (build failed, `error: "build_failed"`;
+  retried after 5 minutes). The transcript is always there regardless.
+- `audio.url` is versioned: keep using it for the `<audio>` element while
+  the page is open; positions in the document belong to that version.
+  Reload the document (not just the audio) to get a newer version.
 - A line is one speaker's consecutive speech (segments less than 2 s
   apart, as in `transcript.md`); `segments` are Whisper's sentences, each
   with its own position, for finer seeking.
 - `kind`: `voice` (recorded speech) or `tts` (text the bot spoke for the
   user). `exact: false` for TTS: its `position` is the moment it was spoken
   at, not the TTS audio itself (the bot does not record its own voice).
-- `position: null`: that audio is gone; show the time, no seek.
+- `position` / `position_end`: where the line or segment starts and ends
+  in the audio. `null`: that audio is gone (or not in the mix yet); show
+  the time, no seek.
 - Clickable timestamp: show `at` as wall-clock time, on click set
-  `audio.currentTime = position`. Highlighting the current line: the last
-  line whose `position <= currentTime`.
+  `audio.currentTime = position`.
+- Highlighting what is playing: the segment with `position <= currentTime
+  < position_end` (not "the last line that started": lines are in time
+  order, which is not always mix order, see section 3).
 
 ### `GET …/{session}/audio`
 
@@ -214,7 +250,9 @@ Edge and Safari 18.4+.
 ### `GET …/{session}/audio.mp3`
 
 The mix as MP3 (for downloading/sharing). First request: `202
-{"status": "building"}` with `Retry-After`; poll until `200`.
+{"status": "building"}` with `Retry-After`; poll until `200`. 409
+`session_recording` while the session is being recorded, 503 `busy` when
+4 transcodes are queued already.
 
 ### `GET …/{session}/transcript.md`
 
@@ -231,8 +269,8 @@ Build the frontend into a folder and set `WEB_STATIC_DIR` (mount it into
 the container): `/` serves `index.html`, real files are served as they are,
 and any other non-API path also gets `index.html` (client-side routing).
 During development run the frontend's dev server and list its origin in
-`WEB_CORS_ORIGINS` (e.g. `http://localhost:5173`); with `WEB_PASSWORD` set,
-fetch with `credentials: "include"`.
+`WEB_CORS_ORIGINS` (e.g. `http://localhost:5173`) and fetch with
+`credentials: "include"` (Basic auth).
 
 ## 6. Running
 
@@ -241,14 +279,14 @@ docker compose build tts_bot          # the shared image
 docker compose up -d tts_web          # http://<server>:8095/api/v1/info
 ```
 
-Settings: `.env.example`, section "Recordings website". Set `WEB_PASSWORD`
-unless the port is reachable only from trusted machines. Logs:
+Settings: `.env.example`, section "Recordings website". `WEB_PASSWORD` is
+required (or `WEB_ALLOW_ANONYMOUS=1`). Logs:
 `docker logs discord_tts_web`; cache: `./cache/web` (safe to delete).
 
 ## 7. Extending
 
 - **New derived data** (waveform peaks, per-speaker tracks, search index,
-  summaries): a new artifact kind in `MediaCache` — a name, a fingerprint
+  summaries): a new artifact kind in `MediaCache` — a name (`[a-z0-9_]`), a fingerprint
   of its inputs and a builder function; caching, atomicity, failure
   back-off and clean-up come for free. Expose it through `ArchiveService`
   and a route; add its name to `info.features`.
