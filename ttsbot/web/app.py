@@ -121,13 +121,26 @@ def cors_middleware(origins: tuple[str, ...]):
     return middleware
 
 
+# The page runs only its own scripts (so a transcript can never inject one),
+# talks only to its own origin, and may load the two web fonts it asks for.
+# Inline styles are allowed: the interface sets colours per speaker.
+PAGE_POLICY = (
+    "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src https://fonts.gstatic.com; img-src 'self' data:; media-src 'self'; connect-src 'self'; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
+
+
 @web.middleware
 async def headers_middleware(request: web.Request, handler) -> web.StreamResponse:
     response = await handler(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
-    if request.path.startswith("/api/") and not isinstance(response, web.FileResponse):
-        response.headers.setdefault("Cache-Control", "no-store")
+    if request.path.startswith("/api/"):
+        if not isinstance(response, web.FileResponse):
+            response.headers.setdefault("Cache-Control", "no-store")
+    else:
+        response.headers.setdefault("Content-Security-Policy", PAGE_POLICY)
     return response
 
 
@@ -232,7 +245,8 @@ def _static_routes(app: web.Application, folder: Path) -> None:
             raise web.HTTPNotFound()
         candidate = (folder / tail).resolve()
         if tail and candidate.is_file() and candidate.is_relative_to(folder.resolve()):
-            return web.FileResponse(candidate)
+            # revalidated on every load (cheap 304s), so a new frontend shows up at once
+            return web.FileResponse(candidate, headers={"Cache-Control": "no-cache"})
         return web.FileResponse(index, headers={"Cache-Control": "no-cache"})
 
     app.router.add_get("/{tail:.*}", page)

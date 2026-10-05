@@ -8,4 +8,5 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py ./
 COPY ttsbot ./ttsbot
+COPY web ./web
 CMD ["python", "-u", "bot.py"]

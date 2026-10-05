@@ -146,6 +146,47 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api_miss.status, 404)
 
 
+    async def test_static_files_are_revalidated_and_the_page_has_a_policy(self):
+        static = self.dir / "static"
+        static.mkdir()
+        (static / "index.html").write_text("<html>app</html>", encoding="utf-8")
+        (static / "app.js").write_text("1", encoding="utf-8")
+        client = await self.client(static_dir=static)
+        for path in ("/", "/app.js", f"/sessions/{GUILD}/{NAME}"):
+            response = await client.get(path)
+            self.assertEqual(response.headers["Cache-Control"], "no-cache", path)
+            self.assertIn("script-src 'self'", response.headers["Content-Security-Policy"], path)
+            self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"], path)
+        api = await client.get("/api/v1/info")
+        self.assertNotIn("Content-Security-Policy", api.headers, "the policy is for pages, not JSON")
+
+
+class ShippedFrontendTests(unittest.TestCase):
+    """The interface in ./web: everything the page loads must exist."""
+
+    ROOT = Path(__file__).resolve().parent.parent / "web"
+
+    def test_every_local_reference_resolves(self):
+        import re
+
+        index = (self.ROOT / "index.html").read_text(encoding="utf-8")
+        refs = set(re.findall(r'(?:src|href)="(/[^"]+)"', index))
+        self.assertTrue(refs, "index.html references nothing")
+        for js in self.ROOT.glob("js/*.js"):
+            for rel in re.findall(r"from '(\./[^']+)'", js.read_text(encoding="utf-8")):
+                refs.add(f"/js/{rel[2:]}")
+        for ref in refs:
+            self.assertTrue((self.ROOT / ref.lstrip("/")).is_file(), f"missing {ref}")
+
+    def test_no_inline_scripts_or_handlers(self):
+        import re
+
+        index = (self.ROOT / "index.html").read_text(encoding="utf-8")
+        for tag in re.findall(r"<script[^>]*>", index):
+            self.assertIn("src=", tag, "inline script would be blocked by the policy")
+        self.assertIsNone(re.search(r"<[a-z][^>]* on[a-z]+=", index), "inline event handler would be blocked by the policy")
+
+
 class StartupTests(unittest.TestCase):
     def setUp(self):
         from ttsbot import config

@@ -263,14 +263,46 @@ The bot's own `transcript.md`, as is.
 `{"status": "ok", "recordings_readable": true, "sessions_indexed": 14, "cache": {...}}`;
 503 when the recordings folder is unreadable. No auth (container healthcheck).
 
-## 5. Frontend hosting
+## 5. Frontend
 
-Build the frontend into a folder and set `WEB_STATIC_DIR` (mount it into
-the container): `/` serves `index.html`, real files are served as they are,
-and any other non-API path also gets `index.html` (client-side routing).
-During development run the frontend's dev server and list its origin in
-`WEB_CORS_ORIGINS` (e.g. `http://localhost:5173`) and fetch with
-`credentials: "include"` (Basic auth).
+The interface lives in `web/` and needs no build step: plain HTML, CSS and
+ES modules, so what is in the repo is what the browser runs. It ships in the
+image (`/app/web`) and is served at `/` (`WEB_STATIC_DIR` defaults to it in
+`docker-compose.yml`); real files are served as they are, any other
+non-API path gets `index.html` (the address `/sessions/<guild>/<session>?t=<seconds>`
+opens a recording at that moment). Files are revalidated on every load and
+the page carries a Content-Security-Policy (own scripts only, own origin only,
+the two web fonts from Google Fonts).
+
+```
+web/index.html            page skeleton (no inline scripts: the policy forbids them)
+web/css/app.css           the look
+web/js/main.js            boot, address bar, keyboard
+web/js/api.js             the only module that does HTTP
+web/js/sessions.js        list of recordings (left column)
+web/js/viewer.js          one recording: ties card, player, ribbon, transcript together
+web/js/player.js          <audio> with a per-frame clock
+web/js/ribbon.js          vertical map of the recording (lanes per speaker)
+web/js/transcript.js      the scrolling transcript, follow mode, search hits
+web/js/timeline.js        session document -> model; "what is playing at t" (pure)
+web/js/format.js          dates in the server timezone, durations, countdowns (pure)
+web/js/palette.js, dom.js, ui.js   colours per person, escaping, toasts
+```
+
+Rules the code keeps: everything that reaches `innerHTML` goes through
+`esc()` / `markup()` (names and transcripts come from other people); the
+playing line is found by audio *position* over a sorted index, never by line
+order; a recording that is still being made is re-read every 30 s without
+interrupting playback; missing audio, unknown names and `null` fields have
+their own states instead of errors.
+
+**Develop:** `WEB_STATIC_DIR=web WEB_ALLOW_ANONYMOUS=1 python -m ttsbot.web`
+and open http://127.0.0.1:8095 (a mounted `./web` also works in a container:
+edit, reload). **Test:** `node --test "tests/web/*.test.mjs"` (the pure
+modules; Node 20+) and `python -m unittest tests.test_web` (headers, policy,
+every file the page references exists). A frontend dev server on another
+origin must be listed in `WEB_CORS_ORIGINS` and fetch with
+`credentials: "include"`.
 
 ## 6. Running
 
