@@ -36,6 +36,9 @@ from ttsbot.recording.transcript import build_session_transcript, chunk_result, 
 
 log = logging.getLogger("tts_bot")
 
+# Attempts at a chunk Groq keeps rejecting before it is given up on.
+MAX_ATTEMPTS = 3
+
 
 @dataclass(frozen=True, slots=True)
 class PendingChunk:
@@ -54,7 +57,7 @@ def error_path(session: Path, chunk_file: str) -> Path:
 class TranscriptionWorker:
     def __init__(self, root: Path, transcriber: GroqTranscriber, budget: AudioBudget, *,
                  name_for: Callable[[int, int], Awaitable[str | None]], tz: dt.tzinfo,
-                 scan_seconds: float = 30.0, max_attempts: int = 3,
+                 scan_seconds: float = 30.0, max_attempts: int = MAX_ATTEMPTS,
                  ready: Callable[[], Awaitable] | None = None,
                  keep_audio_days: int = 0, keep_transcript_days: int = 0,
                  prune_seconds: float = 86400.0) -> None:

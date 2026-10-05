@@ -80,6 +80,9 @@ def reload() -> None:
     global STT_ENABLED, GROQ_API_KEY, STT_MODEL, STT_LANGUAGE, STT_PROMPT
     global STT_AUDIO_SECONDS_PER_HOUR, STT_AUDIO_SECONDS_PER_DAY, STT_MIN_BILLED_SECONDS
     global STT_REQUESTS_PER_MINUTE, TRANSCRIPT_TIMEZONE
+    global WEB_HOST, WEB_PORT, WEB_CACHE_DIR, WEB_CACHE_MAX_MB, WEB_STATIC_DIR
+    global WEB_USERNAME, WEB_PASSWORD, WEB_CORS_ORIGINS, WEB_MIX_GAP_MS
+    global WEB_MAINTENANCE_SECONDS, WEB_PREBUILD_RECENT
 
     TMP_DIR = Path(os.getenv("TTS_TMP_DIR", "/dev/shm"))
     BOT_CONFIG_PATH = Path(os.getenv("BOT_CONFIG_PATH", "/app/data/config.json"))
@@ -235,6 +238,24 @@ def reload() -> None:
     STT_MIN_BILLED_SECONDS = max(0.0, float(os.getenv("STT_MIN_BILLED_SECONDS", "10")))
     STT_REQUESTS_PER_MINUTE = max(1, int(os.getenv("STT_REQUESTS_PER_MINUTE", "20")))
     TRANSCRIPT_TIMEZONE = os.getenv("TRANSCRIPT_TIMEZONE", "UTC").strip() or "UTC"
+
+    # Recordings website (python -m ttsbot.web, docs/RECORDINGS_WEB.md): a
+    # separate process that only reads RECORDING_DIR. Derived audio (the
+    # joined session mix, MP3) is cached in WEB_CACHE_DIR, least recently
+    # used first out over WEB_CACHE_MAX_MB. WEB_PASSWORD turns on HTTP
+    # Basic auth; WEB_CORS_ORIGINS (comma-separated) lets a frontend dev
+    # server on another origin call the API.
+    WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    WEB_PORT = int(os.getenv("WEB_PORT", "8095"))
+    WEB_CACHE_DIR = Path(os.getenv("WEB_CACHE_DIR", "/app/cache"))
+    WEB_CACHE_MAX_MB = max(64, int(os.getenv("WEB_CACHE_MAX_MB", "2048")))
+    WEB_STATIC_DIR = os.getenv("WEB_STATIC_DIR", "").strip()
+    WEB_USERNAME = os.getenv("WEB_USERNAME", "").strip()
+    WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
+    WEB_CORS_ORIGINS = tuple(o.strip().rstrip("/") for o in os.getenv("WEB_CORS_ORIGINS", "").split(",") if o.strip())
+    WEB_MIX_GAP_MS = min(5000, max(0, int(os.getenv("WEB_MIX_GAP_MS", "500"))))
+    WEB_MAINTENANCE_SECONDS = max(30.0, float(os.getenv("WEB_MAINTENANCE_SECONDS", "300")))
+    WEB_PREBUILD_RECENT = max(0, int(os.getenv("WEB_PREBUILD_RECENT", "3")))
 
     VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
     # One knob for bare-metal runs: point PIPER_MODELS_DIR at ./models and

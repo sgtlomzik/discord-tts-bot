@@ -106,7 +106,9 @@ class RecordingVoiceClient(discord.VoiceClient):
 
     def _start_recording(self) -> None:
         if self._recorder is None and self.channel is not None:
-            self._recorder = ChannelRecorder(settings_from_config(), self.guild.id, self.channel.id)
+            self._recorder = ChannelRecorder(settings_from_config(), self.guild.id, self.channel.id,
+                                             guild_name=getattr(self.guild, "name", None),
+                                             channel_name=getattr(self.channel, "name", None))
             self._recorder.start()
         if not self._listening:
             self._connection.add_socket_listener(self._on_packet)

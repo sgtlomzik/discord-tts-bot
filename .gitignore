@@ -14,6 +14,7 @@ __pycache__/
 
 # --- Runtime state (mounted into the container, never committed) -------
 data/
+cache/
 models/
 
 # --- Local-only files ---------------------------------------------------

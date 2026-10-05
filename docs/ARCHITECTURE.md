@@ -565,6 +565,16 @@ off.
 Both run inside the worker, so nothing is pruned while `GROQ_API_KEY` is
 unset or `STT_ENABLED=0`.
 
+### 9.3 Recordings website
+
+`python -m ttsbot.web` (the `tts_web` service) serves the sessions, their
+transcripts with clickable times and one joined audio track per session
+as a JSON API, from a separate container that mounts the recordings
+read-only. `ttsbot/archive` holds the read side (store, mix, cache,
+retention, service), `ttsbot/web` the HTTP layer. The bot's only part in
+it: `session.json` also keeps `guild_name` / `channel_name`, written
+atomically. See [RECORDINGS_WEB.md](RECORDINGS_WEB.md).
+
 ## 10. Persistence and Guild State
 
 Persistent bot settings live in `data/config.json` and are managed by `BotConfigStore`.

@@ -80,34 +80,35 @@ def result_path(session: Path, chunk_file: str) -> Path:
     return (session / chunk_file).with_suffix(".json")
 
 
-def build_session_transcript(session: Path, name_for: Callable[[int], str], tz: dt.tzinfo,
-                             merge_gap: float = 2.0) -> dict:
-    """Write ``transcript.md`` / ``transcript.jsonl``; return a summary."""
-    info = json.loads((session / "session.json").read_text(encoding="utf-8"))
-    entries = []
-    manifest = session / "chunks.jsonl"
-    if manifest.exists():
-        entries = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line]
+MERGE_GAP_SECONDS = 2.0
+
+
+def utterances(entries: list[dict], results: dict[str, dict], tts: list[dict]) -> list[dict]:
+    """Every kept segment and TTS line of a session, in time order.
+
+    ``results`` maps a chunk file to its ``NNNN.json``; a voice line also
+    says where it is in that file (``file``, ``offset`` in seconds), so a
+    player can find it.
+    """
     lines: list[dict] = []
-    pending = 0
     for entry in entries:
-        path = result_path(session, entry["file"])
-        if not path.exists():
-            pending += 1
+        result = results.get(entry["file"])
+        if result is None:
             continue
-        result = json.loads(path.read_text(encoding="utf-8"))
         for segment in result["segments"]:
             lines.append({"user_id": entry["user_id"], "kind": "voice", "at": segment["at"],
-                          "until": segment["until"], "text": segment["text"]})
-    tts = session / "tts.jsonl"
-    if tts.exists():
-        for raw in tts.read_text(encoding="utf-8").splitlines():
-            if raw:
-                item = json.loads(raw)
-                lines.append({"user_id": item["user_id"], "kind": "tts", "at": item["at"],
-                              "until": item["at"], "text": item["text"]})
+                          "until": segment["until"], "text": segment["text"],
+                          "file": entry["file"], "offset": segment["start"]})
+    for item in tts:
+        lines.append({"user_id": item["user_id"], "kind": "tts", "at": item["at"],
+                      "until": item["at"], "text": item["text"]})
     lines.sort(key=lambda line: line["at"])
+    return lines
 
+
+def merge_lines(lines: list[dict], merge_gap: float = MERGE_GAP_SECONDS) -> list[dict]:
+    """Join consecutive lines of one speaker (and kind) less than
+    ``merge_gap`` seconds apart; each merged line keeps its ``parts``."""
     merged: list[dict] = []
     for line in lines:
         last = merged[-1] if merged else None
@@ -115,8 +116,34 @@ def build_session_transcript(session: Path, name_for: Callable[[int], str], tz: 
                 and line["at"] - last["until"] <= merge_gap):
             last["text"] += " " + line["text"]
             last["until"] = max(last["until"], line["until"])
+            last["parts"].append(line)
         else:
-            merged.append(dict(line))
+            merged.append({"user_id": line["user_id"], "kind": line["kind"], "at": line["at"],
+                           "until": line["until"], "text": line["text"], "parts": [line]})
+    return merged
+
+
+def build_session_transcript(session: Path, name_for: Callable[[int], str], tz: dt.tzinfo,
+                             merge_gap: float = MERGE_GAP_SECONDS) -> dict:
+    """Write ``transcript.md`` / ``transcript.jsonl``; return a summary."""
+    info = json.loads((session / "session.json").read_text(encoding="utf-8"))
+    entries = []
+    manifest = session / "chunks.jsonl"
+    if manifest.exists():
+        entries = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line]
+    results: dict[str, dict] = {}
+    pending = 0
+    for entry in entries:
+        path = result_path(session, entry["file"])
+        if not path.exists():
+            pending += 1
+            continue
+        results[entry["file"]] = json.loads(path.read_text(encoding="utf-8"))
+    tts_lines = []
+    tts = session / "tts.jsonl"
+    if tts.exists():
+        tts_lines = [json.loads(raw) for raw in tts.read_text(encoding="utf-8").splitlines() if raw]
+    merged = merge_lines(utterances(entries, results, tts_lines), merge_gap)
 
     def clock(epoch: float, fmt: str = "%H:%M:%S") -> str:
         return dt.datetime.fromtimestamp(epoch, tz).strftime(fmt)
@@ -139,5 +166,6 @@ def build_session_transcript(session: Path, name_for: Callable[[int], str], tz: 
     (session / "transcript.md").write_text("\n".join(out) + "\n", encoding="utf-8")
     with (session / "transcript.jsonl").open("w", encoding="utf-8") as jsonl:
         for line in merged:
-            jsonl.write(json.dumps({**line, "name": names[line["user_id"]]}, ensure_ascii=False) + "\n")
+            row = {key: line[key] for key in ("user_id", "kind", "at", "until", "text")}
+            jsonl.write(json.dumps({**row, "name": names[line["user_id"]]}, ensure_ascii=False) + "\n")
     return {"lines": len(merged), "pending": pending, "files": len(entries)}

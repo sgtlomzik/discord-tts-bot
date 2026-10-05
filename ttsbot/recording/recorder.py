@@ -78,10 +78,13 @@ def _utc_stamp(epoch: float) -> str:
 
 
 class ChannelRecorder:
-    def __init__(self, settings: RecorderSettings, guild_id: int, channel_id: int) -> None:
+    def __init__(self, settings: RecorderSettings, guild_id: int, channel_id: int, *,
+                 guild_name: str | None = None, channel_name: str | None = None) -> None:
         self.settings = settings
         self.guild_id = guild_id
         self.channel_id = channel_id
+        self.guild_name = guild_name
+        self.channel_name = channel_name
         self.started_at = time.time()
         self.path = settings.root / str(guild_id) / f"{_utc_stamp(self.started_at)}-{channel_id}"
         self.counters: collections.Counter[str] = collections.Counter()
@@ -279,7 +282,14 @@ class ChannelRecorder:
             "started_at": round(self.started_at, 3),
             "ended_at": None if ended_at is None else round(ended_at, 3),
         }
-        (self.path / "session.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # Names as they were at the start, for readers without Discord access.
+        if self.guild_name:
+            data["guild_name"] = self.guild_name
+        if self.channel_name:
+            data["channel_name"] = self.channel_name
+        tmp = self.path / "session.json.tmp"
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.path / "session.json")  # readers never see a half-written file
 
     def _log_stats(self, final: bool = False) -> None:
         counters = dict(self.counters)
