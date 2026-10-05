@@ -187,6 +187,20 @@ class ShippedFrontendTests(unittest.TestCase):
         self.assertIsNone(re.search(r"<[a-z][^>]* on[a-z]+=", index), "inline event handler would be blocked by the policy")
 
 
+class DockerContextTests(unittest.TestCase):
+    """The build context is an allowlist: whatever the Dockerfile copies must be let in."""
+
+    def test_everything_the_dockerfile_copies_is_in_the_context(self):
+        root = Path(__file__).resolve().parent.parent
+        allowed = {line[1:].strip().rstrip("/") for line in (root / ".dockerignore").read_text(encoding="utf-8").splitlines()
+                   if line.startswith("!")}
+        for line in (root / "Dockerfile").read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if parts[:1] == ["COPY"]:
+                for source in parts[1:-1]:
+                    self.assertIn(source.rstrip("/").removeprefix("./"), allowed, f"{source} is copied but excluded by .dockerignore")
+
+
 class StartupTests(unittest.TestCase):
     def setUp(self):
         from ttsbot import config
