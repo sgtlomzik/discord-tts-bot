@@ -310,9 +310,10 @@ class CircuitBreakerStateMachineTests(unittest.TestCase):
         clock["now"] = 60.5
         self.assertTrue(cb.allow_request())
         cb.record_failure()
-        # Back to OPEN, with a fresh opened_at anchored to current clock.
+        # Back to OPEN, anchored to the current clock, with the pause
+        # doubled (CircuitBreakerConfig.backoff_factor) for a failed probe.
         self.assertEqual(cb.state, CircuitState.OPEN)
-        self.assertAlmostEqual(cb.cooldown_remaining, 60.0, delta=0.001)
+        self.assertAlmostEqual(cb.cooldown_remaining, 120.0, delta=0.001)
         # No probes again until another cooldown elapses.
         self.assertFalse(cb.allow_request())
 

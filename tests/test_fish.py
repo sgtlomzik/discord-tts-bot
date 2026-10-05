@@ -321,7 +321,7 @@ class FishCacheTests(unittest.TestCase):
     def test_fish_voice_round_trip(self):
         voice = VoiceRecord(name="fish-default", label="Fish", description="", provider="fish",
                             fish=FishParams("voice-id", speed=1.25, pitch=-3, emotion="sad"))
-        reg = SimpleNamespace(version=1, fallback_profile="fish-default", voices={"fish-default": voice})
+        reg = VoiceRegistry(fallback_profile="fish-default", voices={"fish-default": voice})
         restored = registry_from_dict(registry_to_dict(reg))
         self.assertEqual(restored.get("fish-default").fish.reference_id, "voice-id")
         self.assertEqual(restored.get("fish-default").fish.speed, 1.25)

@@ -16,6 +16,10 @@ the next key, before any audio plays; after the last key comes the first.
 "Out of credits" is judged from the remaining balance ElevenLabs reports:
 a message that is merely longer than what a key has left goes to the next
 key without moving the ring off it.
+
+``check_quota()`` asks the free subscription endpoint of every key for its
+balance and reset time; the health worker uses it to keep the provider
+paused until a key has credits again, without spending a message on it.
 """
 
 from __future__ import annotations
@@ -33,8 +37,9 @@ from typing import AsyncIterator, Callable
 
 import httpx
 
-from ttsbot.errors import QuotaExhaustedError
+from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
 from ttsbot.gemini import write_wav
+from ttsbot.health import QuotaReport, fingerprint
 from ttsbot.httpclient import attach_warmer, provider_limits
 
 log = logging.getLogger("tts_bot")
@@ -141,7 +146,7 @@ class ElevenLabsKeyError(ElevenLabsError):
     """A problem of the API key, not of the request: try the next key."""
 
 
-class ElevenLabsAuthError(ElevenLabsKeyError):
+class ElevenLabsAuthError(ElevenLabsKeyError, AuthError):
     """Invalid or revoked key, or one without the text_to_speech permission."""
 
 
@@ -169,14 +174,25 @@ class ElevenLabsPlanError(ElevenLabsKeyError):
     """
 
 
+def _quota_line(index: int, entry: dict) -> str:
+    """``#1 …e62b 5965/10000 (сброс 29.10)`` for logs and /fallback status."""
+    head = f"#{index + 1} {entry['key']}"
+    if entry["remaining"] is None:
+        return f"{head} не проверен ({entry['error'][:80]})"
+    line = f"{head} {entry['remaining']}/{entry['limit']}"
+    if entry["reset_at"]:
+        line += time.strftime(" (сброс %d.%m)", time.gmtime(entry["reset_at"]))
+    return line
+
+
 def _remaining_credits(message: str) -> int | None:
     match = _REMAINING_RE.search(message)
     return int(match.group(1).replace(",", "")) if match else None
 
 
-class ElevenLabsRequestError(ElevenLabsError):
-    """A problem of this request, not of the provider: the pipeline falls
-    back to Piper without counting it against the circuit breaker."""
+class ElevenLabsRequestError(ElevenLabsError, RequestError):
+    """A problem of this request, not of the provider: the next voice in the
+    fallback chain speaks it, and the circuit breaker does not count it."""
 
 
 class ElevenLabsVoiceNotFoundError(ElevenLabsRequestError):
@@ -197,7 +213,7 @@ class ElevenLabsQuotaExhaustedError(ElevenLabsKeyError, QuotaExhaustedError):
     """HTTP 402, or every key in the ring is out of credits: pause the provider."""
 
 
-class ElevenLabsRateLimitError(ElevenLabsError):
+class ElevenLabsRateLimitError(ElevenLabsError, RateLimitError):
     """HTTP 429; ``retry_after`` is the server's Retry-After, if it sent one."""
 
     def __init__(self, message: str, status_code: int | None = None,
@@ -304,6 +320,7 @@ class ElevenLabsProvider:
             log.warning("Saved ElevenLabs key is no longer configured; starting at key #1")
         self._active = saved or 0
         self._on_key_switch = on_key_switch
+        self._quota: list[dict] = []
 
     @property
     def session_requests(self) -> int:
@@ -322,6 +339,69 @@ class ElevenLabsProvider:
     @property
     def active_key_index(self) -> int:
         return self._active
+
+    @property
+    def health_fingerprint(self) -> str:
+        """Changes when the key ring changes: saved health is then dropped."""
+        return fingerprint(*self.config.keys)
+
+    @property
+    def last_quota(self) -> list[dict]:
+        """Per-key balances from the last ``check_quota()`` (ring order)."""
+        return list(self._quota)
+
+    async def check_quota(self) -> QuotaReport | None:
+        """Ask ElevenLabs how many credits each key has left; no credits spent.
+
+        ``GET /v1/user/subscription`` reports the characters used and the
+        monthly limit of the key's account, and when they reset. When the
+        active key is empty and another is not, the ring moves to it. Returns
+        None when no key could be checked (network error, or keys without
+        the user_read permission): a real request has to find out instead.
+        """
+        keys = self.config.keys
+        quota: list[dict] = []
+        for index, key in enumerate(keys):
+            entry: dict = {"key": mask_key(key), "remaining": None, "limit": None, "reset_at": None, "error": ""}
+            try:
+                response = await self._client.get(
+                    "/v1/user/subscription", headers={"xi-api-key": key}, timeout=10.0,
+                )
+                if response.status_code != 200:
+                    error = _http_error(response, response.content)
+                    entry["error"] = str(error)
+                    entry["invalid"] = isinstance(error, ElevenLabsAuthError) and "missing_permissions" not in str(error)
+                else:
+                    data = response.json()
+                    limit = int(data.get("character_limit") or 0)
+                    used = int(data.get("character_count") or 0)
+                    entry["remaining"] = max(0, limit - used)
+                    entry["limit"] = limit
+                    reset = data.get("next_character_count_reset_unix")
+                    entry["reset_at"] = float(reset) if reset else None
+            except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+            quota.append(entry)
+        self._quota = quota
+        known = [e for e in quota if e["remaining"] is not None]
+        usable = [i for i, e in enumerate(quota) if (e["remaining"] or 0) >= EMPTY_KEY_CREDITS]
+        detail = " · ".join(_quota_line(i, e) for i, e in enumerate(quota))
+        if usable:
+            if self._active not in usable:
+                previous = self._active
+                self._active = next(
+                    (i for step in range(len(keys)) if (i := (previous + step) % len(keys)) in usable),
+                    usable[0],
+                )
+                log.info("ElevenLabs key %s has credits; switching from key %s",
+                         self._key_label(self._active), self._key_label(previous))
+                self._save_active()
+            return QuotaReport(True, None, detail)
+        unchecked = [e for e in quota if e["remaining"] is None and not e.get("invalid")]
+        if unchecked:
+            return None  # the keys we could not see may still work
+        resets = [e["reset_at"] for e in known if e["reset_at"]]
+        return QuotaReport(False, min(resets) if resets else None, detail)
 
     def key_usage(self) -> list[tuple[str, int, bool]]:
         """``[(masked key, session credits, active)]`` in ring order."""

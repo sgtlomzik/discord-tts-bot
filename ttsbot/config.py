@@ -53,6 +53,7 @@ def reload() -> None:
     global TTS_CONTINUOUS_STREAM, TTS_STREAMING_ENABLED, TTS_STREAM_TTFA_TIMEOUT
     global FISH_TTFA_TIMEOUT, GEMINI_TTFA_TIMEOUT, GEMINI_TTFA_PER_CHAR
     global ELEVENLABS_TTFA_TIMEOUT, TTS_CONNECTION_KEEPALIVE_SECONDS
+    global PROVIDER_HEALTH_PATH, TTS_HEALTH_CHECK_INTERVAL
     global TTS_PREFETCH_ENABLED, TTS_PREFETCH_LOOKAHEAD
     global TTS_IDLE_FRAME_MODE, TTS_IDLE_VOLUME_DB, TTS_STREAM_TAIL_MS
     global TTS_MAX_CONTINUOUS_IDLE_SECONDS, IDLE_DISCONNECT_SECONDS
@@ -129,6 +130,13 @@ def reload() -> None:
     # (a new one costs 0.3-0.5 s through the VPN). ~1 KB per ping, no
     # credits. 0 disables; typing warm-ups still run.
     TTS_CONNECTION_KEEPALIVE_SECONDS = max(0.0, float(os.getenv("TTS_CONNECTION_KEEPALIVE_SECONDS", "60")))
+    # Provider health (ttsbot/health.py): breaker state survives restarts in
+    # this file, and paused providers are checked (quota report, host ping)
+    # every TTS_HEALTH_CHECK_INTERVAL seconds once their pause is over.
+    PROVIDER_HEALTH_PATH = Path(
+        os.getenv("TTS_HEALTH_PATH", str(BOT_CONFIG_PATH.parent / "provider_health.json"))
+    )
+    TTS_HEALTH_CHECK_INTERVAL = max(5.0, float(os.getenv("TTS_HEALTH_CHECK_INTERVAL", "30")))
     # Prefetch: decouple generation from playback so message N+1 is synthesized
     # while N is still playing (cuts queue_wait under bursts). Playback stays
     # strictly sequential FIFO. TTS_PREFETCH_ENABLED=0 reverts to the proven

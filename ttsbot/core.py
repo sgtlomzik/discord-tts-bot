@@ -21,6 +21,7 @@ from ttsbot import voice_registry
 from ttsbot.elevenlabs import ElevenLabsConfig, ElevenLabsProvider
 from ttsbot.fish import FishConfig, FishProvider
 from ttsbot.gemini import GeminiConfig, GeminiProvider
+from ttsbot.health import HealthStore
 from ttsbot.providers import (
     LocalProvider,
     TTSDispatcher,
@@ -63,6 +64,8 @@ class TTSBot(
         # The /voicebot command group; attached by the composition root
         # (bot.py) before the bot starts, added to the tree in setup_hook.
         self.tts_group: discord.app_commands.Group | None = None
+        # More top-level groups (/fallback), attached the same way.
+        self.extra_groups: list[discord.app_commands.Group] = []
         self.message_queue: asyncio.Queue[TTSJob] = asyncio.Queue(maxsize=config.QUEUE_MAXSIZE)
         self.worker_task: asyncio.Task[None] | None = None
         # Prefetch pipeline: generation worker fills ready_queue (bounded by
@@ -174,6 +177,10 @@ class TTSBot(
             cache=self.tts_cache,
             fallback_profile=self.voice_registry.fallback_profile,
         )
+        # Provider pauses survive restarts: a provider out of quota stays
+        # paused until its check, instead of failing the first messages.
+        if config.PROVIDER_HEALTH_PATH.parent.exists():
+            self.tts_dispatcher.attach_health_store(HealthStore(config.PROVIDER_HEALTH_PATH))
         self.continuous_sources: dict[int, ContinuousTTSAudioSource] = {}
         self.merge_buffers: dict[tuple[int, int], MergeBufferState] = {}
         self.merge_locks: dict[tuple[int, int], asyncio.Lock] = {}
@@ -218,6 +225,8 @@ class TTSBot(
     async def setup_hook(self) -> None:
         if self.tts_group is not None:
             self.tree.add_command(self.tts_group)
+        for group in self.extra_groups:
+            self.tree.add_command(group)
         try:
             synced = await self.tree.sync()
             log.info(
@@ -237,6 +246,9 @@ class TTSBot(
         if config.TTS_CONNECTION_KEEPALIVE_SECONDS > 0:
             self.keepalive_task = asyncio.create_task(
                 self._connection_keepalive_worker(), name="tts-connection-keepalive")
+        if self.tts_dispatcher.provider_names():
+            self.health_task = asyncio.create_task(
+                self._provider_health_worker(), name="tts-provider-health")
         if config.RECORDING_ENABLED and config.STT_ENABLED:
             self.transcription_task = asyncio.create_task(
                 self._make_transcription_worker().run(), name="stt-worker")
@@ -283,7 +295,8 @@ class TTSBot(
 
     async def close(self) -> None:
         for task in (self.worker_task, self.generation_task, self.playback_task,
-                     getattr(self, "keepalive_task", None), getattr(self, "transcription_task", None)):
+                     getattr(self, "keepalive_task", None), getattr(self, "transcription_task", None),
+                     getattr(self, "health_task", None)):
             if task:
                 task.cancel()
         transcriber = getattr(self, "transcriber", None)

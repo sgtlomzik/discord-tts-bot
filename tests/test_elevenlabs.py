@@ -643,7 +643,13 @@ class ElevenLabsPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await pipeline._generate_elevenlabs_stream_into(prepared, _voice()), "pre_audio")
             self.assertTrue(prepared.channel.empty())
         self.assertIsInstance(prepared.error, ElevenLabsQuotaExhaustedError)
-        self.assertGreater(pipeline.tts_dispatcher.elevenlabs_circuit_breaker.cooldown_remaining, 800)
+        # ElevenLabs can report its quota: paused until the health worker
+        # asks it (within a minute), not on a blind 30 min timer.
+        breaker = pipeline.tts_dispatcher.elevenlabs_circuit_breaker
+        self.assertIs(breaker.state, CircuitState.OPEN)
+        self.assertEqual(breaker.kind.value, "quota")
+        self.assertTrue(breaker.await_check)
+        self.assertAlmostEqual(breaker.cooldown_remaining, 60, delta=1)
 
     async def test_billing_is_counted_when_the_stream_stops_early(self):
         pipeline = self._pipeline(lambda r: _audio(stream=_Chunks([_ogg(1)[:900]], fail_after=True), cost="6.5"))
@@ -716,7 +722,7 @@ class ElevenLabsPipelineTests(unittest.IsolatedAsyncioTestCase):
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         with patch.object(config, "TTS_STREAMING_ENABLED", True), patch.object(config, "TTS_CONTINUOUS_STREAM", True):
             await pipeline._prepare_into(prepared)
-        pipeline._generate_file_into.assert_awaited_once_with(prepared, piper)
+        pipeline._generate_file_into.assert_awaited_once_with(prepared, piper, [])
         self.assertIsNone(await prepared.channel.get())
 
     async def test_register_voice_probes_and_saves(self):
