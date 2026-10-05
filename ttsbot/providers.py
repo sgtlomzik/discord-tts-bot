@@ -11,11 +11,10 @@ The split mirrors the rollout plan in ``docs/MINIMAX_INTEGRATION_PLAN.md``:
   modifying it. Internal logic untouched.
 * ``MiniMaxProvider`` — added in a later commit. Calls the MiniMax T2A
   HTTP endpoint, decodes the hex-encoded MP3 payload, writes it to disk.
-* ``CircuitBreaker`` — short-circuits repeated failures so a flaky cloud
-  API does not stall the bot.
-* ``TTSDispatcher`` — facade that selects the primary provider, handles
-  fallback to ``LocalProvider`` on any failure, and reports outcomes to
-  the circuit breaker.
+* ``CircuitBreaker`` (ttsbot.health) — pauses a provider according to why
+  it failed, so a flaky or exhausted cloud API does not stall the bot.
+* ``TTSDispatcher`` — facade that speaks a message with a voice or the
+  next voice of its fallback chain, and checks paused providers.
 
 All providers satisfy the ``TTSProvider`` protocol: ``async def
 synthesize(text, filename) -> None`` that writes a valid audio file at
@@ -47,9 +46,19 @@ from typing import (
     Protocol,
 )
 
-from ttsbot.errors import QuotaExhaustedError
+from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
 from ttsbot import config as bot_config
-from ttsbot.elevenlabs import ElevenLabsProvider, ElevenLabsRequestError
+from ttsbot.health import (  # noqa: F401  (CircuitState is re-exported)
+    LONG_KINDS,
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitState,
+    FailureKind,
+    HealthStore,
+    classify_failure,
+    fingerprint,
+)
+from ttsbot.elevenlabs import ElevenLabsProvider
 from ttsbot.fish import FishProvider
 from ttsbot.gemini import GeminiProvider, write_wav
 from ttsbot.httpclient import attach_warmer, provider_limits
@@ -131,145 +140,23 @@ class LocalProvider:
 
 
 # ---------------------------------------------------------------------------
-# Circuit breaker (skeleton; fully wired in a later commit)
+# Circuit breaker: lives in ttsbot.health, re-exported here for callers
 # ---------------------------------------------------------------------------
 
 
-class CircuitState(str, Enum):
-    CLOSED = "closed"          # normal: every call hits the primary
-    OPEN = "open"              # all calls short-circuit to fallback
-    HALF_OPEN = "half_open"    # single probe call after cooldown
-
-
-@dataclass
-class CircuitBreakerConfig:
-    failure_threshold: int = 3
-    cooldown_seconds: float = 60.0
-
-
-class CircuitBreaker:
-    """Tracks consecutive failures of the cloud provider.
-
-    State machine:
-    - CLOSED: normal operation, every call hits the cloud provider.
-    - OPEN: the provider has just produced ``failure_threshold``
-      consecutive failures. All requests short-circuit to fallback.
-    - HALF_OPEN: the cooldown (``cooldown_seconds``) since ``OPEN``
-      has elapsed. The very next request is allowed through as a
-      single probe; success returns the breaker to CLOSED, failure
-      flips it back to OPEN with a fresh cooldown.
-    """
-
-    def __init__(
-        self,
-        config: Optional[CircuitBreakerConfig] = None,
-        *,
-        clock: Optional[Callable[[], float]] = None,
-    ) -> None:
-        self._config = config or CircuitBreakerConfig()
-        self._state: CircuitState = CircuitState.CLOSED
-        self._consecutive_failures: int = 0
-        self._opened_at: Optional[float] = None
-        self._probe_outstanding: bool = False
-        # Set by trip(): a one-off cooldown (e.g. an exhausted quota) that
-        # replaces the configured one until the next success.
-        self._cooldown_override: Optional[float] = None
-        # Clock injection point so tests can fast-forward through the
-        # cooldown without sleeping the real wall clock.
-        self._clock = clock or time.perf_counter
-
-    @property
-    def state(self) -> CircuitState:
-        return self._state
-
-    @property
-    def consecutive_failures(self) -> int:
-        return self._consecutive_failures
-
-    @property
-    def cooldown_remaining(self) -> float:
-        """Seconds remaining in the current cooldown, or 0.0 if not OPEN."""
-        if self._state is not CircuitState.OPEN or self._opened_at is None:
-            return 0.0
-        elapsed = self._clock() - self._opened_at
-        cooldown = (
-            self._config.cooldown_seconds
-            if self._cooldown_override is None else self._cooldown_override
-        )
-        return max(0.0, cooldown - elapsed)
-
-    def allow_request(self) -> bool:
-        """Return True if a primary call should be attempted right now.
-
-        - CLOSED: always True.
-        - OPEN: False until cooldown elapses; then transitions to
-          HALF_OPEN and returns True for exactly one probe.
-        - HALF_OPEN: True for the first caller (the probe), then
-          False for every subsequent caller until ``record_success``
-          or ``record_failure`` resolves the state. The one-shot
-          guarantee prevents two concurrent callers from both
-          slipping through during the probe window.
-        """
-        if self._state is CircuitState.CLOSED:
-            return True
-        if self._state is CircuitState.HALF_OPEN:
-            if self._probe_outstanding:
-                # Consume the probe atomically so a second caller
-                # arriving in the same event-loop tick does not also
-                # see True and bypass the breaker.
-                self._probe_outstanding = False
-                return True
-            return False
-        # OPEN: maybe promote to HALF_OPEN if cooldown has elapsed.
-        # The current allow_request call IS the probe — consume it
-        # immediately so a second caller arriving in the same tick
-        # sees _probe_outstanding=False and is blocked.
-        if self.cooldown_remaining <= 0.0:
-            self._state = CircuitState.HALF_OPEN
-            self._probe_outstanding = False
-            return True
-        return False
-
-    def record_success(self) -> None:
-        self._consecutive_failures = 0
-        self._state = CircuitState.CLOSED
-        self._opened_at = None
-        self._probe_outstanding = False
-        self._cooldown_override = None
-
-    def trip(self, cooldown_seconds: float) -> None:
-        """Open immediately for ``cooldown_seconds`` (quota exhausted)."""
-        self._consecutive_failures += 1
-        self._state = CircuitState.OPEN
-        self._opened_at = self._clock()
-        self._probe_outstanding = False
-        self._cooldown_override = max(0.0, cooldown_seconds)
-
-    def record_failure(self) -> None:
-        self._consecutive_failures += 1
-        if self._state is CircuitState.OPEN and self._cooldown_override is not None:
-            return  # keep the longer trip() cooldown already in force
-        self._cooldown_override = None
-        if self._state is CircuitState.HALF_OPEN:
-            # The probe failed — back to OPEN with a fresh cooldown.
-            self._state = CircuitState.OPEN
-            self._opened_at = self._clock()
-            self._probe_outstanding = False
-            return
-        if self._consecutive_failures >= self._config.failure_threshold:
-            self._state = CircuitState.OPEN
-            self._opened_at = self._clock()
-            self._probe_outstanding = False
-
-
 def load_circuit_breaker_from_env() -> CircuitBreaker:
-    """Build a CircuitBreaker from the standard ``CB_*`` env vars."""
-    threshold = int(os.getenv("CB_FAILURE_THRESHOLD", "3"))
-    cooldown = float(os.getenv("CB_COOLDOWN_SECONDS", "60"))
+    """Build a CircuitBreaker from the ``CB_*`` and ``TTS_*_RECHECK`` env vars."""
+    def number(name: str, default: str) -> float:
+        return float(os.getenv(name, "").strip() or default)
+
     return CircuitBreaker(
         CircuitBreakerConfig(
-            failure_threshold=max(1, threshold),
-            cooldown_seconds=max(0.0, cooldown),
+            failure_threshold=max(1, int(number("CB_FAILURE_THRESHOLD", "3"))),
+            cooldown_seconds=max(0.0, number("CB_COOLDOWN_SECONDS", "60")),
+            backoff_factor=max(1.0, number("CB_BACKOFF_FACTOR", "2")),
+            max_cooldown_seconds=max(0.0, number("CB_MAX_COOLDOWN_SECONDS", "900")),
+            auth_recheck_seconds=max(60.0, number("TTS_AUTH_RECHECK_SECONDS", "3600")),
+            max_recheck_seconds=max(60.0, number("TTS_MAX_RECHECK_SECONDS", "86400")),
         )
     )
 
@@ -307,11 +194,11 @@ class MiniMaxError(Exception):
     """
 
 
-class MiniMaxAuthError(MiniMaxError):
+class MiniMaxAuthError(MiniMaxError, AuthError):
     """Invalid API key / Group ID. Also covers missing config."""
 
 
-class MiniMaxQuotaError(MiniMaxError):
+class MiniMaxQuotaError(MiniMaxError, RateLimitError):
     """HTTP 429 (rate-limited) or explicit quota status_code."""
 
 
@@ -344,7 +231,7 @@ class MiniMaxTimeoutError(MiniMaxError):
     """Request exceeded TTS_REQUEST_TIMEOUT."""
 
 
-class MiniMaxVoiceNotFoundError(MiniMaxError):
+class MiniMaxVoiceNotFoundError(MiniMaxError, RequestError):
     """status_code 2054 — the requested voice_id does not exist."""
 
 
@@ -1244,22 +1131,39 @@ def load_dispatcher_config_from_env() -> DispatcherConfig:
     )
 
 
+class NoVoiceAvailableError(RuntimeError):
+    """No voice of the fallback chain could speak the message."""
+
+
+# A provider that can report its quota is asked this soon after a QUOTA or
+# AUTH failure, to learn the reset time instead of guessing.
+QUICK_CHECK_SECONDS = 60.0
+# Quotas reset at the reported second; check a little after it.
+RESET_MARGIN_SECONDS = 120.0
+
+PROVIDER_LABELS = {
+    "minimax": "MiniMax", "fish": "Fish", "gemini": "Gemini", "elevenlabs": "ElevenLabs",
+    "piper": "Piper",
+}
+
+
 class TTSDispatcher:
-    """Facade that the bot calls to obtain synthesized audio.
+    """Facade that the bot calls to synthesize a message to a file.
 
-    Routing logic (post commit 3):
+    Routing: ``synthesize_chain`` tries a voice, then its fallback voices
+    (``VoiceRegistry.chain_for``) in order. Each try goes through the
+    voice's provider: cache, then the provider's circuit breaker, then the
+    API. A provider that failed for any reason other than this one request
+    (see ttsbot.health) is skipped for the rest of the chain, so a Fish
+    outage does not cost a second Fish timeout on the next Fish voice.
+    ``synthesize`` without ``fallbacks`` keeps the pre-chain behavior: the
+    voice, then the Piper ``fallback_profile``.
 
-    * ``primary=local`` → always local.
-    * ``primary=minimax`` and cloud is configured:
-      - if circuit breaker is OPEN → local (no API call attempted).
-      - try cloud. On success: ``cb.record_success()``; return cloud.
-      - on any error: ``cb.record_failure()``; fall back to local.
-    * cloud not configured (missing key/voice_id) → local.
-
-    Cache (post commit 7): if enabled, the dispatcher checks the cache
-    BEFORE invoking any provider and short-circuits to a copy on hit.
-    Cache misses go through the normal provider chain, then the
-    resulting audio is stored in the cache for next time.
+    Health: every cloud provider has a CircuitBreaker. ``record_failure``
+    classifies an exception and pauses the provider for as long as that
+    kind of failure calls for; ``check_health`` (the bot runs it every
+    TTS_HEALTH_CHECK_INTERVAL seconds) checks paused providers without
+    spending a user message: a quota report, or a ping of the host.
     """
 
     def __init__(
@@ -1283,10 +1187,18 @@ class TTSDispatcher:
         self._gemini_cb = load_circuit_breaker_from_env()
         self._elevenlabs = elevenlabs
         self._elevenlabs_cb = load_circuit_breaker_from_env()
+        self._breakers: dict[str, CircuitBreaker] = {
+            "minimax": self._cb, "fish": self._fish_cb,
+            "gemini": self._gemini_cb, "elevenlabs": self._elevenlabs_cb,
+        }
+        for name, breaker in self._breakers.items():
+            breaker.name = breaker.name or PROVIDER_LABELS[name]
+        # Providers whose check_quota() could not tell (e.g. keys without
+        # the permission to read their quota): probed on the backoff instead.
+        self._quota_unknown: set[str] = set()
         self._config = config or DispatcherConfig()
         self._cache = cache  # None means caching disabled
-        # Piper profile name to fall back to when a cloud (MiniMax) voice
-        # fails. Sourced from the registry's fallback_profile.
+        # Piper profile spoken when a voice fails and no chain is given.
         self._fallback_profile = fallback_profile
 
     @property
@@ -1297,30 +1209,139 @@ class TTSDispatcher:
     def circuit_breaker(self) -> CircuitBreaker:
         return self._cb
 
+    # -- provider health ------------------------------------------------
+
+    def breaker_for(self, provider: str | None) -> Optional[CircuitBreaker]:
+        """The circuit breaker of a provider name (None for Piper/unknown)."""
+        return self._breakers.get(provider or "")
+
+    def provider_names(self) -> list[str]:
+        """The configured cloud providers, in a stable order."""
+        return [name for name in self._breakers if self.provider_for(name) is not None]
+
+    def _name_of(self, breaker: CircuitBreaker) -> str:
+        return next((name for name, b in self._breakers.items() if b is breaker), "")
+
+    @staticmethod
+    def health_fingerprint(provider) -> str:
+        """Id of a provider's credentials, so saved health follows its key."""
+        value = getattr(provider, "health_fingerprint", None)
+        if isinstance(value, str):
+            return value
+        cfg = getattr(provider, "config", None) or getattr(provider, "_config", None)
+        return fingerprint(str(getattr(cfg, "api_key", "") or ""), str(getattr(cfg, "group_id", "") or ""))
+
+    def attach_health_store(self, store: HealthStore) -> None:
+        """Restore every configured provider's breaker and save its changes."""
+        for name in self.provider_names():
+            store.bind(name, self._breakers[name], self.health_fingerprint(self.provider_for(name)))
+
     def record_failure(
         self, breaker: CircuitBreaker, exc: BaseException | None = None,
     ) -> None:
-        """Count a provider failure; an exhausted balance/plan pauses it longer.
+        """Count a provider failure; how long it pauses depends on its kind.
 
-        A rate limit that names its Retry-After pauses the provider for
-        exactly that long instead of the quota cooldown.
+        - this request only (unknown voice, ...): not counted at all;
+        - a rate limit with Retry-After: paused for exactly that long;
+        - quota used up / key rejected: paused until a check says otherwise
+          (soon, when the provider can report its quota);
+        - anything else: counted toward the CB_* threshold.
         """
+        kind = classify_failure(exc)
+        if kind is FailureKind.REQUEST:
+            log.info(
+                "%s rejected this request only (%s: %s); provider stays available",
+                breaker.name or "Provider", type(exc).__name__, exc,
+            )
+            if breaker.state is CircuitState.HALF_OPEN:
+                breaker.record_success()  # the probe got a real answer: it works
+            return
         retry_after = getattr(exc, "retry_after", None)
-        if retry_after:
+        if kind is FailureKind.RATE_LIMIT and retry_after:
             log.warning(
                 "Rate limited (%s); pausing the provider for %.0fs (Retry-After)",
                 type(exc).__name__, retry_after,
             )
-            breaker.trip(float(retry_after))
-        elif isinstance(exc, QuotaExhaustedError):
-            cooldown = self._config.quota_cooldown_seconds
-            log.warning(
-                "Quota exhausted (%s); pausing the provider for %.0fs: %s",
-                type(exc).__name__, cooldown, exc,
+            breaker.record_failure(kind, error=exc, retry_after=float(retry_after))
+            return
+        if kind in LONG_KINDS:
+            name = self._name_of(breaker)
+            provider = self.provider_for(name)
+            # A quota report proves nothing about a rejected key, and a
+            # check that was wrong before (or could not tell) is not asked.
+            checkable = (
+                kind is FailureKind.QUOTA and breaker.check_trusted and not breaker.closed_by_check
+                and callable(getattr(provider, "check_quota", None)) and name not in self._quota_unknown
             )
-            breaker.trip(cooldown)
-        else:
-            breaker.record_failure()
+            log.warning(
+                "%s (%s); pausing the provider until it is %s: %s",
+                "Quota exhausted" if kind is FailureKind.QUOTA else "Key rejected",
+                type(exc).__name__, "checked" if checkable else "probed", exc,
+            )
+            breaker.record_failure(
+                kind, error=exc,
+                until=breaker.now() + QUICK_CHECK_SECONDS if checkable else None,
+                base=self._config.quota_cooldown_seconds if kind is FailureKind.QUOTA else None,
+            )
+            breaker.await_check = checkable
+            return
+        was_open = breaker.state is CircuitState.OPEN
+        breaker.record_failure(kind, error=exc)
+        if not was_open and breaker.state is CircuitState.OPEN:
+            # Let the health worker ping the host before a message probes.
+            breaker.await_check = self._pingable(self.provider_for(self._name_of(breaker)))
+
+    @staticmethod
+    def _pingable(provider) -> bool:
+        return callable(getattr(getattr(provider, "warmer", None), "reachable", None))
+
+    async def check_health(self) -> None:
+        """Check every paused provider whose pause is over (health worker)."""
+        for name, breaker in self._breakers.items():
+            provider = self.provider_for(name)
+            if provider is None or not breaker.check_due:
+                continue
+            try:
+                await self._check_provider(name, provider, breaker)
+            except Exception:
+                log.exception("Health check of %s failed", breaker.name)
+                breaker.await_check = False  # let a real request decide
+
+    async def _check_provider(self, name: str, provider, breaker: CircuitBreaker) -> None:
+        kind = breaker.kind
+        if kind is FailureKind.QUOTA:
+            checker = getattr(provider, "check_quota", None)
+            report = await checker() if callable(checker) else None
+            if report is None:
+                # Cannot tell: the next request probes, and later failures
+                # wait on the backoff rather than on this check.
+                self._quota_unknown.add(name)
+                breaker.await_check = False
+                return
+            self._quota_unknown.discard(name)
+            if report.available:
+                log.info("%s quota check: available again (%s)", breaker.name, report.detail)
+                breaker.record_success(confirmed=False)
+                return
+            log.info("%s quota check: still unavailable (%s)", breaker.name, report.detail)
+            breaker.record_failure(
+                kind, error=report.detail or "quota check: unavailable",
+                until=report.reset_at + RESET_MARGIN_SECONDS if report.reset_at else None,
+                base=self._config.quota_cooldown_seconds if kind is FailureKind.QUOTA else None,
+            )
+            breaker.await_check = True
+            return
+        if kind is FailureKind.TRANSIENT and self._pingable(provider):
+            if await provider.warmer.reachable():
+                log.info("%s host answers again; the next request probes it", breaker.name)
+                breaker.await_check = False
+            else:
+                breaker.reopen(f"{breaker.name} host unreachable")
+                breaker.await_check = True
+            return
+        breaker.await_check = False
+
+    # -- providers --------------------------------------------------------
 
     @property
     def cloud(self) -> Optional[TTSProvider]:
@@ -1353,7 +1374,8 @@ class TTSDispatcher:
     def provider_for(self, provider: str | None):
         """The configured provider object for a voice record's ``provider``
         value, or None (Piper, unknown, or not configured). Register every
-        new cloud provider here so typing warm-ups reach it."""
+        new cloud provider here (and in ``_breakers``) so typing warm-ups,
+        health checks and the fallback chain reach it."""
         return {
             "minimax": self._cloud,
             "fish": self._fish,
@@ -1365,141 +1387,156 @@ class TTSDispatcher:
     def cache(self) -> Optional[TTSPhraseCache]:
         return self._cache
 
-    async def synthesize(self, text: str, filename: Path, voice=None) -> str:
-        """Produce audio at ``filename`` and return the provider used.
+    # -- synthesis --------------------------------------------------------
 
-        ``voice`` is a registry ``VoiceRecord`` (or None). Its ``provider``
-        decides routing: a ``minimax`` record goes to the cloud with the
-        record's voice_id/params; a ``piper`` record goes to local Piper
-        with the record's profile name. A cloud failure falls back to the
-        registry ``fallback_profile`` (Piper).
-        """
-        # Cache key must include the voice so two voices never collide, plus
-        # the MiniMax params so re-tuning a voice (speed/pitch/emotion/vol)
-        # yields a fresh key instead of serving stale audio.
-        provider = getattr(voice, "provider", None) if voice is not None else None
-        want_fish = (
-            provider == "fish" or
-            (voice is None and self._config.primary is PrimaryProvider.FISH)
-        ) and self._fish is not None
-        fish_ref = (
-            getattr(getattr(voice, "fish", None), "reference_id", "")
-            or (self._fish.config.reference_id if self._fish is not None else "")
-        )
-        fish_cfg = self._fish.config if want_fish else None
-        voice_key = (
-            fish_cfg.cache_key(fish_ref, getattr(voice, "fish", None))
-            if want_fish else voice_cache_key(voice)
-        )
-
-        want_gemini = (
-            provider == "gemini"
-            or (voice is None and self._config.primary is PrimaryProvider.GEMINI)
-        ) and self._gemini is not None
-        if want_gemini:
-            used = await self._synthesize_gemini(text, filename, getattr(voice, "gemini", None))
-            if used:
-                return used
-
-        want_elevenlabs = self._elevenlabs is not None and (
-            provider == "elevenlabs"
-            # No record: only when ELEVENLABS_VOICE_ID gives a voice to use.
-            or (
-                voice is None and self._config.primary is PrimaryProvider.ELEVENLABS
-                and bool(self._elevenlabs.config.voice_id)
-            )
-        )
-        if want_elevenlabs:
-            used = await self._synthesize_elevenlabs(
-                text, filename, getattr(voice, "elevenlabs", None),
-            )
-            if used:
-                return used
-        own_cache = want_gemini or want_elevenlabs
-
-        # 1. Cache hit short-circuits everything.
-        if self._cache is not None and not own_cache:
-            cached = self._cache.lookup(text, voice_key)
-            if cached is not None:
-                shutil.copyfile(cached, filename)
-                log.debug("TTS cache HIT text=%d chars voice=%s", len(text), voice_key)
-                return "cache"
-
-        if want_fish and not self._fish_cb.allow_request():
-            log.info("Fish circuit breaker open; using fallback Piper")
-        elif want_fish:
-            try:
-                await self._fish.synthesize(
-                    text, filename, reference_id=fish_ref, params=getattr(voice, "fish", None),
-                    request_config=fish_cfg,
-                )
-                self._fish_cb.record_success()
-                self._maybe_cache(text, filename, voice_key, suffix="opus")
-                return "fish"
-            except Exception as exc:
-                self.record_failure(self._fish_cb, exc)
-                log.warning("Fish synthesis failed (%s: %s); falling back to Piper", type(exc).__name__, exc)
-
-        # 2. Cloud (MiniMax) path: when the record is a minimax voice, or
-        #    (no record) the env default is minimax. Requires a configured
-        #    cloud provider.
-        want_minimax = (
-            provider == "minimax"
-            or (voice is None and self._config.primary is PrimaryProvider.MINIMAX)
-        ) and self._cloud is not None
-
-        if want_minimax:
-            if self._cb.allow_request():
-                try:
-                    mm = getattr(voice, "minimax", None) if voice is not None else None
-                    if mm is not None:
-                        await self._cloud.synthesize(
-                            text, filename,
-                            voice_id=mm.voice_id, model=mm.model,
-                            speed=mm.speed, vol=mm.vol, pitch=mm.pitch,
-                            emotion=mm.emotion, language_boost=mm.language_boost,
-                        )
-                    else:
-                        await self._cloud.synthesize(text, filename)
-                    self._cb.record_success()
-                    self._maybe_cache(text, filename, voice_key)
-                    return self._cloud.name
-                except Exception as exc:
-                    log.warning(
-                        "TTS provider %s failed (%s: %s); falling back to %s",
-                        self._cloud.name, type(exc).__name__, exc, self._local.name,
-                    )
-                    self.record_failure(self._cb, exc)
-            else:
-                log.debug(
-                    "Circuit breaker open; skipping %s, using fallback Piper",
-                    self._cloud.name,
-                )
-
-        # 3. Local (Piper) path. Pick the profile name: the requested piper
-        #    voice, or the registry fallback when a cloud voice was wanted.
-        if provider == "piper":
-            fallback_name = getattr(voice, "name", None)
-        elif (
-            provider in {"minimax", "fish", "gemini", "elevenlabs"}
-            or want_minimax or want_fish or own_cache
+    def route(self, voice) -> str:
+        """Provider name for a voice record; without one, TTS_PRIMARY_PROVIDER."""
+        if voice is not None:
+            return getattr(voice, "provider", None) or "piper"
+        primary = self._config.primary
+        if primary is PrimaryProvider.LOCAL:
+            return "piper"
+        if primary is PrimaryProvider.ELEVENLABS and not (
+            self._elevenlabs is not None and self._elevenlabs.config.voice_id
         ):
-            fallback_name = self._fallback_profile or None
-        else:
-            fallback_name = None
-        await self._local.synthesize(text, filename, fallback_name)
-        # Cache regardless of provider: when TTS_CACHE_ENABLED=1 the
-        # operator has opted in, and a cache hit on a repeated short
-        # phrase is a win whether the underlying provider is Piper
-        # or MiniMax (the local file copy is faster than even Piper).
-        # A Fish/Gemini/ElevenLabs voice keys its cache by provider params, so
-        # a Piper fallback stored here would be served as that voice later.
-        if not want_fish and not own_cache:
-            self._maybe_cache(text, filename, voice_key)
-        return self._local.name
+            return "piper"  # no ELEVENLABS_VOICE_ID: no voice to use
+        return primary.value
 
-    async def _synthesize_gemini(self, text: str, filename: Path, params) -> str:
-        """Gemini file path: cache, then the API. Returns "" to fall back."""
+    async def synthesize(self, text: str, filename: Path, voice=None, fallbacks=None) -> str:
+        """Produce audio at ``filename`` and return the provider used."""
+        used, _ = await self.synthesize_chain(text, filename, voice, fallbacks)
+        return used
+
+    async def synthesize_chain(
+        self, text: str, filename: Path, voice=None, fallbacks=None,
+    ) -> tuple[str, object]:
+        """Speak ``text`` with ``voice`` or the first of ``fallbacks`` that can.
+
+        Returns ``(provider used, voice used)``; the provider is "cache" for
+        a cache hit. ``fallbacks=None`` means the pre-chain behavior: Piper's
+        fallback profile after a cloud voice. With a list, raises
+        NoVoiceAvailableError when no voice of it could speak.
+        """
+        candidates = [voice] if fallbacks is None else [voice, *fallbacks]
+        legacy_tail = fallbacks is None and self.route(voice) != "piper"
+        skipped: set[str] = set()
+        for index, candidate in enumerate(candidates):
+            provider = self.route(candidate)
+            if provider in skipped:
+                continue
+            more = legacy_tail or index + 1 < len(candidates)
+            try:
+                used, error = await self._synthesize_one(text, filename, candidate, provider)
+            except Exception as exc:
+                if not more:
+                    raise
+                used, error = "", exc
+                log.warning("%s synthesis failed (%s: %s)", PROVIDER_LABELS.get(provider, provider),
+                            type(exc).__name__, exc)
+            if used:
+                if index:
+                    log.info("Fallback voice %s spoke for %s", getattr(candidate, "name", "-"),
+                             getattr(voice, "name", "-"))
+                return used, candidate
+            if classify_failure(error) is not FailureKind.REQUEST:
+                skipped.add(provider)
+        if legacy_tail:
+            await self._local.synthesize(text, filename, self._fallback_profile or None)
+            return self._local.name, None
+        names = ", ".join(getattr(c, "name", "-") for c in candidates)
+        raise NoVoiceAvailableError(f"No voice could speak the message (tried {names})")
+
+    async def _synthesize_one(self, text: str, filename: Path, voice, provider: str):
+        """One voice, no fallback: ``(provider used or "", error or None)``."""
+        if provider == "gemini":
+            if self._gemini is None:
+                return "", None
+            return await self._synthesize_gemini(text, filename, getattr(voice, "gemini", None))
+        if provider == "elevenlabs":
+            if self._elevenlabs is None:
+                return "", None
+            return await self._synthesize_elevenlabs(text, filename, getattr(voice, "elevenlabs", None))
+        if provider == "fish":
+            if self._fish is None:
+                return "", None
+            return await self._synthesize_fish(text, filename, voice)
+        if provider == "minimax":
+            if self._cloud is None:
+                return "", None
+            return await self._synthesize_minimax(text, filename, voice)
+        voice_key = voice_cache_key(voice)
+        if self._cache_hit(text, filename, voice_key):
+            return "cache", None
+        await self._local.synthesize(text, filename, getattr(voice, "name", None))
+        self._maybe_cache(text, filename, voice_key)
+        return self._local.name, None
+
+    def _cache_hit(self, text: str, filename: Path, voice_key: str) -> bool:
+        if self._cache is None:
+            return False
+        cached = self._cache.lookup(text, voice_key)
+        if cached is None:
+            return False
+        shutil.copyfile(cached, filename)
+        log.debug("TTS cache HIT text=%d chars voice=%s", len(text), voice_key)
+        return True
+
+    def _breaker_closed_to(self, breaker: CircuitBreaker) -> bool:
+        """True (and a log line) when the breaker does not allow a request."""
+        if breaker.allow_request():
+            return False
+        log.info("%s circuit breaker open (%s); trying the next voice",
+                 breaker.name, breaker.describe())
+        return True
+
+    async def _synthesize_fish(self, text: str, filename: Path, voice):
+        params = getattr(voice, "fish", None)
+        cfg = self._fish.config
+        reference_id = getattr(params, "reference_id", "") or cfg.reference_id
+        cache_key = cfg.cache_key(reference_id, params)
+        if self._cache_hit(text, filename, cache_key):
+            return "cache", None
+        if self._breaker_closed_to(self._fish_cb):
+            return "", None
+        try:
+            await self._fish.synthesize(
+                text, filename, reference_id=reference_id, params=params, request_config=cfg,
+            )
+        except Exception as exc:
+            self.record_failure(self._fish_cb, exc)
+            log.warning("Fish synthesis failed (%s: %s)", type(exc).__name__, exc)
+            return "", exc
+        self._fish_cb.record_success()
+        self._maybe_cache(text, filename, cache_key, suffix="opus")
+        return "fish", None
+
+    async def _synthesize_minimax(self, text: str, filename: Path, voice):
+        voice_key = voice_cache_key(voice)
+        if self._cache_hit(text, filename, voice_key):
+            return "cache", None
+        if self._breaker_closed_to(self._cb):
+            return "", None
+        mm = getattr(voice, "minimax", None) if voice is not None else None
+        try:
+            if mm is not None:
+                await self._cloud.synthesize(
+                    text, filename,
+                    voice_id=mm.voice_id, model=mm.model,
+                    speed=mm.speed, vol=mm.vol, pitch=mm.pitch,
+                    emotion=mm.emotion, language_boost=mm.language_boost,
+                )
+            else:
+                await self._cloud.synthesize(text, filename)
+        except Exception as exc:
+            log.warning("TTS provider %s failed (%s: %s)", self._cloud.name, type(exc).__name__, exc)
+            self.record_failure(self._cb, exc)
+            return "", exc
+        self._cb.record_success()
+        self._maybe_cache(text, filename, voice_key)
+        return self._cloud.name, None
+
+    async def _synthesize_gemini(self, text: str, filename: Path, params):
+        """Gemini file path: cache, then the API."""
         cache_key = self._gemini.config.cache_key(params)
         volume_db = float(getattr(params, "volume_db", 0.0) or 0.0)
         if self._cache is not None:
@@ -1508,18 +1545,17 @@ class TTSDispatcher:
                 try:
                     rate, channels, pcm = read_pcm_cache(cached)
                     write_wav(filename, rate, channels, apply_gain(pcm, volume_db))
-                    return "cache"
+                    return "cache", None
                 except (OSError, ValueError) as exc:
                     log.warning("Unreadable Gemini cache file %s (%s); regenerating", cached, exc)
-        if not self._gemini_cb.allow_request():
-            log.info("Gemini circuit breaker open; using fallback Piper")
-            return ""
+        if self._breaker_closed_to(self._gemini_cb):
+            return "", None
         try:
             rate, channels, pcm = await self._gemini.fetch_pcm(text, params)
         except Exception as exc:
             self.record_failure(self._gemini_cb, exc)
-            log.warning("Gemini synthesis failed (%s: %s); falling back to Piper", type(exc).__name__, exc)
-            return ""
+            log.warning("Gemini synthesis failed (%s: %s)", type(exc).__name__, exc)
+            return "", exc
         self._gemini_cb.record_success()
         write_wav(filename, rate, channels, apply_gain(pcm, volume_db))
         if self._cache is not None:
@@ -1527,10 +1563,10 @@ class TTSDispatcher:
                 self._cache.store_bytes(text, pcm_cache_header(rate, channels) + pcm, cache_key, "pcm")
             except OSError as exc:
                 log.warning("TTS cache store failed: %s", exc)
-        return "gemini"
+        return "gemini", None
 
-    async def _synthesize_elevenlabs(self, text: str, filename: Path, params) -> str:
-        """ElevenLabs file path: cache, then the API. Returns "" to fall back.
+    async def _synthesize_elevenlabs(self, text: str, filename: Path, params):
+        """ElevenLabs file path: cache, then the API.
 
         Opus is cached as the raw Ogg (.opus, decoded by ffmpeg), PCM as a
         .pcm entry; the streaming path keeps its own Discord-frame entries.
@@ -1546,23 +1582,19 @@ class TTSDispatcher:
                         write_wav(filename, rate, channels, pcm)
                     else:
                         shutil.copyfile(cached, filename)
-                    return "cache"
+                    return "cache", None
                 except (OSError, ValueError) as exc:
                     log.warning("Unreadable ElevenLabs cache file %s (%s); regenerating", cached, exc)
-        if not self._elevenlabs_cb.allow_request():
-            log.info("ElevenLabs circuit breaker open; using fallback Piper")
-            return ""
+        if self._breaker_closed_to(self._elevenlabs_cb):
+            return "", None
         # The file path reads the whole clip, so the budget grows with the text.
         budget = bot_config.ELEVENLABS_TTFA_TIMEOUT + 0.03 * len(text)
         try:
             kind, rate, data = await asyncio.wait_for(self._elevenlabs.fetch(text, params), budget)
         except Exception as exc:
-            if not isinstance(exc, ElevenLabsRequestError):
-                self.record_failure(self._elevenlabs_cb, exc)
-            log.warning(
-                "ElevenLabs synthesis failed (%s: %s); falling back to Piper", type(exc).__name__, exc,
-            )
-            return ""
+            self.record_failure(self._elevenlabs_cb, exc)
+            log.warning("ElevenLabs synthesis failed (%s: %s)", type(exc).__name__, exc)
+            return "", exc
         self._elevenlabs_cb.record_success()
         if kind == "pcm":
             write_wav(filename, rate, 1, data)
@@ -1575,7 +1607,7 @@ class TTSDispatcher:
                 self._cache.store_bytes(text, entry, cache_key, suffix)
             except OSError as exc:
                 log.warning("TTS cache store failed: %s", exc)
-        return "elevenlabs"
+        return "elevenlabs", None
 
     def _maybe_cache(self, text: str, filename: Path, voice_key: str = "", suffix: str | None = None) -> None:
         if self._cache is None:

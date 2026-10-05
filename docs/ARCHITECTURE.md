@@ -63,9 +63,12 @@ The active runtime pieces are:
   - `playback.py` - PCM preparation and the continuous Opus player feed.
   - `commands.py` - `build_commands(bot)` creates the /voicebot group
     bound to a bot instance; `events.py` - `register_events(bot)`.
-- `ttsbot/providers.py` - provider abstraction: dispatcher, MiniMax
-  client and its error classes, phrase cache, circuit breaker (including
-  the long quota trip).
+- `ttsbot/providers.py` - provider abstraction: dispatcher (fallback chain,
+  health checks), MiniMax client and its error classes, phrase cache.
+- `ttsbot/health.py` - failure kinds, the circuit breaker with its backoff
+  and quota pauses, and `HealthStore` (`data/provider_health.json`).
+- `ttsbot/errors.py` - marker classes every provider error inherits:
+  `QuotaExhaustedError`, `AuthError`, `RateLimitError`, `RequestError`.
 - `ttsbot/fish.py` - Fish HTTP client, request configuration and in-flight
   deduplication.
 - `ttsbot/elevenlabs.py` - ElevenLabs streaming client, error mapping and
@@ -299,22 +302,64 @@ share one HTTP stream. MiniMax streaming and file paths share one cache key,
 `voice_cache_key(voice)`, which includes the voice tuning, so re-tuning a
 MiniMax voice never replays old audio.
 
-Fallbacks and breakers:
+Fallback chain:
 
-- No first audio within `FISH_TTFA_TIMEOUT` (default 5 s; MiniMax uses
-  `TTS_STREAM_TTFA_TIMEOUT`), an HTTP error or an open breaker sends the
-  message to the registry's Piper fallback voice. Every case is logged. The
-  budget runs until the first audio packet or decoded frame, because an Ogg
-  stream's first bytes may be only the header pages.
-- Fish and MiniMax each have a `CircuitBreaker` (`CB_FAILURE_THRESHOLD`
-  failures open it for `CB_COOLDOWN_SECONDS`). The generation code does the
-  accounting: a pre-audio exception is stored in `PreparedAudio.error` and
-  passed to `TTSDispatcher.record_failure(breaker, exc)`.
-- An exhausted balance or plan raises a `QuotaExhaustedError` subclass:
-  `FishQuotaExhaustedError` (HTTP 402) or `MiniMaxQuotaExhaustedError`
-  (status 1008/2056). `record_failure` then calls `CircuitBreaker.trip()` for
-  `TTS_QUOTA_COOLDOWN_SECONDS`, which ordinary failures cannot shorten. Rate
-  limits (HTTP 429, MiniMax 1039) count as ordinary failures.
+- `voices.json` holds `fallback_chain`, a list of voice names tried in order
+  when a message's voice cannot speak it, and each voice may have its own
+  `fallback` list instead. `VoiceRegistry.chain_for(voice)` returns the
+  voice followed by those voices (unknown names and repeats skipped). An
+  unset chain means `[fallback_profile]` (the Piper voice), as before
+  chains existed; an empty list means no fallback. Nothing in the code
+  names a provider: a new provider only needs voices. `/fallback set`
+  shows and edits both lists; it warns when a chain does not end in Piper.
+- `_prepare_into` streams the chain's voices in turn. No first audio within
+  the provider's budget (`FISH_TTFA_TIMEOUT`, default 5 s; MiniMax uses
+  `TTS_STREAM_TTFA_TIMEOUT`), an HTTP error or an open breaker moves to the
+  next voice, with one `Fallback ... voice=A -> B reason=...` line (INFO
+  while the provider is paused, WARNING otherwise). The budget runs until
+  the first audio packet or decoded frame, because an Ogg stream's first
+  bytes may be only the header pages. A provider that failed for a reason
+  other than this one message is skipped for the rest of the chain, so one
+  outage costs one timeout. The first voice that cannot stream (Piper)
+  takes the file path, `TTSDispatcher.synthesize_chain`, with the voices
+  after it. Each voice uses its own cache key.
+
+Provider health (`ttsbot/health.py`):
+
+- Every cloud provider has a `CircuitBreaker`. The generation code stores a
+  pre-audio exception in `PreparedAudio.error` and passes it to
+  `TTSDispatcher.record_failure(breaker, exc)`, which sorts it with
+  `classify_failure` by the marker classes in `ttsbot/errors.py`:
+
+  | kind | examples | effect |
+  |---|---|---|
+  | request | missing voice, message too long for the credits left | not counted; next voice speaks this message |
+  | transient | timeout, network error, 5xx, no audio | `CB_FAILURE_THRESHOLD` in a row pause for `CB_COOLDOWN_SECONDS`, x`CB_BACKOFF_FACTOR` per failed probe up to `CB_MAX_COOLDOWN_SECONDS` |
+  | rate_limit | HTTP 429 | the Retry-After; without one, counted as transient |
+  | quota | HTTP 402, MiniMax 1008/2056, all ElevenLabs keys empty | paused until checked (see below) |
+  | auth | HTTP 401/403, MiniMax 1004 | like quota, starting at `TTS_AUTH_RECHECK_SECONDS` |
+
+- The health worker (`_provider_health_worker`, every
+  `TTS_HEALTH_CHECK_INTERVAL` s) runs `TTSDispatcher.check_health()` for
+  paused providers whose pause is over, so a user message is not spent on
+  finding out:
+  - quota/auth: a provider with `check_quota()` is asked 60 s after the
+    failure and then at its reported reset time, at least daily
+    (`TTS_MAX_RECHECK_SECONDS`). ElevenLabs implements it with the free
+    `GET /v1/user/subscription` per key (credits left, monthly reset) and
+    moves the key ring to a key with credits. Without `check_quota`, a real
+    request probes after `TTS_QUOTA_COOLDOWN_SECONDS`, doubling to a day.
+  - transient: the provider's `ConnectionWarmer.reachable()` pings the
+    host; while it does not answer the pause grows, once it answers the
+    next request probes.
+  A breaker waiting for its check (`await_check`) lets a real request probe
+  anyway 5 minutes after the pause, in case the worker is stuck; a probe
+  that never reports back frees the slot after 2 minutes.
+- `HealthStore` keeps every breaker in `data/provider_health.json`
+  (`TTS_HEALTH_PATH`) with a fingerprint of the provider's keys, so a
+  provider out of quota stays paused across restarts, and a changed key
+  starts clean. `/fallback status` shows each provider's state, its live
+  quota where available, and resets a pause by hand.
 - MiniMax reports errors as a plain JSON body, sometimes pretty-printed, even
   on streaming requests. The stream reader collects non-SSE lines and
   classifies them at the end instead of trusting the `Content-Type` header.
@@ -340,9 +385,10 @@ moves the ring and the same request is retried with the next key before
 any audio. A message only too long for a key's balance, or a voice the
 key's plan does not allow (`paid_plan_required`), is retried with the next
 key without moving the ring. When every key is empty the provider raises
-`ElevenLabsQuotaExhaustedError` (the long breaker trip); request-level
-errors (`ElevenLabsRequestError`: missing voice, message too long for every
-key, plan-restricted voice) fall back to Piper without a breaker failure.
+`ElevenLabsQuotaExhaustedError` (a quota pause, checked through
+`check_quota`); request-level errors (`ElevenLabsRequestError`: missing
+voice, message too long for every key, plan-restricted voice) go to the
+next voice of the chain without a breaker failure.
 The active key is persisted as a sha256 fingerprint in `data/config.json`.
 
 The local fallback path is:
@@ -454,6 +500,13 @@ Current commands:
   so only the guild that owns an emoji can set, remove or see its alias;
 - `status` - show current runtime state;
 - `stats` - cache, queue, per-session usage and breaker states;
+
+`/voicebot` is at Discord's limit of 25 subcommands, so a second group
+holds the fallback chain and provider health:
+
+- `/fallback status` - each provider's health and live quota; `reset:`
+  ends a pause by hand;
+- `/fallback set` - show or set the fallback chain (global, or `voice:`).
 - `limit` - show or change the per-message text length cap (persisted in `data/config.json`);
 - `queue-clear` - clear queued work;
 - `test` - enqueue a test phrase, optionally to a specific voice channel.

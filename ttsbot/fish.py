@@ -14,7 +14,7 @@ from typing import AsyncIterator
 
 import httpx
 
-from ttsbot.errors import QuotaExhaustedError
+from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
 from ttsbot.httpclient import attach_warmer, provider_limits
 
 log = logging.getLogger("tts_bot")
@@ -88,10 +88,41 @@ class FishQuotaExhaustedError(FishError, QuotaExhaustedError):
     """HTTP 402: the Fish balance is used up."""
 
 
-def _http_error(what: str, status_code: int, detail: str) -> FishError:
+class FishAuthError(FishError, AuthError):
+    """HTTP 401/403: the Fish key is invalid or not allowed."""
+
+
+class FishRateLimitError(FishError, RateLimitError):
+    """HTTP 429; ``retry_after`` is the server's Retry-After, if it sent one."""
+
+    def __init__(self, message: str, status_code: int | None = None,
+                 retry_after: float | None = None) -> None:
+        super().__init__(message, status_code)
+        self.retry_after = retry_after
+
+
+class FishRequestError(FishError, RequestError):
+    """HTTP 400/404/422: this voice or text was rejected; Fish itself works."""
+
+
+def _retry_after(value: str | None) -> float | None:
+    try:
+        seconds = float(value) if value else None
+    except ValueError:
+        return None
+    return seconds if seconds is not None and seconds > 0 else None
+
+
+def _http_error(what: str, status_code: int, detail: str, retry_after: str | None = None) -> FishError:
     message = f"{what} HTTP {status_code}: {detail}"
     if status_code == 402:
         return FishQuotaExhaustedError(message, status_code)
+    if status_code in (401, 403):
+        return FishAuthError(message, status_code)
+    if status_code == 429:
+        return FishRateLimitError(message, status_code, _retry_after(retry_after))
+    if status_code in (400, 404, 422):
+        return FishRequestError(message, status_code)
     return FishError(message, status_code)
 
 
@@ -189,7 +220,9 @@ class FishProvider:
             ) as response:
                 if response.status_code != 200:
                     detail = (await response.aread())[:300].decode("utf-8", "replace")
-                    raise _http_error("Fish", response.status_code, detail)
+                    raise _http_error(
+                        "Fish", response.status_code, detail, response.headers.get("retry-after"),
+                    )
                 async for chunk in response.aiter_bytes():
                     if chunk:
                         async with flight.condition:

@@ -22,12 +22,14 @@ except Exception:  # pragma: no cover - optional dependency
     SynthesisConfig = None
 
 from ttsbot import voice_registry
-from ttsbot.elevenlabs import ElevenLabsError, ElevenLabsRequestError
+from ttsbot.elevenlabs import ElevenLabsError
 from ttsbot.errors import QuotaExhaustedError
 from ttsbot.fish import FishError
 from ttsbot.gemini import GeminiError
+from ttsbot.health import FailureKind, classify_failure
 from ttsbot.pcm import PcmFramer, pcm_cache_header, pcm_to_frames, read_pcm_cache
 from ttsbot.providers import (
+    NoVoiceAvailableError,
     MiniMaxError,
     MiniMaxProvider,
     MiniMaxVoiceNotFoundError,
@@ -177,7 +179,7 @@ class SynthesisPipelineMixin:
                 if member.bot or not self.config_store.is_allowed(guild_id, member.id):
                     continue
                 record = self.voice_registry.get(self.config_store.voice_for_user(guild_id, member.id))
-                provider = self.tts_dispatcher.provider_for(getattr(record, "provider", None))
+                provider = self._speaking_provider(record)
                 warmer = getattr(provider, "warmer", None)
                 if warmer is not None:
                     warmers[warmer.name] = warmer
@@ -202,6 +204,16 @@ class SynthesisPipelineMixin:
                 log.exception("Connection keep-alive check failed")
             await asyncio.sleep(10)
 
+    async def _provider_health_worker(self) -> None:
+        """Check paused providers on a timer (see TTSDispatcher.check_health)."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                await self.tts_dispatcher.check_health()
+            except Exception:
+                log.exception("Provider health check failed")
+            await asyncio.sleep(config.TTS_HEALTH_CHECK_INTERVAL)
+
     def warm_tts_connection(self, guild_id: int, user_id: int):
         """Warm the HTTP connection of the user's cloud voice (on typing).
 
@@ -209,9 +221,27 @@ class SynthesisPipelineMixin:
         connection was used in the last 30 s.
         """
         record = self.voice_registry.get(self.config_store.voice_for_user(guild_id, user_id))
-        provider = self.tts_dispatcher.provider_for(getattr(record, "provider", None))
+        provider = self._speaking_provider(record)
         warmer = getattr(provider, "warmer", None)
         return warmer.maybe_warm() if warmer is not None else None
+
+    def _speaking_provider(self, record):
+        """The cloud provider that will speak for ``record`` now: its own,
+        or, while that one is paused, the next one of its fallback chain
+        (None when Piper speaks)."""
+        if record is None:
+            return None
+        dispatcher = self.tts_dispatcher
+        for voice in self.voice_registry.chain_for(record):
+            provider = dispatcher.provider_for(voice.provider)
+            if provider is None:
+                if voice.is_piper:
+                    return None
+                continue
+            breaker = dispatcher.breaker_for(voice.provider)
+            if breaker is None or breaker.state.value == "closed":
+                return provider
+        return None
 
     def _resolve_piper_profile(self, voice_profile: str | None) -> VoiceProfile:
         """Resolve a voice name to a Piper ``VoiceProfile`` via the registry.
@@ -445,18 +475,40 @@ class SynthesisPipelineMixin:
             time.perf_counter() - started,
         )
 
-    async def generate_tts_file(self, text: str, filename: Path, voice_profile: str | None = None) -> str:
-        # Resolve the stored voice name to a registry record; the dispatcher
-        # routes by record.provider (piper -> local, minimax -> cloud) and
-        # falls back to the registry fallback_profile on cloud failure.
+    def voice_chain(self, voice, skip_providers=frozenset()) -> list:
+        """``voice`` and its fallback voices (see VoiceRegistry.chain_for),
+        minus those of ``skip_providers``."""
+        return [v for v in self.voice_registry.chain_for(voice) if v.provider not in skip_providers]
+
+    async def generate_tts_file(
+        self, text: str, filename: Path, voice_profile: str | None = None,
+        *, skip_providers=frozenset(), used_voice: list | None = None,
+    ) -> str:
+        """Speak ``text`` to ``filename`` with the voice or its fallback chain.
+
+        ``skip_providers``: providers not to ask again (they just failed).
+        ``used_voice``: if given, the voice that spoke is appended to it.
+        """
         record = self.voice_registry.get(voice_profile)
         if record is None:
             record = self.voice_registry.fallback_record()
-        provider_used = await self.tts_dispatcher.synthesize(text, filename, voice=record)
+        chain = self.voice_chain(record, skip_providers)
+        if not chain and skip_providers:
+            raise NoVoiceAvailableError(
+                f"No voice left for {voice_profile or 'default'} without {', '.join(sorted(skip_providers))}"
+            )
+        if chain:
+            provider_used, used = await self.tts_dispatcher.synthesize_chain(
+                text, filename, voice=chain[0], fallbacks=chain[1:],
+            )
+        else:  # no voice at all: the legacy route (primary provider, then Piper)
+            provider_used, used = await self.tts_dispatcher.synthesize_chain(text, filename, record)
+        if used_voice is not None:
+            used_voice.append(used)
         log.info(
             "TTS engine used: %s voice=%s",
             provider_used,
-            record.name if record is not None else (voice_profile or "default"),
+            getattr(used, "name", None) or voice_profile or "default",
         )
         return provider_used
 
@@ -536,15 +588,18 @@ class SynthesisPipelineMixin:
             worker_started - job.queued_at, time.perf_counter() - worker_started,
         )
         source = self.ensure_continuous_player(vc)
+        errors: list[BaseException] = []
         try:
-            status, frames = await self._stream_tts_to_source(source, voice, job)
+            status, frames = await self._stream_tts_to_source(source, voice, job, errors=errors)
         except Exception:
             log.exception("Streaming playback crashed; falling back to Piper")
             cb.record_failure()
             return "fallback"
 
         if status == "pre_audio":
-            cb.record_failure()
+            # Classified like every other provider: a missing voice is not
+            # counted, a quota or a rejected key pauses MiniMax for longer.
+            self.tts_dispatcher.record_failure(cb, errors[0] if errors else None)
             return "fallback"
         # Audio started: ok (full) or truncated (mid-stream failure). Either
         # way we do NOT overlay Piper on top of already-playing audio.
@@ -560,14 +615,15 @@ class SynthesisPipelineMixin:
         return "done"
 
     async def _stream_tts_to_source(
-        self, source: "ContinuousTTSAudioSource", voice, job: TTSJob
+        self, source: "ContinuousTTSAudioSource", voice, job: TTSJob, errors: list | None = None,
     ) -> tuple[str, int]:
         """Stream a MiniMax voice into the continuous player frame-by-frame.
 
         Returns (status, frames_enqueued) where status is "ok", "truncated"
         (audio started then the stream failed mid-way) or "pre_audio" (failed
         before any audio — caller falls back to Piper). Circuit-breaker
-        accounting is the caller's job.
+        accounting is the caller's job; a pre-audio exception is appended to
+        ``errors`` for it.
         """
         cloud = self.tts_dispatcher.cloud
         mm = voice.minimax
@@ -599,8 +655,10 @@ class SynthesisPipelineMixin:
                 "Stream failed before first audio (%s: %s); Piper fallback",
                 type(exc).__name__, exc,
             )
-            if isinstance(exc, QuotaExhaustedError):
-                # The caller only sees "pre_audio"; trip the long pause here.
+            if errors is not None:
+                errors.append(exc)
+            elif isinstance(exc, QuotaExhaustedError):
+                # No caller to classify it: trip the long pause here.
                 self.tts_dispatcher.record_failure(self.tts_dispatcher.circuit_breaker, exc)
             return ("pre_audio", 0)
 
@@ -777,36 +835,70 @@ class SynthesisPipelineMixin:
                 self.message_queue.task_done()
 
     async def _prepare_into(self, prepared: PreparedAudio) -> None:
-        """Generate a job's audio into ``prepared.channel`` (frame batches)."""
+        """Generate a job's audio into ``prepared.channel`` (frame batches).
+
+        Walks the voice's fallback chain: each streaming voice is tried in
+        turn until one produces audio; a failure before any audio moves on
+        to the next voice. A provider that failed for a reason other than
+        this one message (or is paused) is skipped for the rest of the
+        chain. The first voice that cannot stream (Piper) takes the file
+        path together with the voices after it.
+        """
         job = prepared.job
         voice = self.voice_registry.get(job.voice_profile) or self.voice_registry.fallback_record()
         try:
             if prepared.cancelled:
                 return
-            if getattr(voice, "is_fish", False) and self._should_attempt_stream(voice):
-                status = await self._generate_fish_stream_into(prepared, voice)
-                if status != "pre_audio":
+            chain = self.voice_chain(voice) or [voice]
+            skipped: set[str] = set()
+            for index, candidate in enumerate(chain):
+                if prepared.cancelled:
                     return
-                voice = self.voice_registry.fallback_record()
-            if getattr(voice, "is_gemini", False) and self._should_attempt_stream(voice):
-                status = await self._generate_gemini_stream_into(prepared, voice)
-                if status != "pre_audio":
+                if getattr(candidate, "provider", None) in skipped:
+                    continue
+                if candidate is None or not self._should_attempt_stream(candidate):
+                    rest = [v for v in chain[index + 1:] if v.provider not in skipped]
+                    await self._generate_file_into(prepared, candidate, rest)
                     return
-                voice = self.voice_registry.fallback_record()
-            if getattr(voice, "is_elevenlabs", False) and self._should_attempt_stream(voice):
-                status = await self._generate_elevenlabs_stream_into(prepared, voice)
-                if status != "pre_audio":
-                    return
-                voice = self.voice_registry.fallback_record()
-            if self._should_attempt_stream(voice):
-                status = await self._generate_stream_into(prepared, voice)
+                prepared.error = None
+                status = await self._stream_voice_into(prepared, candidate)
                 if status != "pre_audio":
                     return  # ok / truncated / cache / cancelled
-                voice = self.voice_registry.fallback_record()  # pre-audio -> Piper
-            await self._generate_file_into(prepared, voice)
+                if classify_failure(prepared.error) is not FailureKind.REQUEST:
+                    skipped.add(candidate.provider)
+                nxt = next((v for v in chain[index + 1:] if v.provider not in skipped), None)
+                self._log_fallback(job, candidate, nxt, prepared.error)
+            log.error("No voice could speak job=%s guild=%s chain=%s", job.job_id, job.guild_id,
+                      ",".join(v.name for v in chain))
         finally:
             # Always terminate the channel so the consumer never hangs.
             await prepared.channel.put(None)
+
+    async def _stream_voice_into(self, prepared: PreparedAudio, voice) -> str:
+        """Stream one voice into ``prepared.channel`` by its provider."""
+        if voice.is_fish:
+            return await self._generate_fish_stream_into(prepared, voice)
+        if voice.is_gemini:
+            return await self._generate_gemini_stream_into(prepared, voice)
+        if voice.is_elevenlabs:
+            return await self._generate_elevenlabs_stream_into(prepared, voice)
+        return await self._generate_stream_into(prepared, voice)
+
+    def _log_fallback(self, job, voice, nxt, error) -> None:
+        """One line per fallback step; quiet (INFO) while the provider is paused."""
+        breaker = self.tts_dispatcher.breaker_for(voice.provider)
+        paused = error is None and breaker is not None and breaker.state.value != "closed"
+        if error is not None:
+            reason = f"{type(error).__name__}: {error}"
+        elif paused:
+            reason = breaker.describe()
+        else:
+            reason = "no audio in time"
+        log.log(
+            logging.INFO if paused else logging.WARNING,
+            "Fallback guild=%s job=%s voice=%s -> %s reason=%s",
+            job.guild_id, job.job_id, voice.name, nxt.name if nxt else "none", reason[:200],
+        )
 
     async def _safe_pcm_frames(self, path: Path, pitch: int = 0) -> list[bytes]:
         try:
@@ -877,7 +969,7 @@ class SynthesisPipelineMixin:
         if prepared.cancelled:
             return "cancelled"
         if not cb.allow_request():
-            log.info("Fish circuit breaker open; Piper fallback guild=%s", job.guild_id)
+            log.info("Fish circuit breaker open; next voice guild=%s", job.guild_id)
             return "pre_audio"
         prepared.provider = "fish"
         stream = self._stream_fish_opus_to_channel if direct else self._stream_fish_to_channel
@@ -917,7 +1009,7 @@ class SynthesisPipelineMixin:
         if prepared.cancelled:
             return "cancelled"
         if not cb.allow_request():
-            log.info("Gemini circuit breaker open; Piper fallback guild=%s", job.guild_id)
+            log.info("Gemini circuit breaker open; next voice guild=%s", job.guild_id)
             return "pre_audio"
         prepared.provider = "gemini"
         status, _ = await self._stream_gemini_to_channel(prepared, voice, cache_key)
@@ -963,7 +1055,7 @@ class SynthesisPipelineMixin:
         if prepared.cancelled:
             return "cancelled"
         if not cb.allow_request():
-            log.info("ElevenLabs circuit breaker open; Piper fallback guild=%s", job.guild_id)
+            log.info("ElevenLabs circuit breaker open; next voice guild=%s", job.guild_id)
             return "pre_audio"
         prepared.provider = "elevenlabs"
         if opus:
@@ -978,14 +1070,9 @@ class SynthesisPipelineMixin:
             )
         if status == "ok":
             cb.record_success()
-        elif isinstance(prepared.error, ElevenLabsRequestError):
-            # A missing voice or one too-long message must not pause every
-            # ElevenLabs voice.
-            log.warning(
-                "ElevenLabs cannot voice this message with %s (%s): %s; Piper fallback",
-                voice.name, params.voice_id, prepared.error,
-            )
         elif status != "cancelled":
+            # A missing voice or one too-long message (a request error) is
+            # not counted: it must not pause every ElevenLabs voice.
             self.tts_dispatcher.record_failure(cb, prepared.error)
         return status
 
@@ -1127,17 +1214,22 @@ class SynthesisPipelineMixin:
                 part_path.unlink(missing_ok=True)
         return status, frames_count
 
-    async def _generate_file_into(self, prepared: PreparedAudio, voice) -> None:
+    async def _generate_file_into(self, prepared: PreparedAudio, voice, fallbacks=()) -> None:
+        """Synthesize to a file with ``voice``, or the first of ``fallbacks``
+        that can, and put its frames into the channel."""
         if prepared.cancelled:
             return
         job = prepared.job
         filename = config.TMP_DIR / f"tts_{uuid.uuid4().hex}.wav"
         try:
-            prepared.provider = await self.tts_dispatcher.synthesize(
-                job.text, filename, voice=voice
+            prepared.provider, used = await self.tts_dispatcher.synthesize_chain(
+                job.text, filename, voice=voice,
+                # No voice at all: the legacy route (primary provider, then Piper).
+                fallbacks=list(fallbacks) if voice is not None or fallbacks else None,
             )
             if prepared.cancelled:
                 return
+            voice = used or voice
             pitch = voice.fish.pitch if getattr(voice, "is_fish", False) and prepared.provider in {"fish", "cache"} else 0
             frames = limit_pcm_frames(await self._safe_pcm_frames(filename, pitch), job.text, voice)
             if frames:
@@ -1567,15 +1659,19 @@ class SynthesisPipelineMixin:
                 # Audio). On a pre-audio failure or an open breaker it returns
                 # "fallback" and we drop to the Piper file path below.
                 file_voice_name = job.voice_profile
+                skip_providers: frozenset[str] = frozenset()
                 if getattr(voice, "is_minimax", False) and self._should_attempt_stream(voice):
                     outcome = await self._run_streaming_job(job, voice, worker_started)
                     if outcome == "done":
                         continue
-                    # Pre-audio fallback: use Piper directly, never re-hit cloud.
-                    file_voice_name = self.voice_registry.fallback_profile
+                    # Pre-audio fallback: the rest of the chain, never MiniMax again.
+                    skip_providers = frozenset({"minimax"})
 
                 connect_task = asyncio.create_task(self.ensure_voice(job.voice_channel))
-                tts_task = asyncio.create_task(self.generate_tts_file(job.text, filename, file_voice_name))
+                spoke: list = []
+                tts_task = asyncio.create_task(self.generate_tts_file(
+                    job.text, filename, file_voice_name, skip_providers=skip_providers, used_voice=spoke,
+                ))
 
                 try:
                     vc, provider_used = await asyncio.gather(connect_task, tts_task)
@@ -1610,7 +1706,8 @@ class SynthesisPipelineMixin:
 
                 try:
                     file_voice = (
-                        self.voice_registry.get(file_voice_name)
+                        (spoke[0] if spoke else None)
+                        or self.voice_registry.get(file_voice_name)
                         or self.voice_registry.fallback_record()
                     )
                     pitch = (

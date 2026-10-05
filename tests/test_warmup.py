@@ -110,7 +110,8 @@ class TypingEventTests(unittest.IsolatedAsyncioTestCase):
         })
         warmer = MagicMock()
         providers = {"elevenlabs": types.SimpleNamespace(warmer=warmer)}
-        bot.tts_dispatcher = types.SimpleNamespace(provider_for=lambda name: providers.get(name or ""))
+        bot.tts_dispatcher = types.SimpleNamespace(provider_for=lambda name: providers.get(name or ""),
+                                                   breaker_for=lambda name: None)
         bot.config_store = MagicMock()
         bot.config_store.is_enabled.return_value = True
         bot.config_store.is_allowed.return_value = True

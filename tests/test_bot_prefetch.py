@@ -111,11 +111,11 @@ class PrepareIntoTests(unittest.IsolatedAsyncioTestCase):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
 
-        async def fake_synth(text, filename, voice=None):
+        async def fake_synth(text, filename, voice=None, fallbacks=None):
             Path(filename).write_bytes(_MP3)
-            return "local"
+            return "local", voice
 
-        tts_bot.tts_dispatcher.synthesize = AsyncMock(side_effect=fake_synth)
+        tts_bot.tts_dispatcher.synthesize_chain = AsyncMock(side_effect=fake_synth)
         prepared = bot_mod.PreparedAudio(job=_job(bot_mod), channel=asyncio.Queue())
         await tts_bot._prepare_into(prepared)
         batches = await _drain(prepared)

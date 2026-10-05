@@ -12,6 +12,7 @@ Helpers that tests patch (``is_guild_manager``,
 time.
 """
 
+import asyncio
 import logging
 import re
 import time
@@ -139,6 +140,17 @@ def _provider_tag(rec) -> str:
     return "MiniMax" if rec.is_minimax else "Piper"
 
 
+def _parse_chain(text: str) -> list[str] | None:
+    """``"fish-default, piper-ruslan"`` -> names; "default" -> None; "none" -> []."""
+    value = text.strip().lower()
+    if value in {"default", "-", "по умолчанию"}:
+        return None
+    if value in {"none", "off", "нет"}:
+        return []
+    names = [n for n in re.split(r"->|=>|[\s,;>→]+", value) if n and n.strip("-")]
+    return list(dict.fromkeys(names))
+
+
 def _chunk_lines(lines: list[str], limit: int) -> list[str]:
     """Join lines into blocks of at most ``limit`` characters, never
     splitting a line (Discord caps messages at 2000, embed fields at 1024)."""
@@ -231,6 +243,11 @@ def build_commands(bot):
 
 
     tts_group = app_commands.Group(name="voicebot", description="Управление озвучкой сообщений")
+    # /voicebot is at Discord's limit of 25 subcommands, so the fallback
+    # chain and provider health get their own group.
+    fallback_group = app_commands.Group(
+        name="fallback", description="Запасные голоса и состояние TTS-провайдеров",
+    )
 
     @tts_group.command(name="off", description="Отключить озвучку на сервере")
     async def slash_tts_off(interaction: discord.Interaction) -> None:
@@ -1010,6 +1027,135 @@ def build_commands(bot):
             lines.append(f"{rendered} → «{entry.get('say', '')}»")
         await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
+    def _chain_line(names: list[str]) -> str:
+        reg = bot.voice_registry
+        parts = []
+        for name in names:
+            rec = reg.get(name)
+            parts.append(f"`{name}` [{_provider_tag(rec)}]" if rec is not None else f"`{name}` (нет такого)")
+        return " → ".join(parts) if parts else "без запасных голосов"
+
+    def _describe_fallback(record=None) -> str:
+        reg = bot.voice_registry
+        if reg.fallback_chain is None:
+            common = f"{_chain_line(reg.fallback_names())} (по умолчанию: fallback_profile)"
+        else:
+            common = _chain_line(reg.fallback_chain)
+        lines = [f"**Общая цепочка:** {common}"]
+        own = [r for r in (reg.get(n) for n in reg.names()) if r is not None and r.fallback is not None]
+        if own:
+            lines.append("**Свои цепочки:**")
+            lines += [f"• `{r.name}` → {_chain_line(list(r.fallback))}" for r in own]
+        if record is not None:
+            chain = reg.chain_for(record)
+            lines.append(f"**Для `{record.name}` сейчас:** {_chain_line([v.name for v in chain])}")
+            if chain and not chain[-1].is_piper:
+                lines.append("⚠️ В конце нет локального Piper: если облако недоступно, сообщение не прозвучит.")
+        return "\n".join(lines)[:1900]
+
+
+    @fallback_group.command(name="set", description="Цепочка запасных голосов, если основной недоступен")
+    @app_commands.describe(
+        chain="Голоса через запятую по порядку; none — без запасных; default — по умолчанию; пусто — показать",
+        voice="Голос со своей цепочкой; пусто — общая цепочка для всех голосов",
+    )
+    @app_commands.autocomplete(voice=voice_profile_autocomplete)
+    async def slash_tts_fallback(
+        interaction: discord.Interaction, chain: str | None = None, voice: str | None = None,
+    ) -> None:
+        if not await require_guild_manager(interaction):
+            return
+        reg = bot.voice_registry
+        record = None
+        if voice:
+            name = validate_voice_profile(voice)
+            if name is None:
+                await interaction.response.send_message(f"Голос `{voice}` не найден.", ephemeral=True)
+                return
+            record = reg.get(name)
+        if chain is None:
+            await interaction.response.send_message(_describe_fallback(record), ephemeral=True)
+            return
+        names = _parse_chain(chain)
+        unknown = [n for n in names or [] if n not in reg]
+        if unknown:
+            await interaction.response.send_message(
+                "Нет таких голосов: " + ", ".join(f"`{n}`" for n in unknown) + ". Список: `/voicebot voices`.",
+                ephemeral=True,
+            )
+            return
+        previous_chain, previous_record = reg.fallback_chain, record
+        if record is not None:
+            if names is not None:
+                names = [n for n in names if n != record.name]
+            record = replace(record, fallback=tuple(names) if names is not None else None)
+            reg.add(record)
+        else:
+            reg.fallback_chain = names
+        try:
+            bot.persist_voice_registry()
+        except OSError as exc:
+            reg.fallback_chain = previous_chain
+            if previous_record is not None:
+                reg.add(previous_record)
+            log.exception("Failed to persist voices.json after changing the fallback chain")
+            await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
+            return
+        log.info("Fallback chain changed voice=%s chain=%s", record.name if record else "*", names)
+        await interaction.response.send_message("Сохранено.\n" + _describe_fallback(record), ephemeral=True)
+
+
+    _PROVIDER_CHOICES = [
+        app_commands.Choice(name=label, value=name)
+        for name, label in (("elevenlabs", "ElevenLabs"), ("fish", "Fish Audio"),
+                            ("gemini", "Gemini"), ("minimax", "MiniMax"))
+    ]
+
+    @fallback_group.command(name="status", description="Состояние TTS-провайдеров: паузы, квоты, цепочка")
+    @app_commands.describe(reset="Снять паузу с провайдера (после пополнения баланса или смены ключа)")
+    @app_commands.choices(reset=_PROVIDER_CHOICES)
+    async def slash_tts_providers(
+        interaction: discord.Interaction, reset: app_commands.Choice[str] | None = None,
+    ) -> None:
+        if not await require_guild_manager(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        disp = bot.tts_dispatcher
+        notes: list[str] = []
+        if reset is not None:
+            breaker = disp.breaker_for(reset.value)
+            if breaker is not None and disp.provider_for(reset.value) is not None:
+                breaker.reset()
+                log.info("Provider %s health reset by %s", reset.value, interaction.user.id)
+                notes.append(f"Пауза {breaker.name} снята.")
+            else:
+                notes.append(f"{reset.name} не настроен.")
+        lines: list[str] = []
+        for name in disp.provider_names():
+            breaker = disp.breaker_for(name)
+            provider = disp.provider_for(name)
+            line = f"**{breaker.name}** — {breaker.describe()}"
+            if breaker.state.value != "closed" and breaker.last_error:
+                line += f"\n  └ {breaker.last_error[:160]}"
+            checker = getattr(provider, "check_quota", None)
+            if callable(checker):
+                try:
+                    report = await asyncio.wait_for(checker(), 20)
+                except Exception as exc:
+                    report = None
+                    line += f"\n  └ квота: не удалось проверить ({type(exc).__name__})"
+                if report is not None:
+                    line += f"\n  └ квота: {report.detail or ('есть' if report.available else 'нет')}"
+                    if report.available and breaker.kind is not None and breaker.kind.value == "quota":
+                        breaker.record_success(confirmed=False)
+                        line += "\n  └ квота снова есть — пауза снята"
+            lines.append(line)
+        lines.append("**Piper** — локальный, работает без сети")
+        embed = discord.Embed(title="🔀 TTS • Провайдеры", color=0xFEE75C,
+                              description="\n".join(notes + lines)[:4000])
+        embed.add_field(name="Fallback", value=_describe_fallback()[:1024], inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
 
     def _build_stats_embed() -> discord.Embed:
         disp = bot.tts_dispatcher
@@ -1037,7 +1183,8 @@ def build_commands(bot):
             if breaker is None:
                 return "—"
             left = breaker.cooldown_remaining
-            return f"`{breaker.state.value}`" + (f" ({left:.0f} с)" if left else "")
+            kind = f" {breaker.kind.value}" if getattr(breaker, "kind", None) else ""
+            return f"`{breaker.state.value}`{kind}" + (f" ({left:.0f} с)" if left else "")
 
         breakers = []
         if fish is not None:
@@ -1128,7 +1275,9 @@ def build_commands(bot):
             embed.add_field(name="Персональных", value=str(len(cfg.user_voices)), inline=True)
             embed.add_field(name="В озвучке", value=str(len(cfg.allowed_users)), inline=True)
         embed.add_field(name="Всего голосов", value=str(len(reg.names())), inline=True)
-        embed.add_field(name="Fallback", value=f"`{reg.fallback_profile}`", inline=True)
+        embed.add_field(
+            name="Fallback", value=" → ".join(f"`{n}`" for n in reg.fallback_names()) or "нет", inline=True,
+        )
         embed.add_field(
             name="Алиасов эмодзи", value=str(len(bot.config_store.emoji_aliases)), inline=True
         )
