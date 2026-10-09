@@ -56,6 +56,11 @@ The active runtime pieces are:
     composed from the four concern mixins below.
   - `voice_lifecycle.py` - connect/move locks, cooldowns, stale-client
     recovery, idle disconnect, auto-connect policy.
+  - `recording/` - voice receive (off unless `RECORDING_ENABLED=1`):
+    `client.py` (a `VoiceClient` subclass), `rtp.py` (transport
+    decryption), `recorder.py` (per-user chunk files), `ogg.py` (Ogg
+    Opus writer), `vad.py` (speech filter); transcription: `groq.py`
+    (client and audio budget), `worker.py` (queue), `transcript.py`.
   - `merge.py` - the enqueue boundary and legacy/selective-hold merge
     decisions.
   - `pipeline.py` - Piper/MiniMax/Fish synthesis, the streaming fast path,
@@ -458,6 +463,118 @@ The bot manages voice state separately from synthesis:
 
 This is a good separation to preserve when adding a new engine, because the TTS backend should not be responsible for voice lifecycle policy.
 
+### 9.1 Voice recording
+
+With `RECORDING_ENABLED=1` the bot joins voice undeafened (a deafened
+member receives nothing) as `recording.client.RecordingVoiceClient`.
+discord.py 2.7 has no receive API, so the client uses two internal hooks,
+which is why requirements.txt pins discord.py:
+
+- `VoiceConnectionState.add_socket_listener` gets every UDP packet on the
+  socket reader thread. `rtp.decrypt_transport` removes the
+  `aead_xchacha20_poly1305_rtpsize` layer, then the DAVE session
+  discord.py keeps for sending decrypts the Opus packet for its sender.
+- A voice-websocket hook reads SPEAKING (op 5), which maps each SSRC to a
+  user id; packets from an SSRC not yet mapped wait (up to 1 s of them).
+
+Other bots' audio and Discord's end-of-speech silence frames are dropped.
+A packet DAVE cannot decrypt yet (the sender's key arrives ~0.5 s after
+their audio when someone joins) is held for up to 3 s and retried once a
+later packet from that user decrypts.
+
+`recorder.ChannelRecorder` hands the packets to a writer thread that
+muxes each user into `RECORDING_DIR/<guild>/<UTC start>-<channel>/<user>/NNNN.ogg`
+without re-encoding. Discord keeps transmitting through breathing, room
+noise and long runs of digital silence (25 of 35 s in the first live
+test), so the writer decodes each packet only to classify it with WebRTC
+VAD (`vad.py`, `RECORDING_VAD_AGGRESSIVENESS`, default 3: mode 2 still
+kept loud breathing) and keeps speech runs with 200 ms before and 300 ms
+after. A gap between kept speech longer than `RECORDING_PAUSE_MS` becomes
+that much silence and starts a new "piece". Each closed file adds a line to
+`chunks.jsonl` with its pieces as `[offset in file, wall-clock start]`,
+which maps transcript timestamps back to real time; `session.json` holds
+the channel and start/end times. Log lines: `Recording started`,
+`Recording chunk closed ... audio_s= pieces= reason=full|idle|stop`,
+`Recording stats` every minute and `Recording finished` with counters:
+`packets` and `heard_ms` received, `written_ms` kept (the rest was
+filtered out),
+`filled_ms` short gaps kept as silence, `unknown_ssrc_packets`,
+`dave_errors` (failed first attempts), `dave_recovered` / `dave_lost`,
+`transport_errors`, `late_packets`, `bot_packets`, `vad_errors`.
+
+A file stays open until `RECORDING_CHUNK_SECONDS` of speech or
+`RECORDING_IDLE_CLOSE_SECONDS` (15 min) of that user's silence: Groq
+bills each file for at least 10 s. Pieces are also appended to
+`NNNN.pieces.jsonl` as they start, so a file left open by a crash or a
+restart is recovered (`recorder.recover_session`) with exact timestamps.
+Text the bot speaks for someone is logged to `tts.jsonl`, and each
+speaker's display name to `names.json` (kept if they leave the server).
+
+### 9.2 Transcription
+
+With `GROQ_API_KEY` set, `recording.worker.TranscriptionWorker` (task
+`stt-worker`) sends closed files to Groq Whisper (`STT_MODEL`,
+`STT_LANGUAGE`, `verbose_json` with segments), oldest first, one at a
+time. The disk is the queue: a file in `chunks.jsonl` without a
+`NNNN.json` next to it is pending, so restarts lose nothing.
+
+`groq.AudioBudget` keeps the plan's limits. The hourly audio limit is a
+bucket refilling at 2 s per second (headers
+`x-ratelimit-remaining-audio-seconds` / `-reset-audio-seconds`); the
+budget follows the last response's level and falls back to its ledger
+(`RECORDING_DIR/groq_ledger.jsonl`) after a restart or when a response
+lacks those headers (seen from httpx, HTTP/1.1). The ledger also
+enforces the day limit. A 429, 5xx or network error pauses sending for
+the time Groq asks (or 30-60 s); another 4xx writes `NNNN.error.json`,
+and the file is tried 3 times in all. A file over 25 MB is re-encoded to
+32 kb/s mono first.
+
+`NNNN.json` holds Groq's kept segments with `at`/`until` in wall-clock
+time (through the chunk's pieces) and the dropped ones: known Whisper
+hallucinations ("Субтитры сделал DimaTorzok", "Продолжение следует"),
+no-speech and repetition loops. After each result the session's
+`transcript.md` (`[HH:MM:SS] Name: text` in `TRANSCRIPT_TIMEZONE`, a
+speaker's lines less than 2 s apart merged, TTS lines as `Name (TTS)`)
+and `transcript.jsonl` are rebuilt. Log lines: `Transcription worker
+started`, `Transcription done ... audio_s= took= groq_remaining_s=
+day_used_s= pending=`, `Transcription waiting for Groq budget`,
+`Transcription failed, retry in` and `Transcription rejected`.
+
+Retention: the worker applies two independent limits as it starts and
+then every `RECORDING_PRUNE_INTERVAL_HOURS` (default 24; 0 = only at
+start), transcripts first, then audio. A sweep runs off the event loop; a
+failing one is logged and retried at the next interval. 0 turns a limit
+off.
+
+- `RECORDING_AUDIO_KEEP_DAYS` (default 90) deletes the Ogg file of every
+  chunk older than that; age is the chunk's `ended_at` in `chunks.jsonl`.
+  A file goes only when its `NNNN.json` exists, so audio that was never
+  transcribed (Groq rejected it, STT was off) is kept, and sessions still
+  being recorded are skipped. `NNNN.json`, `chunks.jsonl` and
+  `transcript.*` stay. Log line: `Recording audio pruned files=
+  freed_mb= keep_days=`.
+- `RECORDING_TRANSCRIPT_KEEP_DAYS` (default 0, keep forever) deletes the
+  whole folder of a finished session older than that (`session.json`
+  `ended_at`): transcripts, results, manifest and any audio still in it,
+  so it also overrides the audio limit. It skips sessions being recorded,
+  not yet ended, or with a chunk still waiting for transcription (one
+  given up on after 3 tries does not count), and removes a guild folder
+  it empties. Log line: `Recording sessions pruned sessions= freed_mb=
+  keep_days=`.
+
+Both run inside the worker, so nothing is pruned while `GROQ_API_KEY` is
+unset or `STT_ENABLED=0`.
+
+### 9.3 Recordings website
+
+`python -m ttsbot.web` (the `tts_web` service) serves the sessions, their
+transcripts with clickable times and one joined audio track per session
+as a JSON API, from a separate container that mounts the recordings
+read-only. `ttsbot/archive` holds the read side (store, mix, cache,
+retention, service), `ttsbot/web` the HTTP layer. The bot's only part in
+it: `session.json` also keeps `guild_name` / `channel_name`, written
+atomically. See [RECORDINGS_WEB.md](RECORDINGS_WEB.md).
+
 ## 10. Persistence and Guild State
 
 Persistent bot settings live in `data/config.json` and are managed by `BotConfigStore`.
@@ -529,7 +646,11 @@ Main groups:
 - idle disconnect timings;
 - merge policy;
 - selective hold settings;
-- Piper model path and tuning.
+- Piper model path and tuning;
+- voice recording and transcription (`RECORDING_*`, `STT_*`,
+  `TRANSCRIPT_TIMEZONE`), including `RECORDING_AUDIO_KEEP_DAYS` and
+  `RECORDING_TRANSCRIPT_KEEP_DAYS` for how long audio and transcripts are kept and
+  `RECORDING_PRUNE_INTERVAL_HOURS` for how often that is applied.
 
 The important current engine-specific values are:
 

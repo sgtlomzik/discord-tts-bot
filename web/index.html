@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>Эхо — записи</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ff6b3d'/%3E%3Cpath d='M9 13v6M13.5 9v14M18.5 11v10M23 14v4' stroke='%23121316' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/app.css">
+<script type="module" src="/js/main.js"></script>
+</head>
+<body>
+<div class="app">
+  <header class="bar">
+    <button class="menu" id="menu" aria-label="Список записей">☰</button>
+    <div class="logo"><i></i>эхо</div>
+    <div class="crumbs" id="crumbs"></div>
+    <div class="sp"></div>
+    <div class="live" id="live" hidden></div>
+  </header>
+
+  <div class="main">
+    <aside class="col1" id="list">
+      <div class="h"><b>Записи</b><span class="sp"></span><span class="mono count"></span></div>
+      <div class="flt"></div>
+      <div class="rows"></div>
+    </aside>
+
+    <section class="col2">
+      <div class="blk"><div class="title" id="title">Загрузка…</div><div class="sub" id="sub"></div></div>
+      <div class="blk ret" id="ret">
+        <small>аудио удалится через</small>
+        <div class="big" id="keep"></div><div class="r" id="keepUntil"></div>
+        <div class="t"><i id="keepBar"></i></div>
+        <small class="note" id="keepNote"></small>
+      </div>
+      <div class="blk ppl"><div id="ppl"></div><div class="shr" id="shr"></div><small>доля эфира</small></div>
+      <div class="blk tpwrap">
+        <div class="tp">
+          <button class="play" id="play" aria-label="Играть"><svg viewBox="0 0 24 24" aria-hidden="true"><path id="pi" d="M6 3.5v17l15-8.5z"/></svg></button>
+          <button class="chip" id="b10" aria-label="Назад на 10 секунд">−10</button>
+          <button class="chip" id="f10" aria-label="Вперёд на 10 секунд">+10</button>
+          <button class="chip" id="rate" aria-label="Скорость">1×</button>
+          <div class="tm"><span id="cur">00:00.0</span><small id="dur"></small></div>
+        </div>
+      </div>
+      <div class="ribbon" id="ribbon"></div>
+      <div class="dls">
+        <button class="chip" id="mp3">↓ mp3</button>
+        <a class="chip" id="md" download>↓ .md</a>
+        <button class="chip" id="link" title="Скопировать ссылку на этот момент">Ссылка</button>
+      </div>
+    </section>
+
+    <section class="col3">
+      <div class="h"><b>Расшифровка</b><span class="sp"></span>
+        <button class="pill on" id="pill"><i></i><span id="pilltx">Слежу за звуком</span></button></div>
+      <div class="srch">
+        <label class="sbox" id="sbox"><span class="mag" aria-hidden="true">⌕</span><input id="q" placeholder="Поиск по тексту…" spellcheck="false" autocomplete="off"><span class="cnt" id="scnt"></span></label>
+        <button class="sq2" id="hp" aria-label="Предыдущее совпадение">↑</button>
+        <button class="sq2" id="hn" aria-label="Следующее совпадение">↓</button>
+      </div>
+      <div class="chips" id="chips"></div>
+      <div class="scroll" id="scroll" tabindex="0"></div>
+      <button class="jump" id="jump" hidden>↧ К текущей реплике <span class="kbd">F</span></button>
+      <div class="keys"><span><kbd>Пробел</kbd>пауза</span><span><kbd>←</kbd><kbd>→</kbd>±5 с</span><span><kbd>J</kbd><kbd>K</kbd>реплика</span><span><kbd>F</kbd>следить</span><span><kbd>/</kbd>поиск</span></div>
+    </section>
+  </div>
+  <div class="scrim" id="scrim"></div>
+  <audio id="audio-el" preload="metadata"></audio>
+  <div class="toast" id="toast" hidden role="status" aria-live="polite"></div>
+</div>
+</body>
+</html>

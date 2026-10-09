@@ -1,4 +1,6 @@
 discord.py==2.7.1
+# Also serves the recordings website (ttsbot/web); comes with discord.py.
+aiohttp>=3.9,<4
 PyNaCl==1.6.2
 # DAVE (Discord voice E2EE): imported dynamically by discord.py when present
 davey==0.1.5
@@ -6,3 +8,5 @@ piper-tts==1.4.2
 httpx==0.28.1
 emoji==2.15.0
 soxr==1.1.0
+# Voice activity detection for recordings (ttsbot/recording/vad.py)
+webrtcvad-wheels==2.0.14

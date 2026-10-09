@@ -1,8 +1,9 @@
-# Allowlist: the image copies only requirements.txt, bot.py and ttsbot/
-# (see Dockerfile), so exclude everything else from the build context.
+# Allowlist: the image copies only requirements.txt, bot.py, ttsbot/ and
+# web/ (see Dockerfile), so exclude everything else from the build context.
 *
 !requirements.txt
 !bot.py
 !ttsbot
+!web
 **/__pycache__
 **/*.py[cod]

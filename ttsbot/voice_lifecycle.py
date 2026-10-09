@@ -13,6 +13,7 @@ import time
 import discord
 
 from ttsbot import config
+from ttsbot.recording.client import RecordingVoiceClient
 
 log = logging.getLogger("tts_bot")
 
@@ -242,7 +243,13 @@ class VoiceLifecycleMixin:
                     voice_channel.id,
                 )
                 try:
-                    vc = await voice_channel.connect(timeout=60.0, self_deaf=True)
+                    if config.RECORDING_ENABLED:
+                        # A deafened member receives no audio.
+                        vc = await voice_channel.connect(
+                            timeout=60.0, self_deaf=False, cls=RecordingVoiceClient
+                        )
+                    else:
+                        vc = await voice_channel.connect(timeout=60.0, self_deaf=True)
                 except discord.errors.ClientException as exc:
                     if "Already connected" in str(exc):
                         # State desync: discord.py internal state has an active voice client

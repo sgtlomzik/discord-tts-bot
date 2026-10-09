@@ -19,3 +19,43 @@ services:
     volumes:
       - ./models:/app/models:ro
       - ./data:/app/data
+
+  # Recordings website (docs/RECORDINGS_WEB.md): same image, its own
+  # process. It reads the recordings and gets none of the bot's secrets:
+  # only the settings it needs are passed (compose reads them from .env).
+  tts_web:
+    image: ghcr.io/sgtlomzik/discord-tts-bot:latest
+    container_name: discord_tts_web
+    command: ["python", "-u", "-m", "ttsbot.web"]
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      RECORDING_DIR: /app/data/recordings
+      RECORDING_AUDIO_KEEP_DAYS: ${RECORDING_AUDIO_KEEP_DAYS:-90}
+      RECORDING_TRANSCRIPT_KEEP_DAYS: ${RECORDING_TRANSCRIPT_KEEP_DAYS:-0}
+      RECORDING_PRUNE_INTERVAL_HOURS: ${RECORDING_PRUNE_INTERVAL_HOURS:-24}
+      TRANSCRIPT_TIMEZONE: ${TRANSCRIPT_TIMEZONE:-UTC}
+      WEB_CACHE_DIR: /app/cache
+      WEB_CACHE_MAX_MB: ${WEB_CACHE_MAX_MB:-2048}
+      WEB_STATIC_DIR: ${WEB_STATIC_DIR:-/app/web}
+      WEB_USERNAME: ${WEB_USERNAME:-}
+      WEB_PASSWORD: ${WEB_PASSWORD:-}
+      WEB_ALLOW_ANONYMOUS: ${WEB_ALLOW_ANONYMOUS:-0}
+      WEB_CORS_ORIGINS: ${WEB_CORS_ORIGINS:-}
+      WEB_MIX_GAP_MS: ${WEB_MIX_GAP_MS:-500}
+      WEB_PREBUILD_RECENT: ${WEB_PREBUILD_RECENT:-3}
+      WEB_MAINTENANCE_SECONDS: ${WEB_MAINTENANCE_SECONDS:-300}
+    ports:
+      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8095}:8095"
+    volumes:
+      - ./data/recordings:/app/data/recordings:ro
+      - ./cache/web:/app/cache
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8095/api/v1/health', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
