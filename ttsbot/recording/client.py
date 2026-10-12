@@ -12,6 +12,7 @@ Those are internal APIs, so requirements.txt pins discord.py.
 
 from __future__ import annotations
 
+import array
 import collections
 import logging
 import threading
@@ -39,6 +40,11 @@ _PENDING_PACKETS = 50
 # the bot joins (or someone joins) the sender's key arrives ~0.5 s after
 # its audio. They are retried, in order, once a packet decrypts.
 _DAVE_HOLD_PACKETS = 150
+# Diagnostics for frames DAVE reports as sent unencrypted: a decoded peak
+# at or above this (16-bit PCM, ~-36 dBFS) counts as audible, and the
+# first few per user and channel stay are logged with their bytes.
+_PROBE_AUDIBLE_PEAK = 500
+_PROBE_SAMPLES_PER_USER = 5
 
 
 def settings_from_config() -> RecorderSettings:
@@ -59,6 +65,9 @@ class RecordingVoiceClient(discord.VoiceClient):
         self._ssrc_users: dict[int, int] = {}
         self._pending: dict[int, collections.deque] = {}
         self._dave_warned: set[tuple[int, str]] = set()
+        self._last_wall: dict[int, float] = {}
+        self._probe_logged: dict[int, int] = {}
+        self._probe_decoder = None
         self._dave_held: dict[int, collections.deque] = {}
         self._named: set[int] = set()
         self._recorder: ChannelRecorder | None = None
@@ -119,6 +128,8 @@ class RecordingVoiceClient(discord.VoiceClient):
         self._pending.clear()
         self._dave_held.clear()
         self._dave_warned.clear()
+        self._last_wall.clear()
+        self._probe_logged.clear()
         self._named.clear()
 
     # -- voice websocket (event loop) ----------------------------------
@@ -173,6 +184,8 @@ class RecordingVoiceClient(discord.VoiceClient):
             recorder.count("bot_packets")
             return
         self._note_name(recorder, user_id, member)
+        last_wall = self._last_wall.get(user_id)
+        self._last_wall[user_id] = wall
         connection = self._connection
         session = connection.dave_session
         if session is None or not connection.dave_protocol_version:
@@ -185,6 +198,7 @@ class RecordingVoiceClient(discord.VoiceClient):
             reason = str(exc).split("{", 1)[0].strip()
             if "UnencryptedWhenPassthroughDisabled" in reason:
                 recorder.count("dave_unencrypted")
+                self._probe_unencrypted(recorder, user_id, packet, None if last_wall is None else wall - last_wall)
             # Senders keep producing these for hours, one per packet; warn once
             # per user and reason per channel stay, the totals are in the stats.
             if (user_id, reason) not in self._dave_warned:
@@ -209,6 +223,32 @@ class RecordingVoiceClient(discord.VoiceClient):
                 recorder.count("dave_recovered")
                 self._submit(recorder, user_id, old.timestamp, old_payload, old_wall)
         self._submit(recorder, user_id, packet.timestamp, payload, wall)
+
+    def _probe_unencrypted(
+        self, recorder: ChannelRecorder, user_id: int, packet: rtp.RtpPacket, gap_s: float | None
+    ) -> None:
+        """Count what the frames DAVE calls unencrypted actually hold."""
+        payload = packet.payload
+        peak = None
+        try:
+            if self._probe_decoder is None:
+                self._probe_decoder = discord.opus.Decoder()
+            pcm = self._probe_decoder.decode(payload)
+        except Exception:
+            recorder.count("dave_unenc_undecodable")
+        else:
+            samples = array.array("h", pcm)
+            peak = max(max(samples, default=0), -min(samples, default=0))
+            recorder.count("dave_unenc_audible" if peak >= _PROBE_AUDIBLE_PEAK else "dave_unenc_quiet")
+        recorder.count("dave_unenc_spurt_start" if gap_s is None or gap_s > 0.1 else "dave_unenc_mid_spurt")
+        logged = self._probe_logged.get(user_id, 0)
+        if logged < _PROBE_SAMPLES_PER_USER:
+            self._probe_logged[user_id] = logged + 1
+            log.info(
+                "DAVE unencrypted frame guild=%s user=%s seq=%d len=%d head=%s tail=%s peak=%s gap_ms=%s",
+                self.guild.id, user_id, packet.sequence, len(payload), payload[:8].hex(), payload[-4:].hex(),
+                peak, "-" if gap_s is None else round(gap_s * 1000),
+            )
 
     def _note_name(self, recorder: ChannelRecorder, user_id: int, member) -> None:
         if member is None or user_id in self._named:
