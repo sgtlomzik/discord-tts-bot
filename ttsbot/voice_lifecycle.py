@@ -25,13 +25,13 @@ class VoiceLifecycleMixin:
         task = self.idle_disconnect_tasks.pop(guild_id, None)
         if task and not task.done():
             task.cancel()
-            log.info("Cancelled idle disconnect guild=%s", guild_id)
+            log.debug("Cancelled idle disconnect guild=%s", guild_id)
 
     def cancel_continuous_idle_stop(self, guild_id: int) -> None:
         task = self.continuous_idle_stop_tasks.pop(guild_id, None)
         if task and not task.done():
             task.cancel()
-            log.info("Cancelled continuous stream idle stop guild=%s", guild_id)
+            log.debug("Cancelled continuous stream idle stop guild=%s", guild_id)
 
     def get_voice_connect_lock(self, guild_id: int) -> asyncio.Lock:
         lock = self.voice_connect_locks.get(guild_id)
@@ -91,7 +91,7 @@ class VoiceLifecycleMixin:
             name=f"idle-disconnect-{guild.id}",
         )
         self.idle_disconnect_tasks[guild.id] = task
-        log.info("Scheduled idle disconnect guild=%s timeout=%ss", guild.id, config.IDLE_DISCONNECT_SECONDS)
+        log.debug("Scheduled idle disconnect guild=%s timeout=%ss", guild.id, config.IDLE_DISCONNECT_SECONDS)
 
     def has_active_voice_playback(self, guild_id: int, vc: discord.VoiceClient) -> bool:
         source = self.continuous_sources.get(guild_id)
@@ -124,14 +124,14 @@ class VoiceLifecycleMixin:
 
                 channel = vc.channel if isinstance(vc.channel, discord.VoiceChannel) else None
                 if self._whitelisted_user_in_channel(guild, channel):
-                    log.info(
+                    log.debug(
                         "Cancel idle disconnect guild=%s reason=whitelisted_user_present",
                         guild.id,
                     )
                     return
 
                 if self.has_active_voice_playback(guild.id, vc):
-                    log.info("Skip idle disconnect guild=%s reason=playback_active", guild.id)
+                    log.debug("Skip idle disconnect guild=%s reason=playback_active", guild.id)
                     return
 
             vc = discord.utils.get(self.voice_clients, guild=guild)
@@ -139,12 +139,12 @@ class VoiceLifecycleMixin:
                 return
 
             if self.has_active_voice_playback(guild.id, vc):
-                log.info("Skip idle disconnect guild=%s reason=playback_active", guild.id)
+                log.debug("Skip idle disconnect guild=%s reason=playback_active", guild.id)
                 return
 
             channel = vc.channel if isinstance(vc.channel, discord.VoiceChannel) else None
             if self._whitelisted_user_in_channel(guild, channel):
-                log.info(
+                log.debug(
                     "Cancel idle disconnect guild=%s reason=whitelisted_user_present",
                     guild.id,
                 )
@@ -174,7 +174,7 @@ class VoiceLifecycleMixin:
             name=f"continuous-idle-stop-{guild.id}",
         )
         self.continuous_idle_stop_tasks[guild.id] = task
-        log.info(
+        log.debug(
             "Scheduled continuous stream idle stop guild=%s timeout=%ss",
             guild.id,
             config.TTS_MAX_CONTINUOUS_IDLE_SECONDS,
@@ -188,7 +188,7 @@ class VoiceLifecycleMixin:
             if not source or source.stopped:
                 return
             if not source.is_drained:
-                log.info("Skip continuous stream idle stop guild=%s reason=speech_pending", guild.id)
+                log.debug("Skip continuous stream idle stop guild=%s reason=speech_pending", guild.id)
                 return
 
             self.continuous_sources.pop(guild.id, None)
@@ -297,7 +297,7 @@ class VoiceLifecycleMixin:
                     time.perf_counter() - started,
                 )
             else:
-                log.info(
+                log.debug(
                     "Voice ready guild=%s channel=%s took=%.3fs",
                     guild_id,
                     voice_channel.id,

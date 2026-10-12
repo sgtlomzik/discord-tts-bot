@@ -224,13 +224,14 @@ class OpusDetectorTests(unittest.TestCase):
 class FakeDave:
     def __init__(self, fail=False):
         self.fail = fail
+        self.error = ValueError("no key")
         self.ready = True
         self.calls = []
 
     def decrypt(self, user_id, media_type, packet):
         self.calls.append(user_id)
         if self.fail:
-            raise ValueError("no key")
+            raise self.error
         return packet[::-1]  # "decrypted"
 
 
@@ -301,6 +302,19 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(logs.output), 1)
         self.assertIn("DAVE decrypt failed", logs.output[0])
         self.assertEqual(client._recorder.counters["dave_errors"], 2)
+        self.assertEqual(submitted, [])
+
+    def test_missing_dave_key_is_counted_quietly(self):
+        dave = FakeDave(fail=True)
+        dave.error = ValueError("Failed to decrypt: DecryptionFailed(NoValidCryptorFound { media_type: AUDIO })")
+        client, submitted = self.make_client(dave)
+        self.hook(client, 5, ssrc=7, user_id="5", speaking=1)
+        with self.assertNoLogs("tts_bot", "INFO"):
+            for i in range(3):
+                client._on_packet(encrypt(FRAME, ssrc=7, timestamp=960 * i))
+        counters = client._recorder.counters
+        self.assertEqual(counters["dave_nokey"], 3)
+        self.assertNotIn("dave_errors", counters)
         self.assertEqual(submitted, [])
 
     def test_dave_failure_streaks_warn_once_per_user(self):

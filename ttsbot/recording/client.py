@@ -184,15 +184,23 @@ class RecordingVoiceClient(discord.VoiceClient):
         try:
             payload = session.decrypt(user_id, davey.MediaType.audio, packet.payload)
         except Exception as exc:
-            recorder.count("dave_errors")
             reason = str(exc).split("{", 1)[0].strip()
-            if "UnencryptedWhenPassthroughDisabled" in reason:
-                recorder.count("dave_unencrypted")
-            # Senders keep producing these for hours, one per packet; warn once
-            # per user and reason per channel stay, the totals are in the stats.
+            if "NoDecryptorForUser" in reason or "NoValidCryptorFound" in reason:
+                # Expected right after the bot joins: members keep sending under
+                # the previous epoch's key until Discord switches them over, and
+                # a newcomer never gets that key. Counted, not warned about.
+                recorder.count("dave_nokey")
+                level = logging.DEBUG
+            else:
+                recorder.count("dave_errors")
+                if "UnencryptedWhenPassthroughDisabled" in reason:
+                    recorder.count("dave_unencrypted")
+                level = logging.WARNING
+            # One line per user and reason per channel stay; totals are in the stats.
             if (user_id, reason) not in self._dave_warned:
                 self._dave_warned.add((user_id, reason))
-                log.warning(
+                log.log(
+                    level,
                     "Voice receive DAVE decrypt failed guild=%s user=%s ready=%s: %s: %s",
                     self.guild.id, user_id, session.ready, type(exc).__name__, exc,
                 )
