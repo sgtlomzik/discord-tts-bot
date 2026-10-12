@@ -58,7 +58,7 @@ class RecordingVoiceClient(discord.VoiceClient):
     def __init__(self, client: discord.Client, channel: discord.abc.Connectable) -> None:
         self._ssrc_users: dict[int, int] = {}
         self._pending: dict[int, collections.deque] = {}
-        self._dave_failed_users: set[int] = set()
+        self._dave_warned: set[tuple[int, str]] = set()
         self._dave_held: dict[int, collections.deque] = {}
         self._named: set[int] = set()
         self._recorder: ChannelRecorder | None = None
@@ -118,6 +118,7 @@ class RecordingVoiceClient(discord.VoiceClient):
         self._ssrc_users.clear()
         self._pending.clear()
         self._dave_held.clear()
+        self._dave_warned.clear()
         self._named.clear()
 
     # -- voice websocket (event loop) ----------------------------------
@@ -181,8 +182,13 @@ class RecordingVoiceClient(discord.VoiceClient):
             payload = session.decrypt(user_id, davey.MediaType.audio, packet.payload)
         except Exception as exc:
             recorder.count("dave_errors")
-            if user_id not in self._dave_failed_users:
-                self._dave_failed_users.add(user_id)
+            reason = str(exc).split("{", 1)[0].strip()
+            if "UnencryptedWhenPassthroughDisabled" in reason:
+                recorder.count("dave_unencrypted")
+            # Senders keep producing these for hours, one per packet; warn once
+            # per user and reason per channel stay, the totals are in the stats.
+            if (user_id, reason) not in self._dave_warned:
+                self._dave_warned.add((user_id, reason))
                 log.warning(
                     "Voice receive DAVE decrypt failed guild=%s user=%s ready=%s: %s: %s",
                     self.guild.id, user_id, session.ready, type(exc).__name__, exc,
@@ -192,7 +198,6 @@ class RecordingVoiceClient(discord.VoiceClient):
                 recorder.count("dave_lost")
             held.append((packet, wall))
             return
-        self._dave_failed_users.discard(user_id)
         held = self._dave_held.pop(user_id, None)
         if held:
             for old, old_wall in held:

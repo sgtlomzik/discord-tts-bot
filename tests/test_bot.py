@@ -537,6 +537,48 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         tts_bot.ensure_voice.assert_not_awaited()
 
+    async def test_auto_connect_does_not_follow_member_out_of_busy_channel(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.config_store = temp_config_store(bot_mod, {441612025286885397, 449137238698098688})
+        tts_bot.ensure_voice = AsyncMock()
+
+        guild = types.SimpleNamespace(id=90)
+        mover = types.SimpleNamespace(id=441612025286885397, bot=False)
+        stayer = types.SimpleNamespace(id=449137238698098688, bot=False)
+        current = types.SimpleNamespace(id=91, guild=guild, members=[stayer])
+        target = types.SimpleNamespace(id=92, guild=guild, members=[mover])
+        vc = types.SimpleNamespace(
+            channel=current,
+            is_connected=MagicMock(return_value=True),
+            is_playing=MagicMock(return_value=False),
+            is_paused=MagicMock(return_value=False),
+        )
+
+        with patch.object(bot_mod.discord.utils, "get", MagicMock(return_value=vc)):
+            await tts_bot.auto_connect_for_member(mover, target)
+            tts_bot.ensure_voice.assert_not_awaited()
+
+            # Nobody whitelisted left behind: follow as before.
+            current.members = []
+            await tts_bot.auto_connect_for_member(mover, target)
+        tts_bot.ensure_voice.assert_awaited_once_with(target)
+
+    async def test_auto_connect_ignores_state_changes_in_current_channel(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        tts_bot.config_store = temp_config_store(bot_mod, {441612025286885397})
+        tts_bot.ensure_voice = AsyncMock()
+
+        guild = types.SimpleNamespace(id=90)
+        member = types.SimpleNamespace(id=441612025286885397, bot=False)
+        channel = types.SimpleNamespace(id=91, guild=guild, members=[member])
+        vc = types.SimpleNamespace(channel=channel, is_connected=MagicMock(return_value=True))
+
+        with patch.object(bot_mod.discord.utils, "get", MagicMock(return_value=vc)):
+            await tts_bot.auto_connect_for_member(member, channel)
+        tts_bot.ensure_voice.assert_not_awaited()
+
     async def test_auto_connect_skips_when_guild_disabled(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()

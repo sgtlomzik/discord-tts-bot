@@ -223,7 +223,7 @@ class ClientTests(unittest.TestCase):
         client = RecordingVoiceClient.__new__(RecordingVoiceClient)
         client._ssrc_users = {}
         client._pending = {}
-        client._dave_failed_users = set()
+        client._dave_warned = set()
         client._dave_held = {}
         client._named = set()
         names = {}
@@ -286,6 +286,23 @@ class ClientTests(unittest.TestCase):
         self.assertIn("DAVE decrypt failed", logs.output[0])
         self.assertEqual(client._recorder.counters["dave_errors"], 2)
         self.assertEqual(submitted, [])
+
+    def test_dave_failure_streaks_warn_once_per_user(self):
+        # Unencrypted frames arrive interleaved with good ones for hours; a
+        # success between them must not re-arm the warning.
+        dave = FakeDave(fail=True)
+        client, submitted = self.make_client(dave)
+        self.hook(client, 5, ssrc=7, user_id="5", speaking=1)
+        with self.assertLogs("tts_bot", "WARNING") as logs:
+            for i in range(4):
+                dave.fail = True
+                client._on_packet(encrypt(FRAME, ssrc=7, timestamp=1920 * i))
+                dave.fail = False
+                client._on_packet(encrypt(FRAME, ssrc=7, timestamp=1920 * i + 960))
+        self.assertEqual(len(logs.output), 1)
+        self.assertEqual(client._recorder.counters["dave_errors"], 4)
+        client._reset_streams()
+        self.assertEqual(client._dave_warned, set())
 
     def test_packets_held_until_the_key_arrives_are_recovered_in_order(self):
         dave = FakeDave(fail=True)

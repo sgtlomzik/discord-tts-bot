@@ -355,6 +355,25 @@ class VoiceLifecycleMixin:
             )
             return
 
+        vc = discord.utils.get(self.voice_clients, guild=channel.guild)
+        if vc is not None and vc.is_connected():
+            if vc.channel == channel:
+                # Mute/deafen/stream toggles land here too; nothing to do.
+                return
+            if self._whitelisted_user_in_channel(channel.guild, vc.channel) or self.has_active_voice_playback(
+                channel.guild.id, vc
+            ):
+                # Following one member would strand everyone else, and a move
+                # stalls playback for up to discord.py's 30 s move timeout.
+                log.debug(
+                    "Skip auto-connect guild=%s member=%s reason=busy current=%s target=%s",
+                    channel.guild.id,
+                    member.id,
+                    getattr(vc.channel, "id", "unknown"),
+                    channel.id,
+                )
+                return
+
         try:
             await self.ensure_voice(channel)
             log.info(
