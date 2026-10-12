@@ -208,14 +208,13 @@ class OpusDetectorTests(unittest.TestCase):
 class FakeDave:
     def __init__(self, fail=False):
         self.fail = fail
-        self.error = ValueError("no key")
         self.ready = True
         self.calls = []
 
     def decrypt(self, user_id, media_type, packet):
         self.calls.append(user_id)
         if self.fail:
-            raise self.error
+            raise ValueError("no key")
         return packet[::-1]  # "decrypted"
 
 
@@ -225,9 +224,6 @@ class ClientTests(unittest.TestCase):
         client._ssrc_users = {}
         client._pending = {}
         client._dave_warned = set()
-        client._last_wall = {}
-        client._probe_logged = {}
-        client._probe_decoder = None
         client._dave_held = {}
         client._named = set()
         names = {}
@@ -307,24 +303,6 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(client._recorder.counters["dave_errors"], 4)
         client._reset_streams()
         self.assertEqual(client._dave_warned, set())
-
-    def test_unencrypted_frames_are_probed_and_sampled(self):
-        dave = FakeDave(fail=True)
-        dave.error = ValueError("Failed to decrypt: DecryptionFailed(UnencryptedWhenPassthroughDisabled)")
-        client, submitted = self.make_client(dave)
-        client._probe_decoder = types.SimpleNamespace(decode=lambda payload: (1000).to_bytes(2, "little", signed=True) * 1920)
-        self.hook(client, 5, ssrc=7, user_id="5", speaking=1)
-        with self.assertLogs("tts_bot", "INFO") as logs:
-            for i in range(7):
-                client._on_packet(encrypt(FRAME, ssrc=7, timestamp=960 * i))
-        counters = client._recorder.counters
-        self.assertEqual(counters["dave_unencrypted"], 7)
-        self.assertEqual(counters["dave_unenc_audible"], 7)  # peak 1000
-        self.assertEqual(counters["dave_unenc_spurt_start"] + counters["dave_unenc_mid_spurt"], 7)
-        samples = [line for line in logs.output if "DAVE unencrypted frame" in line]
-        self.assertEqual(len(samples), 5)
-        self.assertIn("peak=1000", samples[0])
-        self.assertEqual(submitted, [])
 
     def test_packets_held_until_the_key_arrives_are_recovered_in_order(self):
         dave = FakeDave(fail=True)
