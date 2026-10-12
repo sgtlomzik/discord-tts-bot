@@ -152,6 +152,9 @@ class RecordingVoiceClient(discord.VoiceClient):
             if recorder.counters["transport_errors"] == 1:
                 log.warning("Voice receive transport error guild=%s: %s", self.guild.id, exc)
             return
+        if not packet.payload:
+            recorder.count("padding_packets")
+            return
         if packet.payload == rtp.OPUS_SILENCE:
             return
         wall = time.time()

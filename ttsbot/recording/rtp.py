@@ -54,7 +54,11 @@ def decrypt_transport(data: bytes, mode: str, secret_key: bytes) -> RtpPacket:
     rtpsize layout: 12-byte header, 4 bytes per CSRC and, if the X bit is
     set, the 4-byte extension header are plain text (and the AEAD's
     additional data); the extension body and the Opus payload are
-    encrypted; the last 4 bytes are the nonce counter.
+    encrypted; the last 4 bytes are the nonce counter. If the P bit is set
+    the decrypted payload ends in RTP padding whose last byte is its length
+    (RFC 3550 5.1): WebRTC pads real frames and sends padding-only packets
+    to probe bandwidth. The padding is removed, so a padding-only packet
+    has an empty payload.
     """
     if mode != SUPPORTED_MODE:
         raise PacketError(f"unsupported voice encryption mode {mode}")
@@ -76,5 +80,9 @@ def decrypt_transport(data: bytes, mode: str, secret_key: bytes) -> RtpPacket:
     if has_extension:
         words = struct.unpack_from(">H", data, header_len - 2)[0]
         plain = plain[4 * words:]
+    if data[0] & 0x20:
+        if not plain or not 0 < plain[-1] <= len(plain):
+            raise PacketError("bad RTP padding")
+        plain = plain[:-plain[-1]]
     sequence, timestamp, ssrc = struct.unpack_from(">HII", data, 2)
     return RtpPacket(ssrc=ssrc, sequence=sequence, timestamp=timestamp, payload=plain)

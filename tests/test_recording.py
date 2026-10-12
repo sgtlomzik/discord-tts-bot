@@ -27,10 +27,12 @@ FRAME = b"\xfc" + bytes(40)
 
 
 def encrypt(payload: bytes, *, ssrc=7, sequence=1, timestamp=960, counter=5, extension: bytes | None = None,
-            key=KEY) -> bytes:
+            padding=0, key=KEY) -> bytes:
     """Build a packet the way Discord sends it (aead_xchacha20_poly1305_rtpsize)."""
     header = bytearray(12)
-    header[0] = 0x80 | (0x10 if extension is not None else 0)
+    header[0] = 0x80 | (0x10 if extension is not None else 0) | (0x20 if padding else 0)
+    if padding:
+        payload = payload + bytes([padding]) * padding
     header[1] = 0x78
     struct.pack_into(">HII", header, 2, sequence, timestamp, ssrc)
     plain = payload
@@ -50,6 +52,20 @@ class RtpTests(unittest.TestCase):
     def test_strips_encrypted_header_extension(self):
         data = encrypt(FRAME, extension=b"\x10\xff\x00\x00" * 2)
         self.assertEqual(rtp.decrypt_transport(data, rtp.SUPPORTED_MODE, KEY).payload, FRAME)
+
+    def test_strips_rtp_padding(self):
+        # Shapes seen live: a frame padded to a bigger packet, and a
+        # padding-only bandwidth probe of 255 bytes.
+        data = encrypt(FRAME, extension=b"\x10\xff\x00\x00", padding=74)
+        self.assertEqual(rtp.decrypt_transport(data, rtp.SUPPORTED_MODE, KEY).payload, FRAME)
+        self.assertEqual(rtp.decrypt_transport(encrypt(b"", padding=255), rtp.SUPPORTED_MODE, KEY).payload, b"")
+
+    def test_bad_rtp_padding_is_rejected(self):
+        header = bytearray(encrypt(FRAME, padding=1)[:12])
+        nonce = struct.pack(">I", 5) + bytes(20)
+        cipher = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_encrypt(FRAME + b"\x63", bytes(header), nonce, KEY)
+        with self.assertRaises(rtp.PacketError):
+            rtp.decrypt_transport(bytes(header) + cipher + nonce[:4], rtp.SUPPORTED_MODE, KEY)
 
     def test_wrong_key_mode_and_rtcp_are_rejected(self):
         with self.assertRaises(rtp.PacketError):
@@ -303,6 +319,17 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(client._recorder.counters["dave_errors"], 4)
         client._reset_streams()
         self.assertEqual(client._dave_warned, set())
+
+    def test_padded_frames_reach_dave_and_padding_only_packets_are_dropped(self):
+        dave = FakeDave()
+        client, submitted = self.make_client(dave)
+        self.hook(client, 5, ssrc=7, user_id="5", speaking=1)
+        client._on_packet(encrypt(FRAME, ssrc=7, timestamp=960, padding=17))
+        client._on_packet(encrypt(b"", ssrc=7, timestamp=1920, padding=255))
+        client._on_packet(encrypt(rtp.OPUS_SILENCE, ssrc=7, timestamp=2880, padding=47))
+        self.assertEqual([(s[1], s[2]) for s in submitted], [(960, FRAME[::-1])])
+        self.assertEqual(dave.calls, [5])
+        self.assertEqual(client._recorder.counters["padding_packets"], 1)
 
     def test_packets_held_until_the_key_arrives_are_recovered_in_order(self):
         dave = FakeDave(fail=True)
