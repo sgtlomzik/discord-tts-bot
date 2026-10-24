@@ -280,7 +280,6 @@ def build_commands(bot):
         guild = interaction.guild
         assert guild is not None
         bot.config_store.set_enabled(guild.id, False)
-        bot.clear_merge_buffers(guild.id)
         cleared = bot.clear_queue_for_guild(guild.id)
         await bot.disconnect_guild_voice(guild)
         await interaction.response.send_message(f"TTS отключен. Очередь очищена: {cleared}.", ephemeral=True)
@@ -1276,7 +1275,6 @@ def build_commands(bot):
     def _build_settings_embed() -> discord.Embed:
         cache_on = getattr(bot.tts_dispatcher, "cache", None) is not None
         embed = discord.Embed(title="⚙️ TTS • Настройки", color=0x57F287)
-        embed.add_field(name="Склейка сообщений", value=f"`{config.TTS_MERGE_ALGORITHM}`", inline=True)
         embed.add_field(name="Кэш", value="вкл" if cache_on else "выкл", inline=True)
         embed.add_field(name="Стриминг", value="вкл" if config.TTS_STREAMING_ENABLED else "выкл", inline=True)
         embed.add_field(name="Префетч", value="вкл" if config.TTS_PREFETCH_ENABLED else "выкл", inline=True)
@@ -1412,7 +1410,6 @@ def build_commands(bot):
                     f"Queue: `{bot.message_queue.qsize()}`",
                     f"Default voice: `{guild_config.default_voice}`",
                     f"Allowed users: `{len(guild_config.allowed_users)}`",
-                    f"Merge: `{config.TTS_MERGE_SHORT_MESSAGES}`",
                     "Workers: " + (", ".join(
                         f"`{name}` {'ok' if st.running else 'stopped'}"
                         + (f" (restarts {st.restarts}: {st.last_error})" if st.restarts else "")
@@ -1492,7 +1489,6 @@ def build_commands(bot):
             return
         guild = interaction.guild
         assert guild is not None
-        bot.clear_merge_buffers(guild.id)
         cleared = bot.clear_queue_for_guild(guild.id)
         await interaction.response.send_message(f"Очередь очищена: {cleared}.", ephemeral=True)
 

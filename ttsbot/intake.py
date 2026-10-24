@@ -1,0 +1,118 @@
+"""Message intake for TTSBot: every message is queued as it arrives.
+
+The enqueue boundary normalizes text once for every caller (messages,
+/voicebot test) and applies the per-message length cap; jobs keep the
+order in which their messages arrived.
+"""
+
+import asyncio
+import logging
+import time
+
+import discord
+
+from ttsbot import config
+from ttsbot.messages import speakable_text
+from ttsbot.models import TTSJob
+from ttsbot.textnorm import normalize_for_tts
+
+log = logging.getLogger("tts_bot")
+
+
+class MessageQueueMixin:
+    """Enqueue and queue clearing; mixed into TTSBot."""
+
+    async def enqueue_tts(
+        self,
+        text: str,
+        voice_channel: discord.VoiceChannel,
+        author_id: int,
+        text_channel_id: int,
+        message_ts: float | None = None,
+    ) -> bool:
+        # Normalize once at the boundary so every caller gets identical
+        # cleanup. The TTS_MAX_CHARS cap is enforced here: it protects the
+        # cloud quotas from walls of text and keeps Piper CPU bounded.
+        cleaned = normalize_for_tts(
+            text,
+            max_chars=config.TTS_MAX_CHARS,
+            emoji_aliases=self.config_store.emoji_say_map(),
+        )
+        if not cleaned:
+            log.info(
+                "Skipped TTS enqueue author=%s reason=empty_after_normalize",
+                author_id,
+            )
+            return False
+        try:
+            now = time.perf_counter()
+            voice_profile = self.config_store.voice_for_user(voice_channel.guild.id, author_id)
+            job = TTSJob(
+                text=cleaned,
+                voice_channel=voice_channel,
+                queued_at=now,
+                author_id=author_id,
+                guild_id=voice_channel.guild.id,
+                text_channel_id=text_channel_id,
+                voice_profile=voice_profile,
+                message_ts=message_ts or now,
+            )
+            await asyncio.wait_for(
+                self.message_queue.put(job),
+                timeout=max(config.TTS_QUEUE_PUT_TIMEOUT_MS, 1) / 1000.0,
+            )
+            log.info(
+                "Queued TTS guild=%s text_channel=%s voice_channel=%s author=%s queue=%s chars=%s voice=%s job=%s",
+                voice_channel.guild.id,
+                text_channel_id,
+                voice_channel.id,
+                author_id,
+                self.message_queue.qsize(),
+                len(text),
+                voice_profile,
+                job.job_id,
+            )
+            return True
+        except (asyncio.QueueFull, TimeoutError):
+            log.warning("TTS enqueue failed author=%s enqueue_fail_reason=queue_timeout", author_id)
+            return False
+
+    async def queue_message(
+        self,
+        text: str,
+        voice_channel: discord.VoiceChannel,
+        author_id: int,
+        text_channel_id: int,
+        mentions: dict[str, str] | None = None,
+    ) -> None:
+        """Queue one Discord message for speech, if anything in it is speakable."""
+        spoken = speakable_text(text, self.config_store.emoji_say_map(), mentions)
+        if spoken:
+            await self.enqueue_tts(spoken, voice_channel, author_id, text_channel_id,
+                                   message_ts=time.perf_counter())
+
+    def clear_queue_for_guild(self, guild_id: int) -> int:
+        kept: list[TTSJob] = []
+        removed = 0
+        while True:
+            try:
+                job = self.message_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if job.guild_id == guild_id:
+                removed += 1
+                self.message_queue.task_done()
+            else:
+                kept.append(job)
+                self.message_queue.task_done()
+
+        for job in kept:
+            self.message_queue.put_nowait(job)
+
+        # Cancel prefetched/in-flight prepared audio for this guild so it is
+        # neither played nor finishes burning quota on generation.
+        for prepared in self.active_prepared:
+            if prepared.job.guild_id == guild_id and not prepared.cancelled:
+                prepared.cancelled = True
+                removed += 1
+        return removed

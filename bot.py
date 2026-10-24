@@ -36,12 +36,7 @@ from ttsbot.textnorm import (
     speak_unicode_emoji,
     substitute_emoji_aliases,
 )
-from ttsbot.messages import (
-    MergeBufferState,
-    ParsedMessage,
-    analyze_message_for_merge,
-    is_reaction_like,
-)
+from ttsbot.messages import speakable_text
 from ttsbot.models import (
     GuildConfig,
     PreparedAudio,

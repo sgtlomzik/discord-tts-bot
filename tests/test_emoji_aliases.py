@@ -227,17 +227,13 @@ class StripForSpeechIntegrationTests(unittest.TestCase):
         self.assertEqual(out, "hi there")
 
 
-class MergeAnalysisTests(unittest.TestCase):
+class SpeakableTextTests(unittest.TestCase):
     def test_aliased_emoji_only_message_is_spoken(self):
-        parsed = bot.analyze_message_for_merge("<:Kekis:1>", {"1": "кекис"})
         # The aliased word survives, so the message is not dropped as empty.
-        self.assertEqual(parsed.spoken_text, "кекис")
-        self.assertTrue(parsed.is_custom_emoji_only)
+        self.assertEqual(bot.speakable_text("<:Kekis:1>", {"1": "кекис"}), "кекис")
 
     def test_unaliased_emoji_only_message_is_empty(self):
-        parsed = bot.analyze_message_for_merge("<:Kekis:1>", {})
-        self.assertEqual(parsed.spoken_text, "")
-        self.assertTrue(parsed.is_custom_emoji_only)
+        self.assertEqual(bot.speakable_text("<:Kekis:1>", {}), "")
 
 
 class UnicodeEmojiTests(unittest.TestCase):
@@ -273,9 +269,7 @@ class UnicodeEmojiTests(unittest.TestCase):
         )
 
     def test_unicode_emoji_only_message_is_spoken(self):
-        parsed = bot.analyze_message_for_merge("😎")
-        self.assertEqual(parsed.spoken_text, "лицо в темных очках")
-        self.assertTrue(parsed.is_unicode_emoji_only)
+        self.assertEqual(bot.speakable_text("😎"), "лицо в темных очках")
 
 
 class CacheKeyTests(unittest.TestCase):

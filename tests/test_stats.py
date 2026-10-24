@@ -51,7 +51,7 @@ class EmbedBuilderTests(unittest.TestCase):
         embed = bot._build_settings_embed()
         self.assertIsInstance(embed, discord.Embed)
         names = [f.name for f in embed.fields]
-        self.assertIn("Склейка сообщений", names)
+        self.assertIn("Кэш", names)
         self.assertIn("Лимит символов", names)
 
     def test_voices_embed_without_guild(self):

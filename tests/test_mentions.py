@@ -106,14 +106,10 @@ class NormalizeIntegrationTests(unittest.TestCase):
         self.assertEqual(out, "Вася ку")
 
     def test_mention_only_message_is_spoken(self):
-        parsed = bot.analyze_message_for_merge("<@1>", None, {"1": "Вася"})
-        self.assertEqual(parsed.spoken_text, "Вася")
-        self.assertTrue(parsed.is_mention_only)
+        self.assertEqual(bot.speakable_text("<@1>", None, {"1": "Вася"}), "Вася")
 
     def test_unresolved_mention_only_stays_empty(self):
-        parsed = bot.analyze_message_for_merge("<@1>", None, {})
-        self.assertEqual(parsed.spoken_text, "")
-        self.assertTrue(parsed.is_mention_only)
+        self.assertEqual(bot.speakable_text("<@1>", None, {}), "")
 
 
 if __name__ == "__main__":

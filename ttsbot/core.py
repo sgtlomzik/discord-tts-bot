@@ -33,8 +33,7 @@ from ttsbot.providers import (
 )
 from ttsbot import config
 from ttsbot.audio import ContinuousTTSAudioSource
-from ttsbot.merge import MergeQueueMixin
-from ttsbot.messages import MergeBufferState
+from ttsbot.intake import MessageQueueMixin
 from ttsbot.models import PreparedAudio, TTSJob, VOICE_PROFILES
 from ttsbot.pipeline import SynthesisPipelineMixin
 from ttsbot.playback import PlaybackMixin
@@ -54,7 +53,7 @@ intents.guilds = True
 
 class TTSBot(
     VoiceLifecycleMixin,
-    MergeQueueMixin,
+    MessageQueueMixin,
     SynthesisPipelineMixin,
     PlaybackMixin,
     commands.Bot,
@@ -183,10 +182,6 @@ class TTSBot(
         if config.PROVIDER_HEALTH_PATH.parent.exists():
             self.tts_dispatcher.attach_health_store(HealthStore(config.PROVIDER_HEALTH_PATH))
         self.continuous_sources: dict[int, ContinuousTTSAudioSource] = {}
-        self.merge_buffers: dict[tuple[int, int], MergeBufferState] = {}
-        self.merge_locks: dict[tuple[int, int], asyncio.Lock] = {}
-        self.merge_generations: dict[tuple[int, int], int] = {}
-        self.last_user_message_ts: dict[tuple[int, int], float] = {}
         # The catalog as saved; persist_voice_registry() rolls back to it.
         self._saved_registry = self.voice_registry.snapshot()
 
@@ -302,9 +297,6 @@ class TTSBot(
             task.cancel()
         for task in self.continuous_idle_stop_tasks.values():
             task.cancel()
-        for state in self.merge_buffers.values():
-            if state.timer_task and not state.timer_task.done():
-                state.timer_task.cancel()
         for source in self.continuous_sources.values():
             source.stop()
 

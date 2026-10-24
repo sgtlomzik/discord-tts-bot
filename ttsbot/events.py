@@ -48,16 +48,6 @@ def register_events(bot):
             config.TTS_STREAM_TAIL_MS,
             config.TTS_MAX_CONTINUOUS_IDLE_SECONDS,
         )
-        log.info(
-            "Merge tuning: algorithm=%s enabled=%s max_chars=%s window_ms=%s max_parts=%s selective_enabled=%s selective_scope=all_allowed_users reaction_pause_ms=%s",
-            config.TTS_MERGE_ALGORITHM,
-            config.TTS_MERGE_SHORT_MESSAGES,
-            config.TTS_MERGE_MAX_CHARS,
-            config.TTS_MERGE_WINDOW_MS,
-            config.TTS_MERGE_MAX_PARTS,
-            config.TTS_SELECTIVE_HOLD_ENABLED,
-            config.TTS_SELECTIVE_HOLD_REACTION_PAUSE_MS,
-        )
 
 
     @bot.event
@@ -82,7 +72,7 @@ def register_events(bot):
                     (discord.utils.utcnow() - created_at).total_seconds() * 1000,
                 )
             fixed_phrase = bot.config_store.fixed_phrase_for_user(message.guild.id, message.author.id)
-            await bot.queue_or_merge_message(
+            await bot.queue_message(
                 fixed_phrase if fixed_phrase is not None else message.content,
                 message.author.voice.channel,
                 message.author.id,

@@ -152,7 +152,7 @@ class DeliveryLogTests(unittest.IsolatedAsyncioTestCase):
         async def noop(*args, **kwargs):
             return None
 
-        bot.queue_or_merge_message = noop
+        bot.queue_message = noop
         bot.process_commands = noop
         created = discord.utils.utcnow() - dt.timedelta(milliseconds=120)
         message = types.SimpleNamespace(
