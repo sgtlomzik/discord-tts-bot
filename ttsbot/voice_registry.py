@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from ttsbot.statefile import StateFileError, read_json_object
+
 log = logging.getLogger("tts_bot.registry")
 
 REGISTRY_VERSION = 1
@@ -448,17 +450,17 @@ def registry_from_dict(data: dict) -> Optional[VoiceRegistry]:
 
 
 def load_registry(path: Path) -> Optional[VoiceRegistry]:
-    """Load the catalog from disk, or None if missing/corrupt."""
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        log.exception("Failed to read voices.json: %s", path)
+    """Load the catalog from disk, or None if there is no file.
+
+    A file that cannot be used raises StateFileError: reseeding would
+    overwrite every cloud voice and the fallback chain.
+    """
+    data = read_json_object(path)
+    if data is None:
         return None
     reg = registry_from_dict(data)
     if reg is None:
-        log.error("voices.json has invalid structure: %s", path)
+        raise StateFileError(f"{path} has an invalid structure (\"voices\" must be an object)")
     return reg
 
 
