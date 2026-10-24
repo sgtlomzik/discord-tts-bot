@@ -15,7 +15,7 @@ import types
 
 import discord
 
-from ttsbot import app, audio, config, messages, models, store, textnorm, voice_registry
+from ttsbot import app, audio, config, models, store, textnorm, voice_registry
 from ttsbot import commands as tts_commands
 from ttsbot import events as tts_events
 from ttsbot.core import TTSBot, intents
@@ -35,7 +35,7 @@ def _names(module) -> dict:
 def load_bot_module() -> types.SimpleNamespace:
     bot, objects = app.create_bot()
     ns: dict = {}
-    for module in (textnorm, messages, models, store, audio, tts_commands):
+    for module in (textnorm, models, store, audio, tts_commands):
         ns.update(_names(module))
     ns.update({name: value for name, value in vars(config).items() if name.isupper()})
     ns.update(objects)

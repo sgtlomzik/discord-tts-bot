@@ -95,7 +95,7 @@ class NormalizeIntegrationTests(unittest.TestCase):
         self.assertEqual(bot.normalize_for_tts("<@1> привет"), "привет")
 
     def test_strip_for_speech_resolves(self):
-        out = bot._strip_discord_tokens_for_speech("<@1> ку", None, {"1": "Вася"})
+        out = bot.speakable_text("<@1> ку", None, {"1": "Вася"})
         self.assertEqual(out, "Вася ку")
 
     def test_mention_only_message_is_spoken(self):

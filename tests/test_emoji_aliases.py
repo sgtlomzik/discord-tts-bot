@@ -208,15 +208,15 @@ class NormalizeIntegrationTests(unittest.TestCase):
 class StripForSpeechIntegrationTests(unittest.TestCase):
     def test_alias_wins_over_emoji_map(self):
         # "kekw" is in the legacy EMOJI_MAP -> "Кек"; an id alias overrides it.
-        out = bot._strip_discord_tokens_for_speech("<:kekw:1>", {"1": "кекис"})
+        out = bot.speakable_text("<:kekw:1>", {"1": "кекис"})
         self.assertEqual(out, "кекис")
 
     def test_emoji_map_fallback_when_no_alias(self):
-        out = bot._strip_discord_tokens_for_speech("<:kekw:1>", {})
+        out = bot.speakable_text("<:kekw:1>", {})
         self.assertEqual(out, "Кек")
 
     def test_unknown_unaliased_stripped(self):
-        out = bot._strip_discord_tokens_for_speech("hi <:Nope:1> there", {})
+        out = bot.speakable_text("hi <:Nope:1> there", {})
         self.assertEqual(out, "hi there")
 
 
@@ -258,7 +258,7 @@ class UnicodeEmojiTests(unittest.TestCase):
 
     def test_strip_for_speech_speaks_unicode(self):
         self.assertEqual(
-            bot._strip_discord_tokens_for_speech("привет🎉", {}), "привет хлопушка"
+            bot.speakable_text("привет🎉", {}), "привет хлопушка"
         )
 
     def test_unicode_emoji_only_message_is_spoken(self):

@@ -33,9 +33,7 @@ The active runtime pieces are:
   - `config.py` - every env-derived tunable as a module global, with
     `reload()`; runtime code reads `config.NAME` at call time.
   - `textnorm.py` - Discord markup stripping, emoji aliases, mention
-    resolution, `normalize_for_tts`.
-  - `messages.py` - `speakable_text()`: the part of a message that is
-    spoken (empty for a bare link).
+    resolution, one cleanup behind `speakable_text` and `normalize_for_tts`.
   - `models.py` - `VoiceProfile`, `GuildConfig`, `TTSJob`,
     `PreparedAudio` and the hardcoded Piper `VOICE_PROFILES`.
   - `store.py` - `BotConfigStore` (data/config.json persistence; a failed

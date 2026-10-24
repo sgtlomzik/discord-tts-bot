@@ -12,9 +12,8 @@ import time
 import discord
 
 from ttsbot import config
-from ttsbot.messages import speakable_text
 from ttsbot.models import TTSJob
-from ttsbot.textnorm import normalize_for_tts
+from ttsbot.textnorm import normalize_for_tts, speakable_text
 
 log = logging.getLogger("tts_bot")
 
