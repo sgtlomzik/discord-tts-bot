@@ -1,6 +1,5 @@
 """Connection keep-alive, per-request HTTP log, job ids and cache logs."""
 
-import logging
 import tempfile
 import types
 import unittest

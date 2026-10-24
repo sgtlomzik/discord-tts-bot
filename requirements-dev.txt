@@ -1,0 +1,4 @@
+# Lint and type check, run in CI (.github/workflows/ci.yml); settings in pyproject.toml.
+ruff==0.15.22
+# pyright with a baseline of the errors that predate it (.basedpyright/baseline.json)
+basedpyright==1.31.7

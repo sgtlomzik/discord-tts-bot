@@ -7,7 +7,6 @@ production; a leftover setting must not bring them back.
 
 from __future__ import annotations
 
-import types
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 

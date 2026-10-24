@@ -1,0 +1,18 @@
+# Tool settings only; dependencies live in requirements.txt.
+
+[tool.ruff]
+target-version = "py311"
+extend-exclude = [".omc"]
+
+[tool.ruff.lint.per-file-ignores]
+# Short names like `l` for a log line and inline lambdas read fine in tests.
+"tests/*" = ["E731", "E741"]
+
+[tool.basedpyright]
+# basedpyright is pyright plus a baseline: the errors that existed when the
+# check was added are listed in .basedpyright/baseline.json and only new
+# ones fail CI. After fixing some, shrink it with `basedpyright --writebaseline`.
+include = ["ttsbot", "scripts"]
+pythonVersion = "3.11"
+pythonPlatform = "Linux"
+typeCheckingMode = "standard"

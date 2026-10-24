@@ -12,6 +12,7 @@ import logging
 
 from ttsbot import config
 from ttsbot.models import GuildConfig, VOICE_PROFILES
+from ttsbot.statedb import StateDB
 
 log = logging.getLogger("tts_bot")
 
@@ -31,8 +32,8 @@ def _as_bool(value: object, default: bool = True) -> bool:
 
 
 class BotConfigStore:
-    def __init__(self, db, fallback_users: set[int], voice_registry=None) -> None:
-        self.db = db  # ttsbot.statedb.StateDB
+    def __init__(self, db: StateDB, fallback_users: set[int], voice_registry=None) -> None:
+        self.db = db
         self.fallback_users = set(fallback_users)
         # Validate stored voice names against the unified registry when
         # available (so MiniMax assignments survive reload); otherwise fall

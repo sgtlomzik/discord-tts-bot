@@ -23,8 +23,8 @@ from ttsbot.gemini import (
 from ttsbot.models import PreparedAudio, TTSJob
 from ttsbot.pipeline import SynthesisPipelineMixin
 from ttsbot.providers import (
-    CircuitBreaker, CircuitState, DispatcherConfig, TTSCacheConfig,
-    TTSDispatcher, TTSPhraseCache, load_dispatcher_config_from_env,
+    CircuitState, DispatcherConfig, TTSCacheConfig,
+    TTSDispatcher, TTSPhraseCache,
 )
 from ttsbot.voice_registry import (
     GeminiParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict,

@@ -18,11 +18,9 @@ from ttsbot.providers import (
     CircuitBreaker,
     CircuitBreakerConfig,
     CircuitState,
-    DispatcherConfig,
     LocalProvider,
     TTSDispatcher,
     load_circuit_breaker_from_env,
-    load_dispatcher_config_from_env,
 )
 
 

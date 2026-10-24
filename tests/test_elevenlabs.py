@@ -28,7 +28,7 @@ from ttsbot.ogg_opus import opus_packet_samples
 from ttsbot.pipeline import DISCORD_OPUS_CACHE_SUFFIX, SynthesisPipelineMixin
 from ttsbot.providers import (
     CircuitState, DispatcherConfig, TTSCacheConfig, TTSDispatcher,
-    TTSPhraseCache, load_dispatcher_config_from_env,
+    TTSPhraseCache,
 )
 from ttsbot.voice_registry import (
     ElevenLabsParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict,

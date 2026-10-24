@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import types
 import unittest
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from ttsbot.providers import (voice_cache_key)
