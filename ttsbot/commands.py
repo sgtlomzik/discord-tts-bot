@@ -1380,6 +1380,11 @@ def build_commands(bot):
                     f"Default voice: `{guild_config.default_voice}`",
                     f"Allowed users: `{len(guild_config.allowed_users)}`",
                     f"Merge: `{config.TTS_MERGE_SHORT_MESSAGES}`",
+                    "Workers: " + (", ".join(
+                        f"`{name}` {'ok' if st.running else 'stopped'}"
+                        + (f" (restarts {st.restarts}: {st.last_error})" if st.restarts else "")
+                        for name, st in sorted(bot.supervisor.status().items())
+                    ) or "none"),
                 ]
             ),
             ephemeral=True,
