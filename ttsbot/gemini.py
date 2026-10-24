@@ -22,7 +22,7 @@ from typing import AsyncIterator
 import httpx
 
 from ttsbot import config as bot_config
-from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError
+from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
 from ttsbot.httpclient import attach_warmer, provider_limits
 from ttsbot.streams import StreamSpec
 
@@ -105,6 +105,11 @@ class GeminiAuthError(GeminiError, AuthError):
     """HTTP 401/403: the OpenRouter key is invalid or not allowed."""
 
 
+class GeminiRequestError(GeminiError, RequestError):
+    """HTTP 400/404/413/422: OpenRouter rejected this request (input,
+    voice, length), not the provider: other messages still work."""
+
+
 class GeminiQuotaExhaustedError(GeminiError, QuotaExhaustedError):
     """HTTP 402: the OpenRouter credits are used up."""
 
@@ -135,6 +140,8 @@ def _http_error(response: httpx.Response, detail: str) -> GeminiError:
         return GeminiQuotaExhaustedError(message, status)
     if status == 429:
         return GeminiRateLimitError(message, status, _retry_after(response.headers.get("retry-after")))
+    if status in (400, 404, 413, 422):
+        return GeminiRequestError(message, status)
     return GeminiError(message, status)
 
 
