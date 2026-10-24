@@ -18,6 +18,7 @@ from discord import app_commands
 from test_bot import load_bot_module
 from ttsbot import voice_registry
 from ttsbot.store import BotConfigStore
+from support import state_from
 
 
 def _interaction(done: bool):
@@ -61,14 +62,14 @@ class TreeErrorHandlerTests(unittest.IsolatedAsyncioTestCase):
 class StoreRollbackTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
-        self.store = BotConfigStore(Path(self.dir.name) / "config.json", set())
+        self.store = BotConfigStore(state_from(Path(self.dir.name) / "config.json"), set())
         self.store.set_enabled(1, True)
 
     def tearDown(self):
         self.dir.cleanup()
 
     def _failing_save(self):
-        return patch("ttsbot.store.tempfile.NamedTemporaryFile", side_effect=OSError("disk full"))
+        return patch.object(self.store.db, "save_config", side_effect=OSError("disk full"))
 
     def test_failed_save_reverts_the_change(self):
         with self._failing_save(), self.assertRaises(OSError):

@@ -38,7 +38,7 @@ class StoredLimitTests(unittest.TestCase):
 
     def test_the_limit_survives_a_restart(self):
         self.store.set_tts_max_chars(800)
-        reloaded = self.bot_mod.BotConfigStore(self.store.path, set())
+        reloaded = self.bot_mod.BotConfigStore(self.store.db, set())
         self.assertEqual(reloaded.max_chars(), 800)
 
 

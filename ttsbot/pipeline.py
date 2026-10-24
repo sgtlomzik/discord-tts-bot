@@ -234,13 +234,13 @@ class SynthesisPipelineMixin:
         return VOICE_PROFILES.get(name) or VOICE_PROFILES[piper_default_profile()]
 
     def persist_voice_registry(self) -> None:
-        """Atomically write the current catalog to data/voices.json.
+        """Save the current catalog (one transaction).
 
         On failure the in-memory catalog goes back to what is on disk, so
         a command never leaves a voice in effect that was not saved.
         """
         try:
-            voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
+            voice_registry.save_registry(self.state_db, self.voice_registry)
         except Exception:
             saved = getattr(self, "_saved_registry", None)
             if saved is not None:
@@ -307,7 +307,7 @@ class SynthesisPipelineMixin:
             self.persist_voice_registry()
         except OSError as exc:
             self.voice_registry.voices.pop(name, None)
-            log.exception("Failed to persist voices.json after adding Fish voice %s", name)
+            log.exception("Failed to save the voice catalog after adding Fish voice %s", name)
             return f"не удалось сохранить: {exc}"
         return ""
 
@@ -340,7 +340,7 @@ class SynthesisPipelineMixin:
             self.persist_voice_registry()
         except OSError as exc:
             self.voice_registry.voices.pop(name, None)
-            log.exception("Failed to persist voices.json after adding Gemini voice %s", name)
+            log.exception("Failed to save the voice catalog after adding Gemini voice %s", name)
             return f"не удалось сохранить: {exc}"
         return ""
 
@@ -373,7 +373,7 @@ class SynthesisPipelineMixin:
             self.persist_voice_registry()
         except OSError as exc:
             self.voice_registry.voices.pop(name, None)
-            log.exception("Failed to persist voices.json after adding ElevenLabs voice %s", name)
+            log.exception("Failed to save the voice catalog after adding ElevenLabs voice %s", name)
             return f"не удалось сохранить: {exc}"
         return ""
 

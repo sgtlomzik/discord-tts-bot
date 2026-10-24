@@ -20,6 +20,7 @@ from ttsbot import config, models
 from ttsbot.pipeline import SynthesisPipelineMixin
 from ttsbot.store import BotConfigStore
 from ttsbot.textnorm import normalize_for_tts
+from support import state_from
 
 NUMERIC_SETTINGS = (
     "TTS_MAX_TEXT_LENGTH", "TTS_MAX_CHARS", "TTS_QUEUE_MAXSIZE", "TTS_STREAM_TTFA_TIMEOUT",
@@ -109,7 +110,7 @@ class CloudDefaultVoiceTests(unittest.TestCase):
     def test_new_guilds_get_the_cloud_default_voice(self):
         with tempfile.TemporaryDirectory() as tmp:
             registry = _Registry({"piper-ruslan", "fish-default"}, "piper-ruslan")
-            store = BotConfigStore(Path(tmp) / "config.json", set(), voice_registry=registry)
+            store = BotConfigStore(state_from(Path(tmp) / "config.json"), set(), voice_registry=registry)
             self.assertEqual(store.get_guild(1).default_voice, "fish-default")
 
     def test_the_piper_fallback_stays_a_piper_voice(self):

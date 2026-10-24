@@ -36,7 +36,7 @@ The active runtime pieces are:
     resolution, one cleanup behind `speakable_text` and `normalize_for_tts`.
   - `models.py` - `VoiceProfile`, `GuildConfig`, `TTSJob`,
     `PreparedAudio` and the hardcoded Piper `VOICE_PROFILES`.
-  - `store.py` - `BotConfigStore` (data/config.json persistence; a failed
+  - `store.py` - `BotConfigStore` (guild settings in data/state.db; a failed
     save rolls memory back to what is on disk).
   - `statefile.py` - reading JSON state files: a damaged file raises
     `StateFileError` and stops startup instead of being replaced.
@@ -68,7 +68,7 @@ The active runtime pieces are:
 - `ttsbot/providers.py` - provider abstraction: dispatcher (fallback chain,
   health checks), MiniMax client and its error classes, phrase cache.
 - `ttsbot/health.py` - failure kinds, the circuit breaker with its backoff
-  and quota pauses, and `HealthStore` (`data/provider_health.json`).
+  and quota pauses, and `HealthStore` (pauses saved in `data/state.db`).
 - `ttsbot/errors.py` - marker classes every provider error inherits:
   `QuotaExhaustedError`, `AuthError`, `RateLimitError`, `RequestError`.
 - `ttsbot/fish.py` - Fish HTTP client, request configuration and in-flight
@@ -79,9 +79,9 @@ The active runtime pieces are:
 - `ttsbot/pcm.py` - `PcmFramer`: raw PCM to 48 kHz stereo 20 ms frames
   in-process (soxr), plus the `.pcm` cache format.
 - `ttsbot/voice_registry.py` - the unified voice catalog
-  (data/voices.json).
+  (saved in data/state.db).
 - `scripts/` - operator tools: model download, MiniMax voice cloning,
-  `migrate_fish_default.py` (moves every guild to `fish-default`),
+  `add_gemini_voices.py` (registers every prebuilt Gemini voice),
   `usage_stats.py` (per-user generated characters from logs + Discord history).
 - `tests/` - unit and async integration-style tests; `tests/support.py`
   builds a fresh bot and a namespace of the package's names for them.
@@ -188,7 +188,7 @@ MiniMax voice never replays old audio.
 
 Fallback chain:
 
-- `voices.json` holds `fallback_chain`, a list of voice names tried in order
+- The voice catalog holds `fallback_chain`, a list of voice names tried in order
   when a message's voice cannot speak it, and each voice may have its own
   `fallback` list instead. `VoiceRegistry.chain_for(voice)` returns the
   voice followed by those voices (unknown names and repeats skipped). An
@@ -243,8 +243,8 @@ Provider health (`ttsbot/health.py`):
   A breaker waiting for its check (`await_check`) lets a real request probe
   anyway 5 minutes after the pause, in case the worker is stuck; a probe
   that never reports back frees the slot after 2 minutes.
-- `HealthStore` keeps every breaker in `data/provider_health.json`
-  (`TTS_HEALTH_PATH`) with a fingerprint of the provider's keys, so a
+- `HealthStore` keeps every breaker in `data/state.db` (`provider_health`)
+  with a fingerprint of the provider's keys, so a
   provider out of quota stays paused across restarts, and a changed key
   starts clean. `/fallback status` shows each provider's state, its live
   quota where available, and resets a pause by hand.
@@ -254,7 +254,7 @@ Provider health (`ttsbot/health.py`):
 
 `/voicebot voice-clone` uploads a sample to Fish `POST /model` as multipart,
 waits for `GET /model/{id}` to report `trained`, probes the new `reference_id`
-through `/v1/tts`, and only then saves a Fish voice record in `voices.json`.
+through `/v1/tts`, and only then saves a Fish voice record in the catalog.
 
 ElevenLabs uses `POST /v1/text-to-speech/{voice_id}/stream`, which sends
 audio while it is generated (first audio ~0.2 s with `eleven_v4_turbo`).
@@ -277,7 +277,7 @@ key without moving the ring. When every key is empty the provider raises
 `check_quota`); request-level errors (`ElevenLabsRequestError`: missing
 voice, message too long for every key, plan-restricted voice) go to the
 next voice of the chain without a breaker failure.
-The active key is persisted as a sha256 fingerprint in `data/config.json`.
+The active key is persisted as a sha256 fingerprint in `data/state.db`.
 
 The local fallback path is:
 
@@ -459,19 +459,25 @@ atomically. See [RECORDINGS_WEB.md](RECORDINGS_WEB.md).
 
 ## 8. Persistence and Guild State
 
-Persistent bot settings live in `data/config.json` and are managed by `BotConfigStore`.
+All persistent state lives in one SQLite file, `data/state.db`
+(`ttsbot/statedb.py`, `STATE_DB_PATH`), in a table per kind of data:
 
-The persisted state includes:
+- `guilds`, `emoji_aliases`, `settings` - `BotConfigStore`: whether TTS is
+  enabled for the guild, allowed users, the default voice (new guilds get
+  `TTS_DEFAULT_VOICE_PROFILE`, or the registry fallback if that name is
+  unknown), per-user voices and fixed phrases, emoji pronunciations and the
+  settings changed at runtime (`limit`, Fish latency, the active ElevenLabs
+  key's fingerprint);
+- `voices`, `voice_catalog` - the voice catalog and fallback chain;
+- `provider_health` - provider pauses (`HealthStore`).
 
-- whether TTS is enabled for the guild;
-- allowed users;
-- default voice profile (new guilds get `TTS_DEFAULT_VOICE_PROFILE`, or the
-  registry fallback if that name is unknown);
-- per-user voice override.
-
-The config store is intentionally simple JSON, not a database.
-
-That keeps the runtime easy to reason about and makes tests cheap.
+The stores work on memory and save in one transaction after each change,
+so a crash or a full disk leaves the previous state; a failed save rolls
+memory back. Nested values are JSON text columns. A database that cannot
+be opened stops startup (`StateFileError`) and is left as it is. The
+`config.json`, `voices.json` and `provider_health.json` of earlier versions
+are imported once on startup and left in place (an older image still finds
+them). `sqlite3 data/state.db .dump` shows everything.
 
 ## 9. Commands
 
@@ -506,7 +512,7 @@ holds the fallback chain and provider health:
 - `/fallback status` - each provider's health and live quota; `reset:`
   ends a pause by hand;
 - `/fallback set` - show or set the fallback chain (global, or `voice:`).
-- `limit` - show or change the per-message text length cap (persisted in `data/config.json`);
+- `limit` - show or change the per-message text length cap (persisted in `data/state.db`);
 - `queue-clear` - clear queued work;
 - `test` - enqueue a test phrase, optionally to a specific voice channel.
 
@@ -603,9 +609,9 @@ Defines the Python runtime dependency set.
 
 Documents the supported runtime flags and their defaults.
 
-### `data/config.json`
+### `data/state.db`
 
-Stores live guild settings.
+Stores live guild settings, the voice catalog and provider pauses.
 
 ### `models/`
 

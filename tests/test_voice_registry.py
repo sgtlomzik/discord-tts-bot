@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from ttsbot import voice_registry as vr
+from ttsbot.statedb import StateDB, import_json_state
 
 
 def _piper_profiles() -> dict:
@@ -76,14 +77,12 @@ class VoiceRegistryTests(unittest.TestCase):
         self.assertIn(reg.fallback_profile, reg.voices)
 
     def test_save_load_roundtrip(self):
-        path = self.tmp / "voices.json"
         reg = vr.seed_registry(
             _piper_profiles(), fallback_profile="piper-ruslan", minimax_voice_id="bussshy01"
         )
-        vr.save_registry(path, reg)
-        self.assertTrue(path.exists())
+        vr.save_registry(StateDB(self.tmp / "state.db"), reg)
 
-        loaded = vr.load_registry(path)
+        loaded = vr.load_registry(StateDB(self.tmp / "state.db"))
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.fallback_profile, "piper-ruslan")
         self.assertEqual(set(loaded.names()), set(reg.names()))
@@ -91,19 +90,23 @@ class VoiceRegistryTests(unittest.TestCase):
         self.assertAlmostEqual(loaded.get("piper-ruslan").piper.length_scale, 0.9)
 
     def test_load_missing_returns_none(self):
-        self.assertIsNone(vr.load_registry(self.tmp / "nope.json"))
+        self.assertIsNone(vr.load_registry(StateDB(self.tmp / "state.db")))
 
-    def test_load_or_seed_creates_file(self):
-        path = self.tmp / "voices.json"
-        self.assertFalse(path.exists())
+    def test_load_or_seed_saves_the_seed(self):
         reg = vr.load_or_seed(
-            path, _piper_profiles(), fallback_profile="piper-ruslan", minimax_voice_id="bussshy01"
+            StateDB(self.tmp / "state.db"), _piper_profiles(), fallback_profile="piper-ruslan",
+            minimax_voice_id="bussshy01",
         )
-        self.assertTrue(path.exists())
         self.assertIn("bussshy01", reg)
 
-        reg2 = vr.load_or_seed(path, _piper_profiles(), fallback_profile="piper-ruslan")
+        reg2 = vr.load_or_seed(StateDB(self.tmp / "state.db"), {}, fallback_profile="piper-ruslan")
         self.assertEqual(set(reg2.names()), set(reg.names()))
+
+    def _imported(self, voices_path):
+        """The catalog after importing an earlier version's voices.json."""
+        db = StateDB(self.tmp / "state.db")
+        import_json_state(db, voices_path=voices_path)
+        return vr.load_registry(db)
 
     def test_partial_minimax_block_uses_defaults(self):
         path = self.tmp / "voices.json"
@@ -130,7 +133,7 @@ class VoiceRegistryTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        reg = vr.load_registry(path)
+        reg = self._imported(path)
         mm = reg.get("mm-x")
         self.assertEqual(mm.minimax.voice_id, "male-qn-qingse")
         self.assertEqual(mm.minimax.speed, 1.0)
@@ -153,7 +156,7 @@ class VoiceRegistryTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        reg = vr.load_registry(path)
+        reg = self._imported(path)
         self.assertEqual(set(reg.names()), {"p"})
 
 

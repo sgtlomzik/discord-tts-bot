@@ -7,6 +7,7 @@ are attached from the outside by the composition root (bot.py).
 """
 
 import logging
+import sqlite3
 import time
 import zoneinfo
 from functools import partial
@@ -37,6 +38,7 @@ from ttsbot.recording.groq import AudioBudget, GroqTranscriber
 from ttsbot.recording.worker import TranscriptionWorker
 from ttsbot.store import BotConfigStore
 from ttsbot.session import GuildSession
+from ttsbot.statedb import StateDB, import_json_state
 from ttsbot.supervisor import TaskSupervisor
 from ttsbot.voice_lifecycle import VoiceLifecycleMixin
 
@@ -46,6 +48,16 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 intents.guilds = True
+
+
+def _state_db_location() -> Path | str:
+    """STATE_DB_PATH, or memory when its data directory does not exist
+    (a run outside the container: nothing is written to the host)."""
+    path = config.STATE_DB_PATH
+    if str(path) == ":memory:" or path.parent.exists():
+        return path
+    log.warning("Data directory %s does not exist; keeping state in memory only", path.parent)
+    return ":memory:"
 
 
 class TTSBot(
@@ -69,13 +81,23 @@ class TTSBot(
         # One session per guild: its queue, prefetch, player and voice
         # state; its workers start with the guild's first message.
         self.sessions: dict[int, GuildSession] = {}
-        # Unified voice catalog: data/voices.json, seeded on first start
-        # from the Piper profiles (and MINIMAX_VOICE_ID); then each plugin
-        # points its default voice at its env setting (fish-default, ...).
-        # Selection state stays separate in BotConfigStore.
+        # Guild settings, the voice catalog and provider pauses live in one
+        # SQLite file (data/state.db); the JSON files of earlier versions
+        # are imported into it once.
+        self.state_db = StateDB(_state_db_location())
+        import_json_state(
+            self.state_db,
+            config_path=config.BOT_CONFIG_PATH,
+            voices_path=config.VOICES_REGISTRY_PATH,
+            health_path=config.PROVIDER_HEALTH_PATH,
+        )
+        # Unified voice catalog, seeded on first start from the Piper
+        # profiles (and MINIMAX_VOICE_ID); then each plugin points its
+        # default voice at its env setting (fish-default, ...). Selection
+        # state stays separate in BotConfigStore.
         _mm_seed = load_minimax_config_from_env()
         self.voice_registry = voice_registry.load_or_seed(
-            config.VOICES_REGISTRY_PATH,
+            self.state_db,
             VOICE_PROFILES,
             fallback_profile=piper_default_profile(),
             minimax_voice_id=_mm_seed.voice_id,
@@ -84,12 +106,11 @@ class TTSBot(
         )
         if plugins.seed_voices(self.voice_registry):
             try:
-                voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
-            except OSError:
-                log.exception("Could not save the seeded voices to %s; keeping them in memory",
-                              config.VOICES_REGISTRY_PATH)
+                voice_registry.save_registry(self.state_db, self.voice_registry)
+            except sqlite3.Error:
+                log.exception("Could not save the seeded voices; keeping them in memory")
         self.config_store = BotConfigStore(
-            config.BOT_CONFIG_PATH, config.WHITELIST_USERS, voice_registry=self.voice_registry
+            self.state_db, config.WHITELIST_USERS, voice_registry=self.voice_registry
         )
         self.piper_voices: dict[tuple[str, str], object] = {}
         cache_cfg = load_cache_config_from_env()
@@ -109,8 +130,7 @@ class TTSBot(
         )
         # Provider pauses survive restarts: a provider out of quota stays
         # paused until its check, instead of failing the first messages.
-        if config.PROVIDER_HEALTH_PATH.parent.exists():
-            self.tts_dispatcher.attach_health_store(HealthStore(config.PROVIDER_HEALTH_PATH))
+        self.tts_dispatcher.attach_health_store(HealthStore(self.state_db))
         # The catalog as saved; persist_voice_registry() rolls back to it.
         self._saved_registry = self.voice_registry.snapshot()
 
@@ -245,3 +265,4 @@ class TTSBot(
                 log.exception("Failed to close the %s provider cleanly", name)
 
         await super().close()
+        self.state_db.close()

@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("")
     print("All three steps passed.")
-    print("The voice was registered in data/voices.json (if the bot has run")
+    print("The voice was registered in data/state.db (if the bot has run")
     print("at least once). Assign it in Discord with:")
     print(f"  /voicebot voice-user @user {args.voice_id}")
     print("Or seed it as the env default:")
@@ -206,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def register_in_catalog(voice_id: str, description: str = "") -> None:
-    """Best-effort: append the freshly cloned voice to data/voices.json.
+    """Best-effort: append the freshly cloned voice to the catalog in data/state.db.
 
     Only appends to an EXISTING catalog (created on the bot's first start);
     never creates a fresh, piper-less catalog that would shadow the seed.
@@ -217,12 +217,13 @@ def register_in_catalog(voice_id: str, description: str = "") -> None:
         if str(repo_root) not in sys.path:
             sys.path.insert(0, str(repo_root))
         from ttsbot import voice_registry as vr
+        from ttsbot.statedb import StateDB
 
-        path = repo_root / "data" / "voices.json"
-        reg = vr.load_registry(path)
+        path = repo_root / "data" / "state.db"
+        reg = vr.load_registry(StateDB(path)) if path.exists() else None
         if reg is None:
             print(
-                "[catalog] data/voices.json not found yet — start the bot once, "
+                "[catalog] no voice catalog in data/state.db yet — start the bot once, "
                 "then run /voicebot voice-add, or set MINIMAX_VOICE_ID."
             )
             return
@@ -236,7 +237,7 @@ def register_in_catalog(voice_id: str, description: str = "") -> None:
                 minimax=vr.MiniMaxParams(voice_id=voice_id),
             )
         )
-        vr.save_registry(path, reg)
+        vr.save_registry(StateDB(path), reg)
         print(f"[catalog] registered voice '{name}' in {path}")
     except Exception as exc:  # never block a successful clone on bookkeeping
         print(f"[catalog] auto-register skipped ({type(exc).__name__}: {exc}); "

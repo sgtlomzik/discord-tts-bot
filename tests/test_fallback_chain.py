@@ -30,6 +30,7 @@ from ttsbot.voice_registry import (
 )
 
 from support import with_spec  # noqa: E402
+from ttsbot.statedb import StateDB
 
 
 class Clock:
@@ -263,17 +264,17 @@ class HealthStoreTests(unittest.TestCase):
     def test_pause_survives_restart_unless_the_key_changed(self):
         clock = Clock()
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "provider_health.json"
+            db = StateDB(Path(tmp) / "state.db")
             cb = _breaker(clock)
-            HealthStore(path).bind("elevenlabs", cb, "fp-1")
+            HealthStore(db).bind("elevenlabs", cb, "fp-1")
             cb.record_failure(FailureKind.QUOTA, until=clock.now + 7200, error="no credits")
             cb.await_check = True  # saved too
-            saved = json.loads(path.read_text(encoding="utf-8"))["breakers"]["elevenlabs"]
+            saved = StateDB(Path(tmp) / "state.db").load_health()["elevenlabs"]
             self.assertEqual((saved["state"], saved["kind"], saved["fingerprint"]), ("open", "quota", "fp-1"))
 
             clock.now += 3600
             restored = _breaker(clock)
-            HealthStore(path).bind("elevenlabs", restored, "fp-1")
+            HealthStore(db).bind("elevenlabs", restored, "fp-1")
             self.assertIs(restored.state, CircuitState.OPEN)
             self.assertEqual(restored.kind, FailureKind.QUOTA)
             self.assertAlmostEqual(restored.cooldown_remaining, 3600)
@@ -282,21 +283,21 @@ class HealthStoreTests(unittest.TestCase):
 
             other_key = _breaker(clock)
             with self.assertLogs("tts_bot.health", "INFO"):
-                HealthStore(path).bind("elevenlabs", other_key, "fp-2")
+                HealthStore(db).bind("elevenlabs", other_key, "fp-2")
             self.assertIs(other_key.state, CircuitState.CLOSED)
 
     def test_success_is_saved_as_closed(self):
         clock = Clock()
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "h.json"
+            db = StateDB(Path(tmp) / "state.db")
             cb = _breaker(clock, failure_threshold=1)
-            HealthStore(path).bind("fish", cb)
+            HealthStore(db).bind("fish", cb)
             cb.record_failure()
             clock.now += 61
             self.assertTrue(cb.allow_request())
             cb.record_success()
             restored = _breaker(clock)
-            HealthStore(path).bind("fish", restored)
+            HealthStore(db).bind("fish", restored)
             self.assertIs(restored.state, CircuitState.CLOSED)
 
 

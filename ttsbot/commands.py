@@ -527,7 +527,7 @@ def build_commands(bot):
         try:
             bot.persist_voice_registry()
         except OSError as exc:
-            log.exception("Failed to persist voices.json after voice-add")
+            log.exception("Failed to save the voice catalog after voice-add")
             await interaction.followup.send(
                 f"Голос проверен, но не сохранён на диск: {exc}", ephemeral=True
             )
@@ -683,7 +683,7 @@ def build_commands(bot):
         try:
             bot.persist_voice_registry()
         except OSError as exc:
-            log.exception("Failed to persist voices.json after voice-describe")
+            log.exception("Failed to save the voice catalog after voice-describe")
             await interaction.response.send_message(
                 f"Не удалось сохранить: {exc}", ephemeral=True
             )
@@ -870,7 +870,7 @@ def build_commands(bot):
         try:
             bot.persist_voice_registry()
         except OSError as exc:
-            log.exception("Failed to persist voices.json after voice-tune")
+            log.exception("Failed to save the voice catalog after voice-tune")
             await interaction.response.send_message(
                 f"Не удалось сохранить: {exc}", ephemeral=True
             )
@@ -918,7 +918,7 @@ def build_commands(bot):
             bot.persist_voice_registry()
         except OSError as exc:
             bot.voice_registry.add(rec)
-            log.exception("Failed to persist voices.json after voice-tune")
+            log.exception("Failed to save the voice catalog after voice-tune")
             await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
             return
 
@@ -1128,7 +1128,7 @@ def build_commands(bot):
             reg.fallback_chain = previous_chain
             if previous_record is not None:
                 reg.add(previous_record)
-            log.exception("Failed to persist voices.json after changing the fallback chain")
+            log.exception("Failed to save the voice catalog after changing the fallback chain")
             await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
             return
         log.info("Fallback chain changed voice=%s chain=%s", record.name if record else "*", names)

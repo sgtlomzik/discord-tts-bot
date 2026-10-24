@@ -33,6 +33,7 @@ from ttsbot.providers import (
 from ttsbot.voice_registry import (
     ElevenLabsParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict,
 )
+from support import state_from
 
 VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
 
@@ -455,10 +456,10 @@ class ElevenLabsKeyRingTests(unittest.IsolatedAsyncioTestCase):
     def test_store_persists_only_the_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            store = BotConfigStore(path, set())
+            store = BotConfigStore(state_from(path), set())
             store.set_elevenlabs_key(key_fingerprint("sk_secret"))
-            self.assertNotIn("sk_secret", path.read_text(encoding="utf-8"))
-            self.assertEqual(BotConfigStore(path, set()).settings["elevenlabs_key"], key_fingerprint("sk_secret"))
+            self.assertNotIn(b"sk_secret", (Path(tmp) / "state.db").read_bytes())
+            self.assertEqual(BotConfigStore(state_from(path), set()).settings["elevenlabs_key"], key_fingerprint("sk_secret"))
 
 
 class ElevenLabsTooLongPipelineTests(unittest.IsolatedAsyncioTestCase):

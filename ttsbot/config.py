@@ -67,7 +67,7 @@ def reload() -> None:
     global TTS_STREAM_TTFA_TIMEOUT
     global FISH_TTFA_TIMEOUT, GEMINI_TTFA_TIMEOUT, GEMINI_TTFA_PER_CHAR
     global ELEVENLABS_TTFA_TIMEOUT, TTS_CONNECTION_KEEPALIVE_SECONDS
-    global PROVIDER_HEALTH_PATH, TTS_HEALTH_CHECK_INTERVAL
+    global PROVIDER_HEALTH_PATH, TTS_HEALTH_CHECK_INTERVAL, STATE_DB_PATH
     global TTS_PREFETCH_LOOKAHEAD
     global TTS_IDLE_FRAME_MODE, TTS_IDLE_VOLUME_DB, TTS_STREAM_TAIL_MS
     global TTS_MAX_CONTINUOUS_IDLE_SECONDS, IDLE_DISCONNECT_SECONDS
@@ -91,10 +91,10 @@ def reload() -> None:
     global WEB_MAINTENANCE_SECONDS, WEB_PREBUILD_RECENT, WEB_ALLOW_ANONYMOUS
 
     TMP_DIR = Path(os.getenv("TTS_TMP_DIR", "/dev/shm"))
+    # The JSON state files of earlier versions, imported once into
+    # STATE_DB_PATH (ttsbot.statedb) and no longer written. BOT_CONFIG_PATH
+    # also names the data directory the other paths default into.
     BOT_CONFIG_PATH = Path(os.getenv("BOT_CONFIG_PATH", "/app/data/config.json"))
-    # Catalog of available voices (Piper + MiniMax). Lives in the mounted
-    # ./data volume next to config.json; seeded on first start. This is the
-    # CATALOG only — selection state stays in BotConfigStore/config.json.
     VOICES_REGISTRY_PATH = Path(
         os.getenv("VOICES_REGISTRY_PATH", str(BOT_CONFIG_PATH.parent / "voices.json"))
     )
@@ -129,12 +129,14 @@ def reload() -> None:
     # (a new one costs 0.3-0.5 s through the VPN). ~1 KB per ping, no
     # credits. 0 disables; typing warm-ups still run.
     TTS_CONNECTION_KEEPALIVE_SECONDS = _number("TTS_CONNECTION_KEEPALIVE_SECONDS", 60.0, float, 0.0)
-    # Provider health (ttsbot/health.py): breaker state survives restarts in
-    # this file, and paused providers are checked (quota report, host ping)
-    # every TTS_HEALTH_CHECK_INTERVAL seconds once their pause is over.
     PROVIDER_HEALTH_PATH = Path(
         os.getenv("TTS_HEALTH_PATH", str(BOT_CONFIG_PATH.parent / "provider_health.json"))
     )
+    # Guild settings, the voice catalog and provider pauses: one SQLite file
+    # in the mounted ./data volume (":memory:" keeps them in memory only).
+    STATE_DB_PATH = Path(os.getenv("STATE_DB_PATH", str(BOT_CONFIG_PATH.parent / "state.db")))
+    # Paused providers are checked (quota report, host ping) every
+    # TTS_HEALTH_CHECK_INTERVAL seconds once their pause is over.
     TTS_HEALTH_CHECK_INTERVAL = _number("TTS_HEALTH_CHECK_INTERVAL", 30.0, float, 5.0)
     # Prefetch: generation runs ahead of playback so message N+1 is
     # synthesized while N is still playing; playback stays strictly FIFO.
