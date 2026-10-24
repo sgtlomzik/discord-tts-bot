@@ -235,11 +235,8 @@ class TTSBot(
         except Exception:
             log.exception("Failed to sync slash commands")
         sup = self.supervisor
-        if config.TTS_PREFETCH_ENABLED:
-            sup.start("tts-generation", self._generation_worker)
-            sup.start("tts-playback", self._playback_worker)
-        else:
-            sup.start("tts-worker", self.tts_worker)
+        sup.start("tts-generation", self._generation_worker)
+        sup.start("tts-playback", self._playback_worker)
         if config.TTS_CONNECTION_KEEPALIVE_SECONDS > 0:
             sup.start("tts-connection-keepalive", self._connection_keepalive_worker)
         if self.tts_dispatcher.provider_names():

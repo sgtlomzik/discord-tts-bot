@@ -32,17 +32,8 @@ def register_events(bot):
             config.MAX_TEXT_LENGTH, config.TTS_MAX_CHARS,
         )
         log.info(
-            "Playback tuning: preroll_ms=%s preroll_mode=%s preroll_volume_db=%s tail_ms=%s trim_silence=%s ffmpeg_low_delay=%s",
-            config.TTS_PREROLL_MS,
-            config.TTS_PREROLL_MODE,
-            config.TTS_PREROLL_VOLUME_DB,
-            config.TTS_SILENCE_TAIL_MS,
+            "Continuous stream: trim_silence=%s idle_mode=%s idle_volume_db=%s stream_tail_ms=%s max_idle_seconds=%s",
             config.TTS_TRIM_SILENCE,
-            config.FFMPEG_LOW_DELAY,
-        )
-        log.info(
-            "Continuous stream: enabled=%s idle_mode=%s idle_volume_db=%s stream_tail_ms=%s max_idle_seconds=%s",
-            config.TTS_CONTINUOUS_STREAM,
             config.TTS_IDLE_FRAME_MODE,
             config.TTS_IDLE_VOLUME_DB,
             config.TTS_STREAM_TAIL_MS,

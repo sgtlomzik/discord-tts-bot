@@ -8,7 +8,6 @@ continuous stream is disabled).
 import asyncio
 import logging
 import time
-import uuid
 from pathlib import Path
 
 import discord
@@ -20,7 +19,6 @@ from ttsbot.audio import (
     ContinuousTTSAudioSource,
     OPUS_SILENCE_FRAME,
     build_idle_pcm_frame,
-    build_playback_prepare_command,
     build_tts_pcm_command,
     split_pcm_frames,
 )
@@ -205,82 +203,3 @@ class PlaybackMixin:
             config.TTS_STREAM_TAIL_MS,
         )
         return frames
-
-    async def prepare_playback_file(self, source: Path, prepared: Path, pitch: int = 0) -> Path:
-        started = time.perf_counter()
-        cmd = build_playback_prepare_command(source, prepared, pitch)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            stdout_text = stdout.decode("utf-8", errors="ignore").strip()
-            stderr_text = stderr.decode("utf-8", errors="ignore").strip()
-            raise RuntimeError(
-                f"ffmpeg playback preparation failed rc={proc.returncode} "
-                f"stdout={stdout_text} stderr={stderr_text}"
-            )
-        if not prepared.exists() or prepared.stat().st_size == 0:
-            raise RuntimeError("ffmpeg playback preparation produced empty output")
-
-        log.info(
-            "Playback preparation took=%.3fs source_size=%s prepared_size=%s "
-            "preroll_ms=%s preroll_mode=%s preroll_volume_db=%s tail_ms=%s",
-            time.perf_counter() - started,
-            source.stat().st_size if source.exists() else "unknown",
-            prepared.stat().st_size,
-            config.TTS_PREROLL_MS,
-            config.TTS_PREROLL_MODE,
-            config.TTS_PREROLL_VOLUME_DB,
-            config.TTS_SILENCE_TAIL_MS,
-        )
-        return prepared
-
-    async def play_file(self, vc: discord.VoiceClient, filename: Path, pitch: int = 0) -> None:
-        if vc.is_playing() or vc.is_paused():
-            log.warning("Voice client was already playing; stopping previous source")
-            vc.stop()
-
-        finished = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        started = time.perf_counter()
-
-        def after(error: Exception | None) -> None:
-            if error:
-                log.exception("Playback callback error", exc_info=error)
-            loop.call_soon_threadsafe(finished.set)
-
-        before_options = "-hide_banner -loglevel warning"
-        if config.FFMPEG_LOW_DELAY:
-            before_options = (
-                f"{before_options} "
-                "-fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0"
-            )
-
-        prepared = config.TMP_DIR / f"playback_{uuid.uuid4().hex}.wav"
-        playback_file = filename
-        try:
-            try:
-                playback_file = await self.prepare_playback_file(filename, prepared, pitch)
-            except Exception:
-                log.exception("Playback preparation failed; using source file")
-
-            audio = discord.FFmpegPCMAudio(
-                str(playback_file),
-                before_options=before_options,
-                options="-vn",
-            )
-
-            log.info("Starting playback file=%s size=%s", playback_file, playback_file.stat().st_size)
-            vc.play(audio, after=after)
-            await finished.wait()
-
-            log.info("Playback duration took=%.3fs", time.perf_counter() - started)
-        finally:
-            if prepared.exists():
-                try:
-                    prepared.unlink()
-                except OSError:
-                    log.exception("Failed to remove prepared playback file: %s", prepared)

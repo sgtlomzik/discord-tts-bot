@@ -16,7 +16,7 @@ import httpx
 
 from ttsbot.audio import (
     PCM_FRAME_BYTES, OPUS_SILENCE_FRAME, ContinuousTTSAudioSource, load_opus,
-    build_playback_filter_complex, build_tts_stream_pcm_command,
+    build_tts_stream_pcm_command,
 )
 from ttsbot.ogg_opus import OggOpusDemuxer, UnsupportedOpusStream, opus_packet_samples, read_frame_cache
 from ttsbot import config
@@ -540,7 +540,7 @@ class FishDecodeTests(unittest.IsolatedAsyncioTestCase):
         frequency = crossings / (len(mono) / 48000)
         self.assertGreater(frequency, 800)
         self.assertLess(frequency, 960)
-        self.assertIn("asetrate=96000", build_playback_filter_complex(False, -40.0, 12))
+        self.assertIn("asetrate=96000", ",".join(build_tts_stream_pcm_command("ogg", 12)))
 
     async def test_streamed_ogg_decodes_to_pcm_and_caches_opus(self):
         import subprocess

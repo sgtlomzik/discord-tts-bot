@@ -67,13 +67,9 @@ from ttsbot.audio import (
     PCM_SAMPLE_WIDTH,
     ContinuousTTSAudioSource,
     build_idle_pcm_frame,
-    build_playback_filter_complex,
-    build_playback_prepare_command,
-    build_preroll_lavfi_source,
     build_tts_pcm_command,
     build_tts_stream_pcm_command,
     load_opus,
-    seconds_from_ms,
     split_pcm_frames,
 )
 

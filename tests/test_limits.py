@@ -170,35 +170,6 @@ class FakeSource:
 
 @unittest.skipUnless(_MP3, "ffmpeg required")
 class StutterGuardTests(unittest.IsolatedAsyncioTestCase):
-    async def test_infinite_stream_is_cut_at_the_frame_limit(self):
-        bot_mod = load_bot_module()
-        tts_bot = bot_mod.TTSBot()
-        cloud = MagicMock()
-        cloud.stream_audio = lambda *a, **k: _stutter_forever(_MP3)
-        tts_bot.tts_dispatcher._cloud = cloud
-
-        cfg = bot_mod.config
-        cfg.TTS_AUDIO_CHARS_PER_SECOND = 12.0
-        cfg.TTS_AUDIO_LIMIT_SAFETY = 1.0
-        cfg.TTS_AUDIO_LIMIT_MIN_SECONDS = 0.2
-
-        ch = types.SimpleNamespace(id=10, guild=types.SimpleNamespace(id=1))
-        job = bot_mod.TTSJob("привет, это стрим", ch, 0.0, 1, 1, 1000, "bussshy01", 0.0)
-        from ttsbot.pipeline import playback_frame_limit
-        limit = playback_frame_limit(job.text, _minimax_voice())
-
-        source = FakeSource(bot_mod.PCM_FRAME_BYTES)
-        try:
-            status, frames = await asyncio.wait_for(
-                tts_bot._stream_tts_to_source(source, _minimax_voice(), job),
-                timeout=15,
-            )
-        finally:
-            cfg.reload()
-        self.assertEqual(status, "truncated")
-        self.assertLessEqual(frames, limit)
-        self.assertEqual(len(source.frames), frames)
-
     async def test_prefetch_infinite_stream_is_cut_at_the_frame_limit(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()

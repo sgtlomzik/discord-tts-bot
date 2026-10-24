@@ -23,13 +23,11 @@ except Exception:  # pragma: no cover - optional dependency
 
 from ttsbot import voice_registry
 from ttsbot.elevenlabs import ElevenLabsError
-from ttsbot.errors import QuotaExhaustedError
 from ttsbot.fish import FishError
 from ttsbot.gemini import GeminiError
 from ttsbot.health import FailureKind, classify_failure
 from ttsbot.pcm import PcmFramer, pcm_cache_header, pcm_to_frames, read_pcm_cache
 from ttsbot.providers import (
-    NoVoiceAvailableError,
     MiniMaxError,
     MiniMaxProvider,
     MiniMaxVoiceNotFoundError,
@@ -40,10 +38,9 @@ from ttsbot import config
 from ttsbot.audio import (
     PCM_FRAME_BYTES,
     PCM_FRAME_MS,
-    ContinuousTTSAudioSource,
     build_tts_stream_pcm_command,
 )
-from ttsbot.models import PreparedAudio, TTSJob, VOICE_PROFILES, VoiceProfile
+from ttsbot.models import PreparedAudio, VOICE_PROFILES, VoiceProfile
 from ttsbot.ogg_opus import (
     FRAME_CACHE_MAGIC,
     OggOpusDemuxer,
@@ -486,48 +483,14 @@ class SynthesisPipelineMixin:
             time.perf_counter() - started,
         )
 
-    def voice_chain(self, voice, skip_providers=frozenset()) -> list:
-        """``voice`` and its fallback voices (see VoiceRegistry.chain_for),
-        minus those of ``skip_providers``."""
-        return [v for v in self.voice_registry.chain_for(voice) if v.provider not in skip_providers]
-
-    async def generate_tts_file(
-        self, text: str, filename: Path, voice_profile: str | None = None,
-        *, skip_providers=frozenset(), used_voice: list | None = None,
-    ) -> str:
-        """Speak ``text`` to ``filename`` with the voice or its fallback chain.
-
-        ``skip_providers``: providers not to ask again (they just failed).
-        ``used_voice``: if given, the voice that spoke is appended to it.
-        """
-        record = self.voice_registry.get(voice_profile)
-        if record is None:
-            record = self.voice_registry.fallback_record()
-        chain = self.voice_chain(record, skip_providers)
-        if not chain and skip_providers:
-            raise NoVoiceAvailableError(
-                f"No voice left for {voice_profile or 'default'} without {', '.join(sorted(skip_providers))}"
-            )
-        if chain:
-            provider_used, used = await self.tts_dispatcher.synthesize_chain(
-                text, filename, voice=chain[0], fallbacks=chain[1:],
-            )
-        else:  # no voice at all: the legacy route (primary provider, then Piper)
-            provider_used, used = await self.tts_dispatcher.synthesize_chain(text, filename, record)
-        if used_voice is not None:
-            used_voice.append(used)
-        log.info(
-            "TTS engine used: %s voice=%s",
-            provider_used,
-            getattr(used, "name", None) or voice_profile or "default",
-        )
-        return provider_used
+    def voice_chain(self, voice) -> list:
+        """``voice`` and its fallback voices (see VoiceRegistry.chain_for)."""
+        return list(self.voice_registry.chain_for(voice))
 
     def _should_attempt_stream(self, voice) -> bool:
         """True when a job qualifies for the streaming fast path."""
         return (
             config.TTS_STREAMING_ENABLED
-            and config.TTS_CONTINUOUS_STREAM
             and voice is not None
             and (
                 (getattr(voice, "is_minimax", False) and self.tts_dispatcher.cloud is not None)
@@ -539,279 +502,6 @@ class SynthesisPipelineMixin:
                 )
             )
         )
-
-    async def _run_streaming_job(self, job: TTSJob, voice, worker_started: float) -> str:
-        """Drive a streaming MiniMax job. Returns "done" or "fallback".
-
-        "done": the job is fully handled (streamed ok, truncated mid-play, or
-        a connection error that has nothing to fall back to). "fallback": the
-        caller should run the Piper file path (pre-audio failure or open
-        circuit breaker).
-        """
-        cb = self.tts_dispatcher.circuit_breaker
-        # Connect first — enqueueing frames needs the voice client. Usually
-        # instant because the continuous stream keeps the session open.
-        try:
-            vc = await self.ensure_voice(job.voice_channel)
-        except Exception:
-            log.exception("Voice prepare failed (streaming)")
-            existing = discord.utils.get(self.voice_clients, guild=job.voice_channel.guild)
-            if existing and existing.is_connected():
-                await self.disconnect_guild_voice(job.voice_channel.guild)
-            return "done"
-
-        # Cache hit: play the stored audio from disk, no API call, no breaker
-        # probe consumed. (Cache key already includes the voice.)
-        cache = self.tts_dispatcher.cache
-        if cache is not None:
-            cached = cache.lookup(job.text, voice_cache_key(voice))
-            if cached is not None:
-                source = self.ensure_continuous_player(vc)
-                try:
-                    frames = await self.prepare_tts_pcm_frames(cached)
-                except Exception:
-                    log.exception("Cached audio decode failed; streaming instead")
-                    frames = []
-                frames = limit_pcm_frames(frames, job.text, voice)
-                if frames:
-                    source.enqueue_frames(frames)
-                    log.info(
-                        "Stream cache HIT guild=%s channel=%s frames=%d "
-                        "message_to_audio_s=%.3f (no API)",
-                        job.voice_channel.guild.id, job.voice_channel.id, len(frames),
-                        time.perf_counter() - job.message_ts,
-                    )
-                    await source.wait_until_drained()
-                    self.schedule_continuous_idle_stop(job.voice_channel.guild)
-                    self.schedule_idle_disconnect(job.voice_channel.guild)
-                    return "done"
-
-        # Consume the breaker probe only now that we are about to call cloud.
-        if not cb.allow_request():
-            log.debug(
-                "Circuit breaker open; skipping stream guild=%s", job.voice_channel.guild.id
-            )
-            return "fallback"
-
-        log.info(
-            "Ready to stream guild=%s channel=%s queue_wait=%.3fs prep_total=%.3fs",
-            job.voice_channel.guild.id, job.voice_channel.id,
-            worker_started - job.queued_at, time.perf_counter() - worker_started,
-        )
-        source = self.ensure_continuous_player(vc)
-        errors: list[BaseException] = []
-        try:
-            status, frames = await self._stream_tts_to_source(source, voice, job, errors=errors)
-        except Exception:
-            log.exception("Streaming playback crashed; falling back to Piper")
-            cb.record_failure()
-            return "fallback"
-
-        if status == "pre_audio":
-            # Classified like every other provider: a missing voice is not
-            # counted, a quota or a rejected key pauses MiniMax for longer.
-            self.tts_dispatcher.record_failure(cb, errors[0] if errors else None)
-            return "fallback"
-        # Audio started: ok (full) or truncated (mid-stream failure). Either
-        # way we do NOT overlay Piper on top of already-playing audio.
-        cb.record_success() if status == "ok" else cb.record_failure()
-        await source.wait_until_drained()
-        log.info(
-            "Playback finished (stream) guild=%s channel=%s frames=%d total_since_queue=%.3fs",
-            job.voice_channel.guild.id, job.voice_channel.id, frames,
-            time.perf_counter() - job.queued_at,
-        )
-        self.schedule_continuous_idle_stop(job.voice_channel.guild)
-        self.schedule_idle_disconnect(job.voice_channel.guild)
-        return "done"
-
-    async def _stream_tts_to_source(
-        self, source: "ContinuousTTSAudioSource", voice, job: TTSJob, errors: list | None = None,
-    ) -> tuple[str, int]:
-        """Stream a MiniMax voice into the continuous player frame-by-frame.
-
-        Returns (status, frames_enqueued) where status is "ok", "truncated"
-        (audio started then the stream failed mid-way) or "pre_audio" (failed
-        before any audio — caller falls back to Piper). Circuit-breaker
-        accounting is the caller's job; a pre-audio exception is appended to
-        ``errors`` for it.
-        """
-        cloud = self.tts_dispatcher.cloud
-        mm = voice.minimax
-        agen = cloud.stream_audio(
-            job.text,
-            voice_id=mm.voice_id, model=mm.model, speed=mm.speed,
-            vol=mm.vol, pitch=mm.pitch, emotion=mm.emotion,
-            language_boost=mm.language_boost,
-        )
-        # 1. First chunk under the TTFA budget; any failure here => clean
-        #    fallback to Piper (no audio has played yet).
-        try:
-            first_chunk = await asyncio.wait_for(
-                agen.__anext__(), timeout=config.TTS_STREAM_TTFA_TIMEOUT
-            )
-        except StopAsyncIteration:
-            await agen.aclose()
-            log.warning("Stream produced no audio; falling back to Piper")
-            return ("pre_audio", 0)
-        except asyncio.TimeoutError:
-            await agen.aclose()
-            log.warning(
-                "Stream TTFA exceeded %.2fs; falling back to Piper", config.TTS_STREAM_TTFA_TIMEOUT
-            )
-            return ("pre_audio", 0)
-        except Exception as exc:
-            await agen.aclose()
-            log.warning(
-                "Stream failed before first audio (%s: %s); Piper fallback",
-                type(exc).__name__, exc,
-            )
-            if errors is not None:
-                errors.append(exc)
-            elif isinstance(exc, QuotaExhaustedError):
-                # No caller to classify it: trip the long pause here.
-                self.tts_dispatcher.record_failure(self.tts_dispatcher.circuit_breaker, exc)
-            return ("pre_audio", 0)
-
-        # 2. We have audio. Decode the MP3 byte stream via ffmpeg (stdin ->
-        #    s16le stdout) while feeding chunks concurrently.
-        proc = await asyncio.create_subprocess_exec(
-            *build_tts_stream_pcm_command(),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        mid_error: list[BaseException] = []
-
-        # Tee the MP3 byte stream to a cache ".part" file so a future repeat
-        # of this (voice, text) plays from disk without hitting the API. Only
-        # committed on a clean finish — partial streams are never cached.
-        cache = self.tts_dispatcher.cache
-        cache_final: Path | None = None
-        cache_part = None
-        if cache is not None:
-            try:
-                cache_final = cache.cache_path_for(job.text, voice_cache_key(voice))
-                cache_final.parent.mkdir(parents=True, exist_ok=True)
-                cache_part = open(str(cache_final) + ".part", "wb")
-            except OSError:
-                cache_final = None
-                cache_part = None
-
-        async def _feed() -> None:
-            try:
-                proc.stdin.write(first_chunk)
-                await proc.stdin.drain()
-                if cache_part is not None:
-                    cache_part.write(first_chunk)
-                async for chunk in agen:
-                    proc.stdin.write(chunk)
-                    await proc.stdin.drain()
-                    if cache_part is not None:
-                        cache_part.write(chunk)
-            except Exception as exc:  # mid-stream API/network failure
-                mid_error.append(exc)
-            finally:
-                try:
-                    await agen.aclose()
-                except Exception:
-                    pass
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
-                if cache_part is not None:
-                    try:
-                        cache_part.close()
-                    except Exception:
-                        pass
-
-        feeder = asyncio.create_task(_feed())
-
-        frame_limit = playback_frame_limit(job.text, voice)
-        frames_enqueued = 0
-        limit_hit = False
-        first_frame_ts: float | None = None
-        leftover = b""
-        try:
-            while True:
-                data = await proc.stdout.read(PCM_FRAME_BYTES * 16)
-                if not data:
-                    break
-                buf = leftover + data
-                n = len(buf) - (len(buf) % PCM_FRAME_BYTES)
-                if n:
-                    out_frames = [buf[i:i + PCM_FRAME_BYTES] for i in range(0, n, PCM_FRAME_BYTES)]
-                    if frame_limit is not None and frames_enqueued + len(out_frames) > frame_limit:
-                        out_frames = out_frames[:max(frame_limit - frames_enqueued, 0)]
-                        limit_hit = True
-                    if out_frames:
-                        source.enqueue_frames(out_frames)
-                        if first_frame_ts is None:
-                            first_frame_ts = time.perf_counter()
-                            log.info(
-                                "Stream first audio guild=%s channel=%s "
-                                "message_to_first_audio_s=%.3f queue_to_first_audio_s=%.3f",
-                                job.voice_channel.guild.id, job.voice_channel.id,
-                                first_frame_ts - job.message_ts,
-                                first_frame_ts - job.queued_at,
-                            )
-                        frames_enqueued += len(out_frames)
-                    if limit_hit:
-                        log.warning(
-                            "Audio length limit hit guild=%s: %d frames (%.1fs) for %d chars; "
-                            "aborting stream (likely a stutter loop)",
-                            job.voice_channel.guild.id, frames_enqueued,
-                            frames_enqueued * PCM_FRAME_MS / 1000, len(job.text),
-                        )
-                        try:
-                            proc.kill()
-                        except ProcessLookupError:
-                            pass
-                        break
-                leftover = buf[n:]
-        finally:
-            await feeder
-            if leftover and not limit_hit:
-                source.enqueue_frames(
-                    [leftover + b"\x00" * (PCM_FRAME_BYTES - len(leftover))]
-                )
-                frames_enqueued += 1
-            try:
-                await proc.wait()
-            except Exception:
-                pass
-
-        part_path = (str(cache_final) + ".part") if cache_final is not None else None
-
-        def _discard_cache() -> None:
-            if part_path:
-                try:
-                    os.unlink(part_path)
-                except OSError:
-                    pass
-
-        if limit_hit:
-            _discard_cache()  # a stutter loop must never be cached
-            return ("truncated", frames_enqueued)
-        if mid_error:
-            _discard_cache()  # never cache a partial stream
-            log.warning(
-                "Stream failed mid-playback after %d frames (%s); truncated",
-                frames_enqueued, mid_error[0],
-            )
-            return ("truncated", frames_enqueued)
-        if frames_enqueued == 0:
-            _discard_cache()
-            return ("pre_audio", 0)
-        # Clean finish: finalize the cache file so repeats skip the API.
-        if cache is not None and cache_final is not None and part_path:
-            try:
-                os.replace(part_path, cache_final)
-                cache.commit_file(job.text, cache_final, voice_cache_key(voice))
-            except OSError:
-                _discard_cache()
-        return ("ok", frames_enqueued)
 
     # ------------------------------------------------------------------
     # Prefetch pipeline (TTS_PREFETCH_ENABLED): generation_worker produces
@@ -1441,7 +1131,7 @@ class SynthesisPipelineMixin:
     ) -> tuple[str, int]:
         """Tee compressed audio to an atomic cache file and ffmpeg stdin.
 
-        Like _stream_tts_to_source but writes to the prefetch channel (not the
+        Writes to the prefetch channel (not the
         live player) and honors cancellation. Returns (status, frames) with
         status in ok/truncated/pre_audio/cancelled.
         """
@@ -1628,153 +1318,3 @@ class SynthesisPipelineMixin:
             except OSError:
                 _discard()
         return ("ok", frames_count)
-
-    async def tts_worker(self) -> None:
-        await self.wait_until_ready()
-        await self.warmup_tts()
-        log.info("TTS worker started")
-
-        while not self.is_closed():
-            job = await self.message_queue.get()
-            filename = config.TMP_DIR / f"tts_{uuid.uuid4().hex}.wav"
-
-            try:
-                worker_started = time.perf_counter()
-                voice = (
-                    self.voice_registry.get(job.voice_profile)
-                    or self.voice_registry.fallback_record()
-                )
-
-                # The legacy single-worker mode still streams Fish, Gemini and
-                # ElevenLabs audio. Reuse the same producer/consumer path as prefetch,
-                # without changing the continuous Discord player.
-                if (
-                    getattr(voice, "is_fish", False) or getattr(voice, "is_gemini", False)
-                    or getattr(voice, "is_elevenlabs", False)
-                ) and self._should_attempt_stream(voice):
-                    prepared = PreparedAudio(job=job, channel=asyncio.Queue())
-                    self.active_prepared.add(prepared)
-                    generator = asyncio.create_task(self._prepare_into(prepared))
-                    try:
-                        await self._play_prepared(prepared)
-                        await generator
-                    finally:
-                        if not generator.done():
-                            generator.cancel()
-                            await asyncio.gather(generator, return_exceptions=True)
-                        self.active_prepared.discard(prepared)
-                    continue
-
-                # Streaming fast path: a MiniMax voice over the continuous
-                # stream plays chunks as they arrive (lower Time-To-First-
-                # Audio). On a pre-audio failure or an open breaker it returns
-                # "fallback" and we drop to the Piper file path below.
-                file_voice_name = job.voice_profile
-                skip_providers: frozenset[str] = frozenset()
-                if getattr(voice, "is_minimax", False) and self._should_attempt_stream(voice):
-                    outcome = await self._run_streaming_job(job, voice, worker_started)
-                    if outcome == "done":
-                        continue
-                    # Pre-audio fallback: the rest of the chain, never MiniMax again.
-                    skip_providers = frozenset({"minimax"})
-
-                connect_task = asyncio.create_task(self.ensure_voice(job.voice_channel))
-                spoke: list = []
-                tts_task = asyncio.create_task(self.generate_tts_file(
-                    job.text, filename, file_voice_name, skip_providers=skip_providers, used_voice=spoke,
-                ))
-
-                try:
-                    vc, provider_used = await asyncio.gather(connect_task, tts_task)
-                except Exception:
-                    connect_error = connect_task.exception() if connect_task.done() else None
-                    tts_error = tts_task.exception() if tts_task.done() else None
-                    if connect_error:
-                        log.exception("Voice prepare failed", exc_info=connect_error)
-                        if not tts_task.done():
-                            tts_task.cancel()
-                        vc = discord.utils.get(self.voice_clients, guild=job.voice_channel.guild)
-                        if vc and vc.is_connected():
-                            await self.disconnect_guild_voice(job.voice_channel.guild)
-                        else:
-                            log.info(
-                                "Skip disconnect cleanup guild=%s reason=voice_not_connected",
-                                job.voice_channel.guild.id,
-                            )
-                    elif tts_error:
-                        log.exception("TTS generation failed; keeping voice session", exc_info=tts_error)
-                    else:
-                        log.exception("TTS processing failed before playback")
-                    continue
-
-                log.info(
-                    "Ready to play guild=%s channel=%s queue_wait=%.3fs prep_total=%.3fs",
-                    job.voice_channel.guild.id,
-                    job.voice_channel.id,
-                    worker_started - job.queued_at,
-                    time.perf_counter() - worker_started,
-                )
-
-                try:
-                    file_voice = (
-                        (spoke[0] if spoke else None)
-                        or self.voice_registry.get(file_voice_name)
-                        or self.voice_registry.fallback_record()
-                    )
-                    pitch = (
-                        file_voice.fish.pitch
-                        if getattr(file_voice, "is_fish", False) and provider_used in {"fish", "cache"}
-                        else 0
-                    )
-                    if config.TTS_CONTINUOUS_STREAM:
-                        source = self.ensure_continuous_player(vc)
-                        frames = limit_pcm_frames(
-                            await self.prepare_tts_pcm_frames(filename, pitch), job.text, file_voice
-                        )
-                        audio_enqueue_ts = time.perf_counter()
-                        source.enqueue_frames(frames)
-                        log.info(
-                            "Queued continuous playback guild=%s channel=%s frames=%s duration=%.3fs message_to_audio_enqueue_s=%.3f queue_to_audio_enqueue_s=%.3f",
-                            job.voice_channel.guild.id,
-                            job.voice_channel.id,
-                            len(frames),
-                            len(frames) * PCM_FRAME_MS / 1000,
-                            audio_enqueue_ts - job.message_ts,
-                            audio_enqueue_ts - job.queued_at,
-                        )
-                        await source.wait_until_drained()
-                    else:
-                        playback_request_ts = time.perf_counter()
-                        log.info(
-                            "Starting non-continuous playback metrics message_to_playback_request_s=%.3f queue_to_playback_request_s=%.3f",
-                            playback_request_ts - job.message_ts,
-                            playback_request_ts - job.queued_at,
-                        )
-                        await self.play_file(vc, filename, pitch)
-                except Exception:
-                    log.exception("Playback failed; disconnecting voice")
-                    await self.disconnect_guild_voice(job.voice_channel.guild)
-                    continue
-
-                log.info(
-                    "Playback finished guild=%s channel=%s total_since_queue=%.3fs",
-                    job.voice_channel.guild.id,
-                    job.voice_channel.id,
-                    time.perf_counter() - job.queued_at,
-                )
-
-                self.schedule_continuous_idle_stop(job.voice_channel.guild)
-                self.schedule_idle_disconnect(job.voice_channel.guild)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("TTS processing failed")
-                await self.disconnect_guild_voice(job.voice_channel.guild)
-            finally:
-                if filename.exists():
-                    try:
-                        filename.unlink()
-                    except OSError:
-                        log.exception("Failed to remove temp file: %s", filename)
-                self.message_queue.task_done()
