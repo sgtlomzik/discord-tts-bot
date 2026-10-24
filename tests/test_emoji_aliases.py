@@ -183,7 +183,7 @@ class ConfigStoreEmojiAliasTests(unittest.TestCase):
             store.add_user(10, 222)
             store.set_emoji_alias("1", "K", "кек")
             loaded = bot.BotConfigStore(path, set())
-            self.assertEqual(loaded.get_guild(10).allowed_users, {111, 222})
+            self.assertEqual(loaded.get_guild(10).allowed_users, {222})
             self.assertEqual(loaded.emoji_aliases, {"1": {"name": "K", "say": "кек"}})
 
 

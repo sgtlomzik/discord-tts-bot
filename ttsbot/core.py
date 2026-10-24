@@ -41,6 +41,7 @@ from ttsbot.playback import PlaybackMixin
 from ttsbot.recording.groq import AudioBudget, GroqTranscriber
 from ttsbot.recording.worker import TranscriptionWorker
 from ttsbot.store import BotConfigStore
+from ttsbot.supervisor import TaskSupervisor
 from ttsbot.voice_lifecycle import VoiceLifecycleMixin
 
 log = logging.getLogger("tts_bot")
@@ -67,14 +68,14 @@ class TTSBot(
         # More top-level groups (/fallback), attached the same way.
         self.extra_groups: list[discord.app_commands.Group] = []
         self.message_queue: asyncio.Queue[TTSJob] = asyncio.Queue(maxsize=config.QUEUE_MAXSIZE)
-        self.worker_task: asyncio.Task[None] | None = None
+        # Every long-running worker runs under the supervisor: a crash is
+        # logged and the worker restarted, and /voicebot status shows it.
+        self.supervisor = TaskSupervisor()
         # Prefetch pipeline: generation worker fills ready_queue (bounded by
         # lookahead) with PreparedAudio; playback worker drains it in order.
         self.ready_queue: asyncio.Queue[PreparedAudio] = asyncio.Queue(
             maxsize=config.TTS_PREFETCH_LOOKAHEAD
         )
-        self.generation_task: asyncio.Task[None] | None = None
-        self.playback_task: asyncio.Task[None] | None = None
         # In-flight + buffered prepared items, so queue-clear can cancel them.
         self.active_prepared: set[PreparedAudio] = set()
         self.idle_disconnect_tasks: dict[int, asyncio.Task[None]] = {}
@@ -186,6 +187,8 @@ class TTSBot(
         self.merge_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self.merge_generations: dict[tuple[int, int], int] = {}
         self.last_user_message_ts: dict[tuple[int, int], float] = {}
+        # The catalog as saved; persist_voice_registry() rolls back to it.
+        self._saved_registry = self.voice_registry.snapshot()
 
     def _seed_elevenlabs_default(self, voice_id: str) -> None:
         """Point eleven-default at ELEVENLABS_VOICE_ID, keeping its tuning."""
@@ -236,22 +239,18 @@ class TTSBot(
             )
         except Exception:
             log.exception("Failed to sync slash commands")
+        sup = self.supervisor
         if config.TTS_PREFETCH_ENABLED:
-            self.generation_task = asyncio.create_task(
-                self._generation_worker(), name="tts-generation")
-            self.playback_task = asyncio.create_task(
-                self._playback_worker(), name="tts-playback")
+            sup.start("tts-generation", self._generation_worker)
+            sup.start("tts-playback", self._playback_worker)
         else:
-            self.worker_task = asyncio.create_task(self.tts_worker(), name="tts-worker")
+            sup.start("tts-worker", self.tts_worker)
         if config.TTS_CONNECTION_KEEPALIVE_SECONDS > 0:
-            self.keepalive_task = asyncio.create_task(
-                self._connection_keepalive_worker(), name="tts-connection-keepalive")
+            sup.start("tts-connection-keepalive", self._connection_keepalive_worker)
         if self.tts_dispatcher.provider_names():
-            self.health_task = asyncio.create_task(
-                self._provider_health_worker(), name="tts-provider-health")
+            sup.start("tts-provider-health", self._provider_health_worker)
         if config.RECORDING_ENABLED and config.STT_ENABLED:
-            self.transcription_task = asyncio.create_task(
-                self._make_transcription_worker().run(), name="stt-worker")
+            sup.start("stt-worker", self._make_transcription_worker().run)
 
     def _make_transcription_worker(self) -> TranscriptionWorker:
         config.RECORDING_DIR.mkdir(parents=True, exist_ok=True)
@@ -294,11 +293,7 @@ class TTSBot(
             return None
 
     async def close(self) -> None:
-        for task in (self.worker_task, self.generation_task, self.playback_task,
-                     getattr(self, "keepalive_task", None), getattr(self, "transcription_task", None),
-                     getattr(self, "health_task", None)):
-            if task:
-                task.cancel()
+        await self.supervisor.stop_all()
         transcriber = getattr(self, "transcriber", None)
         if transcriber is not None:
             await transcriber.aclose()

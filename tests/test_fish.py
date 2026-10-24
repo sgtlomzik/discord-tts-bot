@@ -337,7 +337,7 @@ class FishLatencyCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(BotConfigStore(store.path, set()).settings["fish_latency"], "normal")
             with self.assertRaises(ValueError):
                 store.set_fish_latency("fastest")
-            with patch.object(store, "save", side_effect=OSError("disk full")):
+            with patch.object(store, "_write", side_effect=OSError("disk full")):
                 with self.assertRaises(OSError):
                     store.set_fish_latency("balanced")
             self.assertEqual(store.settings["fish_latency"], "normal")
@@ -362,6 +362,7 @@ class FishLatencyCommandTests(unittest.IsolatedAsyncioTestCase):
             voice = bot_mod.bot.voice_registry.get("fish-default")
             original_key = bot_mod.bot.fish_provider.config.cache_key(voice.fish.reference_id, voice.fish)
             with patch.object(bot_mod.tts_commands, "is_guild_manager", return_value=True), \
+                    patch.object(bot_mod.tts_commands, "is_bot_owner", AsyncMock(return_value=True)), \
                     patch.object(bot_mod.discord, "Member", type(interaction.user)):
                 await bot_mod.slash_tts_fish_latency.callback(
                     interaction, SimpleNamespace(value="balanced"),
@@ -831,6 +832,7 @@ class VoiceCloneCommandTests(unittest.IsolatedAsyncioTestCase):
             )
             sample = SimpleNamespace(size=1000, filename=filename, content_type=content_type)
             with patch.object(bot_mod.tts_commands, "is_guild_manager", return_value=True), \
+                    patch.object(bot_mod.tts_commands, "is_bot_owner", AsyncMock(return_value=True)), \
                     patch.object(bot_mod.discord, "Member", type(interaction.user)):
                 await bot_mod.slash_tts_voice_clone.callback(interaction, "new-voice", sample)
             return sent[0]

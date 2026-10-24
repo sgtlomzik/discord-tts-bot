@@ -239,6 +239,7 @@ class ClientTests(unittest.TestCase):
     def make_client(self, dave=None, bots=()):
         client = RecordingVoiceClient.__new__(RecordingVoiceClient)
         client._ssrc_users = {}
+        client._ignored_ssrcs = set()
         client._pending = {}
         client._dave_warned = set()
         client._dave_held = {}
@@ -253,7 +254,7 @@ class ClientTests(unittest.TestCase):
         client.channel = types.SimpleNamespace(guild=types.SimpleNamespace(id=1, get_member=members.get))
         submitted = []
         client._recorder = types.SimpleNamespace(
-            submit=lambda *args: submitted.append(args),
+            submit=lambda *args, **kw: submitted.append(args),
             counters={"transport_errors": 0},
         )
         client._recorder.note_name = names.__setitem__

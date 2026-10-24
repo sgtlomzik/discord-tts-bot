@@ -5,6 +5,7 @@ voices, per-user fixed phrases and custom-emoji pronunciation aliases.
 Plain JSON on disk, written atomically — intentionally not a database.
 """
 
+import copy
 import json
 import logging
 import tempfile
@@ -12,8 +13,25 @@ from pathlib import Path
 
 from ttsbot import config
 from ttsbot.models import GuildConfig, VOICE_PROFILES
+from ttsbot.statefile import StateFileError, read_json_object
 
 log = logging.getLogger("tts_bot")
+
+SCHEMA_VERSION = 1
+
+
+def _as_dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_bool(value: object, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
 
 
 class BotConfigStore:
@@ -34,6 +52,11 @@ class BotConfigStore:
         # Runtime-adjustable global settings that override env defaults.
         self.settings: dict[str, int | str] = {}
         self.load()
+        # What is on disk now: a failed save() rolls memory back to it.
+        self._saved = self._snapshot()
+
+    def _snapshot(self) -> tuple:
+        return copy.deepcopy((self.guilds, self.emoji_aliases, self.settings))
 
     def _is_valid_voice(self, name: str) -> bool:
         if self.voice_registry is not None:
@@ -53,16 +76,18 @@ class BotConfigStore:
         return fallback if fallback and self._is_valid_voice(fallback) else config.DEFAULT_VOICE_PROFILE
 
     def load(self) -> None:
-        if not self.path.exists():
+        # A damaged file stops startup (StateFileError) instead of being
+        # replaced by defaults on the next save.
+        data = read_json_object(self.path)
+        if data is None:
             return
+        version = data.get("version", SCHEMA_VERSION)
+        if not isinstance(version, int) or version > SCHEMA_VERSION:
+            raise StateFileError(
+                f"{self.path} has schema version {version!r}; this build reads up to {SCHEMA_VERSION}"
+            )
 
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            log.exception("Failed to read bot config: %s", self.path)
-            return
-
-        guilds = data.get("guilds", {}) if isinstance(data, dict) else {}
+        guilds = _as_dict(data.get("guilds"))
         for guild_id_raw, raw_config in guilds.items():
             try:
                 guild_id = int(guild_id_raw)
@@ -70,33 +95,34 @@ class BotConfigStore:
                 continue
             if not isinstance(raw_config, dict):
                 continue
+            raw_allowed = raw_config.get("allowed_users", [])
             allowed_users = {
                 int(user_id)
-                for user_id in raw_config.get("allowed_users", [])
+                for user_id in (raw_allowed if isinstance(raw_allowed, list) else [])
                 if str(user_id).isdigit()
             }
             user_voices = {
                 int(user_id): voice
-                for user_id, voice in raw_config.get("user_voices", {}).items()
-                if str(user_id).isdigit() and self._is_valid_voice(voice)
+                for user_id, voice in _as_dict(raw_config.get("user_voices")).items()
+                if str(user_id).isdigit() and isinstance(voice, str) and self._is_valid_voice(voice)
             }
             default_voice = raw_config.get("default_voice", self._default_voice())
-            if not self._is_valid_voice(default_voice):
+            if not isinstance(default_voice, str) or not self._is_valid_voice(default_voice):
                 default_voice = self._default_voice()
             user_fixed_phrases = {
                 int(user_id): phrase
-                for user_id, phrase in raw_config.get("user_fixed_phrases", {}).items()
+                for user_id, phrase in _as_dict(raw_config.get("user_fixed_phrases")).items()
                 if str(user_id).isdigit() and isinstance(phrase, str) and phrase.strip()
             }
             self.guilds[guild_id] = GuildConfig(
-                enabled=bool(raw_config.get("enabled", True)),
+                enabled=_as_bool(raw_config.get("enabled", True)),
                 allowed_users=allowed_users,
                 default_voice=default_voice,
                 user_voices=user_voices,
                 user_fixed_phrases=user_fixed_phrases,
             )
 
-        raw_aliases = data.get("emoji_aliases", {}) if isinstance(data, dict) else {}
+        raw_aliases = data.get("emoji_aliases", {})
         emoji_aliases: dict[str, dict[str, str]] = {}
         if isinstance(raw_aliases, dict):
             for emoji_id, entry in raw_aliases.items():
@@ -112,7 +138,7 @@ class BotConfigStore:
                 }
         self.emoji_aliases = emoji_aliases
 
-        raw_settings = data.get("settings", {}) if isinstance(data, dict) else {}
+        raw_settings = data.get("settings", {})
         if isinstance(raw_settings, dict):
             max_chars = raw_settings.get("tts_max_chars")
             if isinstance(max_chars, int) and max_chars > 0:
@@ -144,16 +170,8 @@ class BotConfigStore:
     def set_fish_latency(self, mode: str) -> None:
         if mode not in {"low", "balanced", "normal"}:
             raise ValueError("Fish latency must be low, balanced, or normal")
-        previous = self.settings.get("fish_latency")
         self.settings["fish_latency"] = mode
-        try:
-            self.save()
-        except OSError:
-            if previous is None:
-                self.settings.pop("fish_latency", None)
-            else:
-                self.settings["fish_latency"] = previous
-            raise
+        self.save()
 
     def set_elevenlabs_key(self, fingerprint: str) -> None:
         """Remember the active ElevenLabs key (its fingerprint, never the key)."""
@@ -161,9 +179,22 @@ class BotConfigStore:
         self.save()
 
     def save(self) -> None:
+        """Write the state; on failure roll memory back to the last save.
+
+        Mutators change memory and then save, so without the rollback a
+        failed write would leave settings in effect that are not on disk.
+        """
+        try:
+            self._write()
+        except Exception:
+            self.guilds, self.emoji_aliases, self.settings = copy.deepcopy(self._saved)
+            raise
+        self._saved = self._snapshot()
+
+    def _write(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
-            "version": 1,
+            "version": SCHEMA_VERSION,
             "guilds": {
                 str(guild_id): {
                     "enabled": config.enabled,
@@ -200,7 +231,9 @@ class BotConfigStore:
     def get_guild(self, guild_id: int) -> GuildConfig:
         config = self.guilds.get(guild_id)
         if config is None:
-            config = GuildConfig(allowed_users=set(self.fallback_users), default_voice=self._default_voice())
+            # WHITELIST_USERS is checked live in is_allowed(), not copied in:
+            # a copy would outlive the user's removal from the env.
+            config = GuildConfig(default_voice=self._default_voice())
             self.guilds[guild_id] = config
         return config
 
@@ -208,7 +241,11 @@ class BotConfigStore:
         return self.get_guild(guild_id).enabled
 
     def is_allowed(self, guild_id: int, user_id: int) -> bool:
-        return user_id in self.get_guild(guild_id).allowed_users
+        return user_id in self.fallback_users or user_id in self.get_guild(guild_id).allowed_users
+
+    def is_env_user(self, user_id: int) -> bool:
+        """Allowed in every guild by WHITELIST_USERS (changed only in .env)."""
+        return user_id in self.fallback_users
 
     def add_user(self, guild_id: int, user_id: int) -> None:
         self.get_guild(guild_id).allowed_users.add(user_id)

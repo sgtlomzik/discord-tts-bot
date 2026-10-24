@@ -23,6 +23,9 @@ log = logging.getLogger("tts_bot")
 
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+# A rejected key (401/403) is the operator's to fix; meanwhile pause all
+# sending instead of using up every file's attempts.
+AUTH_RETRY_SECONDS = 1800.0
 
 
 class TranscriptionError(Exception):
@@ -93,10 +96,13 @@ class GroqTranscriber:
             wait = (float(retry_after) if retry_after.replace(".", "", 1).isdigit() else None) \
                 or parse_duration(headers.get("x-ratelimit-reset-audio-seconds")) or 60.0
             raise TranscriptionError(f"HTTP 429: {response.text[:200]}", retry=True, wait=wait)
+        if response.status_code in (401, 403):
+            raise TranscriptionError(f"HTTP {response.status_code} (API key rejected): {response.text[:200]}",
+                                     retry=True, wait=AUTH_RETRY_SECONDS)
         if response.status_code >= 500:
             raise TranscriptionError(f"HTTP {response.status_code}: {response.text[:200]}", retry=True, wait=60.0)
         if response.status_code != 200:
-            # 400 (bad file), 401 (key), 413 (too large): sending it again won't help.
+            # 400 (bad file), 413 (too large): sending it again won't help.
             raise TranscriptionError(f"HTTP {response.status_code}: {response.text[:300]}", retry=False)
         try:
             data = response.json()

@@ -37,6 +37,16 @@ from ttsbot.recording.transcript import MAX_ATTEMPTS, build_session_transcript, 
 
 log = logging.getLogger("tts_bot")
 
+# Damaged manifest lines and sessions already reported, so a scan every
+# 30 s does not repeat the same warning.
+_reported: set[tuple[str, int]] = set()
+
+
+def _report_once(key: tuple[str, int], message: str, *args: object) -> None:
+    if key not in _reported:
+        _reported.add(key)
+        log.warning(message, *args)
+
 
 @dataclass(frozen=True, slots=True)
 class PendingChunk:
@@ -129,11 +139,17 @@ class TranscriptionWorker:
         for session in sorted(self.root.glob("*/*/")):
             if session in self._finished or not (session / "session.json").exists():
                 continue
-            info = json.loads((session / "session.json").read_text(encoding="utf-8"))
-            if info.get("ended_at") is None and session not in recorder.ACTIVE_SESSIONS:
-                recorder.recover_session(session)  # left open by a crash or restart
+            # One damaged session must not stop the others from being transcribed.
+            try:
                 info = json.loads((session / "session.json").read_text(encoding="utf-8"))
-            todo = [PendingChunk(session, entry) for entry in self._entries(session) if self._needs_work(session, entry)]
+                if info.get("ended_at") is None and session not in recorder.ACTIVE_SESSIONS:
+                    recorder.recover_session(session)  # left open by a crash or restart
+                    info = json.loads((session / "session.json").read_text(encoding="utf-8"))
+                todo = [PendingChunk(session, entry) for entry in self._entries(session)
+                        if self._needs_work(session, entry)]
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                _report_once((str(session), -1), "Transcription skips unreadable session=%s: %s", session, exc)
+                continue
             pending.extend(todo)
             if not todo and info.get("ended_at") is not None and session not in recorder.ACTIVE_SESSIONS:
                 ended.append(session)
@@ -234,22 +250,49 @@ class TranscriptionWorker:
 
     @staticmethod
     def _entries(session: Path) -> list[dict]:
+        """The manifest's entries; a damaged line (a crash mid-append) is skipped."""
         manifest = session / "chunks.jsonl"
         if not manifest.exists():
             return []
-        return [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line]
+        entries = []
+        for number, line in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                if not isinstance(entry, dict) or not isinstance(entry.get("file"), str) \
+                        or not isinstance(entry.get("started_at"), (int, float)):
+                    raise ValueError("not a chunk entry")
+            except ValueError as exc:
+                _report_once((str(manifest), number), "Skipping damaged manifest line %s:%d: %s",
+                             manifest, number, exc)
+                continue
+            entries.append(entry)
+        return entries
 
     def _needs_work(self, session: Path, entry: dict) -> bool:
         if result_path(session, entry["file"]).exists():
             return False
-        error = error_path(session, entry["file"])
-        if error.exists():
-            return json.loads(error.read_text(encoding="utf-8")).get("attempts", 0) < self.max_attempts
-        return True
+        return self._attempts(session, entry["file"]) < self.max_attempts
+
+    @staticmethod
+    def _attempts(session: Path, chunk_file: str) -> int:
+        """Failed attempts so far; an unreadable error file counts as none."""
+        try:
+            data = json.loads(error_path(session, chunk_file).read_text(encoding="utf-8"))
+            return int(data.get("attempts", 0))
+        except FileNotFoundError:
+            return 0
+        except (OSError, ValueError, TypeError, AttributeError):
+            return 0
 
     async def transcribe(self, chunk: PendingChunk, pending: int = 0) -> None:
         entry = chunk.entry
         upload = chunk.path
+        if not upload.exists():
+            # Nothing to send, now or later: give up on it at once.
+            self._record_error(chunk, "audio file is missing", final=True)
+            return
         temp: Path | None = None
         try:
             if upload.stat().st_size > MAX_UPLOAD_BYTES:
@@ -263,15 +306,24 @@ class TranscriptionWorker:
             else:
                 self._record_error(chunk, str(exc))
             return
+        except Exception as exc:
+            self._record_error(chunk, f"{type(exc).__name__}: {exc}")
+            return
         finally:
             if temp is not None:
                 temp.unlink(missing_ok=True)
+        # Groq has billed the audio by now, whatever happens next.
         self.budget.record(entry["audio_seconds"], result.remaining_audio_seconds)
-        stored = chunk_result(entry, result.data, model=self.transcriber.model, took=result.took)
-        target = result_path(chunk.session, entry["file"])
-        tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(stored, ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(target)
+        try:
+            stored = chunk_result(entry, result.data, model=self.transcriber.model, took=result.took)
+            target = result_path(chunk.session, entry["file"])
+            tmp = target.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(stored, ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(target)
+        except Exception as exc:
+            # Counted like a rejection, so the audio is not re-sent forever.
+            self._record_error(chunk, f"result not stored: {type(exc).__name__}: {exc}")
+            return
         error_path(chunk.session, entry["file"]).unlink(missing_ok=True)
         log.info(
             "Transcription done file=%s/%s user=%s audio_s=%.1f took=%.2fs chars=%d segments=%d "
@@ -283,11 +335,9 @@ class TranscriptionWorker:
         )
         await self.rebuild(chunk.session)
 
-    def _record_error(self, chunk: PendingChunk, message: str) -> None:
+    def _record_error(self, chunk: PendingChunk, message: str, *, final: bool = False) -> None:
         path = error_path(chunk.session, chunk.entry["file"])
-        attempts = 1
-        if path.exists():
-            attempts = json.loads(path.read_text(encoding="utf-8")).get("attempts", 0) + 1
+        attempts = self.max_attempts if final else self._attempts(chunk.session, chunk.entry["file"]) + 1
         write_atomic(path, json.dumps({"attempts": attempts, "error": message, "at": round(time.time(), 3)},
                                       ensure_ascii=False))
         log.error("Transcription rejected attempt=%d/%d file=%s/%s: %s",
@@ -304,6 +354,10 @@ class TranscriptionWorker:
         if tts.exists():
             speakers |= {json.loads(line)["user_id"] for line in tts.read_text(encoding="utf-8").splitlines() if line}
         missing = [user_id for user_id in speakers if str(user_id) not in names]
+        if session in recorder.ACTIVE_SESSIONS:
+            # The recorder's writer thread owns names.json while it records;
+            # names it lacks are looked up once the session has ended.
+            missing = []
         for user_id in missing:
             name = await self.name_for(info["guild_id"], user_id)
             if name:

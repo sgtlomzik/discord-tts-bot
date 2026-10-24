@@ -114,7 +114,7 @@ class SlashLimitCommandTests(unittest.IsolatedAsyncioTestCase):
             response=types.SimpleNamespace(send_message=AsyncMock()),
         )
         with patch.object(
-            bot_mod.tts_commands, "require_guild_manager", AsyncMock(return_value=True)
+            bot_mod.tts_commands, "require_bot_owner", AsyncMock(return_value=True)
         ):
             await bot_mod.slash_tts_limit.callback(interaction, 700)
         self.assertEqual(bot_mod.config.TTS_MAX_CHARS, 700)
@@ -122,7 +122,7 @@ class SlashLimitCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("700", msg)
 
         with patch.object(
-            bot_mod.tts_commands, "require_guild_manager", AsyncMock(return_value=True)
+            bot_mod.tts_commands, "require_bot_owner", AsyncMock(return_value=True)
         ):
             await bot_mod.slash_tts_limit.callback(interaction, None)
         msg = interaction.response.send_message.await_args.args[0]
@@ -155,6 +155,8 @@ async def _stutter_forever(data: bytes):
 
 
 class FakeSource:
+    stopped = False
+
     def __init__(self, frame_bytes: int):
         self.frame_bytes = frame_bytes
         self.frames: list[bytes] = []

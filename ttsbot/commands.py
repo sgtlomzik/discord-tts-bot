@@ -54,6 +54,30 @@ async def require_guild_manager(interaction: discord.Interaction) -> bool:
     return True
 
 
+async def is_bot_owner(bot, user: discord.abc.User) -> bool:
+    """OWNER_IDS from the environment, or the Discord application's owner."""
+    if user.id in config.OWNER_IDS:
+        return True
+    try:
+        return await bot.is_owner(user)
+    except discord.HTTPException:
+        log.exception("Could not look up the bot owner")
+        return False
+
+
+async def require_bot_owner(bot, interaction: discord.Interaction) -> bool:
+    """Gate for settings shared by every guild (voices, tuning, limits)."""
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Команда доступна только на сервере.", ephemeral=True)
+        return False
+    if not await is_bot_owner(bot, interaction.user):
+        await interaction.response.send_message(
+            "Это общая настройка для всех серверов: её меняет только владелец бота.", ephemeral=True
+        )
+        return False
+    return True
+
+
 _EMOTION_CHOICES = [
     app_commands.Choice(name="auto (по тексту)", value="auto"),
     app_commands.Choice(name="без эмоции", value="none"),
@@ -290,6 +314,13 @@ def build_commands(bot):
             return
         guild = interaction.guild
         assert guild is not None
+        if bot.config_store.is_env_user(user.id):
+            await interaction.response.send_message(
+                f"{user.mention} озвучивается на всех серверах через WHITELIST_USERS в .env; "
+                "убрать его можно только там.",
+                ephemeral=True,
+            )
+            return
         bot.config_store.remove_user(guild.id, user.id)
         await interaction.response.send_message(f"Исключен из озвучки: {user.mention}", ephemeral=True)
 
@@ -406,7 +437,7 @@ def build_commands(bot):
         description: str = "",
         provider: app_commands.Choice[str] | None = None,
     ) -> None:
-        if not await require_guild_manager(interaction):
+        if not await require_bot_owner(bot, interaction):
             return
         name = name.strip().lower()
         voice_id = voice_id.strip()
@@ -521,7 +552,7 @@ def build_commands(bot):
         reference_id: str,
         description: str = "",
     ) -> None:
-        if not await require_guild_manager(interaction):
+        if not await require_bot_owner(bot, interaction):
             return
         name = name.strip().lower()
         reference_id = reference_id.strip()
@@ -571,7 +602,7 @@ def build_commands(bot):
         sample: discord.Attachment,
         description: str = "",
     ) -> None:
-        if not await require_guild_manager(interaction):
+        if not await require_bot_owner(bot, interaction):
             return
         name = name.strip().lower()
         if not voice_registry.valid_voice_name(name):
@@ -640,7 +671,7 @@ def build_commands(bot):
     async def slash_tts_voice_describe(
         interaction: discord.Interaction, name: str, text: str
     ) -> None:
-        if not await require_guild_manager(interaction):
+        if not await require_bot_owner(bot, interaction):
             return
         name = name.strip().lower()
         rec = bot.voice_registry.get(name)
@@ -687,7 +718,7 @@ def build_commands(bot):
         temperature: app_commands.Range[float, 0.0, 1.0] | None = None,
         top_p: app_commands.Range[float, 0.0, 1.0] | None = None,
     ) -> None:
-        if not await require_guild_manager(interaction):
+        if not await require_bot_owner(bot, interaction):
             return
         name = name.strip().lower()
         rec = bot.voice_registry.get(name)
@@ -734,7 +765,7 @@ def build_commands(bot):
         interaction: discord.Interaction,
         mode: app_commands.Choice[str] | None = None,
     ) -> None:
-        if not await require_guild_manager(interaction):
+        if not await require_bot_owner(bot, interaction):
             return
         if mode is not None:
             try:
@@ -778,7 +809,7 @@ def build_commands(bot):
         similarity: app_commands.Range[float, 0.0, 1.0] | None = None,
         reset: bool = False,
     ) -> None:
-        if not await require_guild_manager(interaction):
+        if not await require_bot_owner(bot, interaction):
             return
         name = name.strip().lower()
         rec = bot.voice_registry.get(name)
@@ -1063,7 +1094,7 @@ def build_commands(bot):
     async def slash_tts_fallback(
         interaction: discord.Interaction, chain: str | None = None, voice: str | None = None,
     ) -> None:
-        if not await require_guild_manager(interaction):
+        if not await require_bot_owner(bot, interaction):
             return
         reg = bot.voice_registry
         record = None
@@ -1119,6 +1150,8 @@ def build_commands(bot):
     ) -> None:
         if not await require_guild_manager(interaction):
             return
+        if reset is not None and not await require_bot_owner(bot, interaction):
+            return  # a reset affects every guild
         await interaction.response.defer(ephemeral=True, thinking=True)
         disp = bot.tts_dispatcher
         notes: list[str] = []
@@ -1351,7 +1384,7 @@ def build_commands(bot):
 
     @tts_group.command(name="stats", description="Статистика и настройки TTS")
     async def slash_tts_stats(interaction: discord.Interaction) -> None:
-        if not await require_guild_manager(interaction):
+        if not await require_bot_owner(bot, interaction):
             return
         view = StatsView(interaction.guild, author_id=interaction.user.id)
         await interaction.response.send_message(
@@ -1380,6 +1413,11 @@ def build_commands(bot):
                     f"Default voice: `{guild_config.default_voice}`",
                     f"Allowed users: `{len(guild_config.allowed_users)}`",
                     f"Merge: `{config.TTS_MERGE_SHORT_MESSAGES}`",
+                    "Workers: " + (", ".join(
+                        f"`{name}` {'ok' if st.running else 'stopped'}"
+                        + (f" (restarts {st.restarts}: {st.last_error})" if st.restarts else "")
+                        for name, st in sorted(bot.supervisor.status().items())
+                    ) or "none"),
                 ]
             ),
             ephemeral=True,
@@ -1432,7 +1470,7 @@ def build_commands(bot):
         interaction: discord.Interaction,
         chars: app_commands.Range[int, 50, 2000] | None = None,
     ) -> None:
-        if not await require_guild_manager(interaction):
+        if not await require_bot_owner(bot, interaction):
             return
         if chars is None:
             await interaction.response.send_message(
@@ -1491,6 +1529,27 @@ def build_commands(bot):
         await bot.ensure_voice(ctx.author.voice.channel)
         await ctx.reply("TTS connected.", mention_author=False)
 
+
+    async def on_app_command_error(
+        interaction: discord.Interaction, error: app_commands.AppCommandError,
+    ) -> None:
+        """Answer every failed slash command instead of leaving it unanswered."""
+        if isinstance(error, app_commands.CheckFailure):
+            text = "Недостаточно прав для этой команды."
+        else:
+            original = getattr(error, "original", error)
+            name = getattr(getattr(interaction, "command", None), "qualified_name", "?")
+            log.error("Slash command /%s failed", name, exc_info=original)
+            text = f"Команда не выполнена: {type(original).__name__}: {original}"[:1900]
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except discord.HTTPException:
+            log.warning("Could not report a failed slash command to the user")
+
+    bot.tree.error(on_app_command_error)
 
     ns = dict(locals())
     ns.pop("bot", None)

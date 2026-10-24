@@ -18,6 +18,14 @@ from ttsbot.recording.client import RecordingVoiceClient
 log = logging.getLogger("tts_bot")
 
 
+class VoiceCooldown(RuntimeError):
+    """A connect or move was refused because a recent one failed.
+
+    The bot may still be connected and playing elsewhere in the guild, so
+    callers must not treat this as a broken connection.
+    """
+
+
 class VoiceLifecycleMixin:
     """Voice connect/disconnect policy; mixed into TTSBot."""
 
@@ -49,6 +57,11 @@ class VoiceLifecycleMixin:
             config.VOICE_CONNECT_COOLDOWN_SECONDS,
             reason,
         )
+
+    def _check_voice_cooldown(self, guild_id: int) -> None:
+        remaining = self.voice_connect_cooldown_remaining(guild_id)
+        if remaining > 0:
+            raise VoiceCooldown(f"Voice connect cooldown active for {remaining:.1f}s")
 
     def voice_connect_cooldown_remaining(self, guild_id: int) -> float:
         until = self.voice_connect_cooldown_until.get(guild_id)
@@ -211,13 +224,12 @@ class VoiceLifecycleMixin:
         lock = self.get_voice_connect_lock(guild_id)
 
         async with lock:
-            remaining = self.voice_connect_cooldown_remaining(guild_id)
-            if remaining > 0:
-                raise RuntimeError(f"Voice connect cooldown active for {remaining:.1f}s")
-
             vc = discord.utils.get(self.voice_clients, guild=voice_channel.guild)
 
+            # The cooldown holds back new connects and moves only: the
+            # channel the bot is already in stays usable.
             if not vc or not vc.is_connected():
+                self._check_voice_cooldown(guild_id)
                 # A prior handshake may have died (network flakiness) yet left a
                 # VoiceClient registered on the guild whose socket is dead.
                 # connect() would then raise "Already connected" and we'd get
@@ -278,6 +290,7 @@ class VoiceLifecycleMixin:
                     time.perf_counter() - started,
                 )
             elif vc.channel != voice_channel:
+                self._check_voice_cooldown(guild_id)
                 log.info(
                     "Moving voice client guild=%s from=%s to=%s",
                     guild_id,
@@ -307,6 +320,10 @@ class VoiceLifecycleMixin:
         return vc
 
     async def disconnect_guild_voice(self, guild: discord.Guild) -> None:
+        # Jobs being generated or played for this guild have nowhere to go.
+        for prepared in self.active_prepared:
+            if prepared.job.guild_id == guild.id:
+                prepared.cancelled = True
         self.cancel_idle_disconnect(guild.id)
         self.cancel_continuous_idle_stop(guild.id)
         source = self.continuous_sources.pop(guild.id, None)

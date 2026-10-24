@@ -93,7 +93,8 @@ class TTSBotTests(unittest.TestCase):
             config = store.get_guild(10)
 
             self.assertTrue(config.enabled)
-            self.assertEqual(config.allowed_users, {111})
+            self.assertEqual(config.allowed_users, set())  # env users are not copied in
+            self.assertTrue(store.is_allowed(10, 111))
 
             store.add_user(10, 222)
             store.set_enabled(10, False)
@@ -104,7 +105,7 @@ class TTSBotTests(unittest.TestCase):
             loaded_config = loaded.get_guild(10)
 
             self.assertFalse(loaded_config.enabled)
-            self.assertEqual(loaded_config.allowed_users, {111, 222})
+            self.assertEqual(loaded_config.allowed_users, {222})
             self.assertEqual(loaded_config.default_voice, "piper-ruslan")
             self.assertEqual(loaded.voice_for_user(10, 222), "piper-ruslan")
 

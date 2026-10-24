@@ -123,7 +123,10 @@ def register_events(bot):
         if not bot.config_store.is_allowed(member.guild.id, member.id):
             return
 
-        if isinstance(after.channel, discord.VoiceChannel):
+        # Only joining or switching a channel pulls the bot in: mute, deafen
+        # and stream toggles arrive here too and must not undo an idle
+        # disconnect.
+        if isinstance(after.channel, discord.VoiceChannel) and before.channel != after.channel:
             await bot.auto_connect_for_member(member, after.channel)
 
         guild = member.guild

@@ -267,8 +267,19 @@ class SynthesisPipelineMixin:
         return VOICE_PROFILES.get(name, VOICE_PROFILES[config.DEFAULT_VOICE_PROFILE])
 
     def persist_voice_registry(self) -> None:
-        """Atomically write the current catalog to data/voices.json."""
-        voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
+        """Atomically write the current catalog to data/voices.json.
+
+        On failure the in-memory catalog goes back to what is on disk, so
+        a command never leaves a voice in effect that was not saved.
+        """
+        try:
+            voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
+        except Exception:
+            saved = getattr(self, "_saved_registry", None)
+            if saved is not None:
+                self.voice_registry.restore(saved)
+            raise
+        self._saved_registry = self.voice_registry.snapshot()
 
     async def validate_minimax_voice(self, voice_id: str) -> tuple[bool, str]:
         """Probe a MiniMax voice_id with a short phrase.

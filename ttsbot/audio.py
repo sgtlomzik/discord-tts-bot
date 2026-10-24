@@ -280,7 +280,9 @@ class ContinuousTTSAudioSource(discord.AudioSource):
         return self._opus
 
     def enqueue_frames(self, frames: list[bytes]) -> None:
-        if not frames:
+        # A stopped source is never read again, so frames queued now would
+        # never drain and wait_until_drained() would never return.
+        if not frames or self._stopped.is_set():
             return
         for frame in frames:
             self._check_frame(frame)

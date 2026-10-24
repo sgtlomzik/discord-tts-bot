@@ -73,6 +73,8 @@ async def _raise_before_first():
 
 
 class FakeSource:
+    stopped = False
+
     def __init__(self, frame_bytes: int):
         self.frame_bytes = frame_bytes
         self.frames: list[bytes] = []
