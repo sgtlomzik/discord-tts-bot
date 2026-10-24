@@ -7,19 +7,12 @@ substituted before the stripping step, mirroring the emoji-alias design.
 
 from __future__ import annotations
 
-import importlib.util
 import types
 import unittest
 from pathlib import Path
 
 
-def load_bot_module():
-    module_path = Path(__file__).resolve().parent.parent / "bot.py"
-    spec = importlib.util.spec_from_file_location("tts_bot_module_mentions", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+from support import load_bot_module  # noqa: E402,F401  (re-exported for other tests)
 
 
 bot = load_bot_module()

@@ -2,7 +2,6 @@
 
 import asyncio
 import datetime as dt
-import importlib.util
 import types
 import unittest
 from pathlib import Path
@@ -20,12 +19,7 @@ from ttsbot.providers import MiniMaxConfig, MiniMaxProvider, TTSDispatcher
 from ttsbot.voice_registry import ElevenLabsParams, VoiceRecord, VoiceRegistry
 
 
-def load_bot_module():
-    path = Path(__file__).resolve().parent.parent / "bot.py"
-    spec = importlib.util.spec_from_file_location("tts_bot_module_warm", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from support import load_bot_module  # noqa: E402,F401  (re-exported for other tests)
 
 
 class WarmerTests(unittest.IsolatedAsyncioTestCase):
