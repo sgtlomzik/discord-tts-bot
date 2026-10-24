@@ -231,7 +231,9 @@ class BotConfigStore:
     def get_guild(self, guild_id: int) -> GuildConfig:
         config = self.guilds.get(guild_id)
         if config is None:
-            config = GuildConfig(allowed_users=set(self.fallback_users), default_voice=self._default_voice())
+            # WHITELIST_USERS is checked live in is_allowed(), not copied in:
+            # a copy would outlive the user's removal from the env.
+            config = GuildConfig(default_voice=self._default_voice())
             self.guilds[guild_id] = config
         return config
 
@@ -239,7 +241,11 @@ class BotConfigStore:
         return self.get_guild(guild_id).enabled
 
     def is_allowed(self, guild_id: int, user_id: int) -> bool:
-        return user_id in self.get_guild(guild_id).allowed_users
+        return user_id in self.fallback_users or user_id in self.get_guild(guild_id).allowed_users
+
+    def is_env_user(self, user_id: int) -> bool:
+        """Allowed in every guild by WHITELIST_USERS (changed only in .env)."""
+        return user_id in self.fallback_users
 
     def add_user(self, guild_id: int, user_id: int) -> None:
         self.get_guild(guild_id).allowed_users.add(user_id)
