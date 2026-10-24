@@ -87,7 +87,8 @@ class BuildBodyEmotionTests(unittest.TestCase):
 
 class VoiceCacheKeyTests(unittest.TestCase):
     def _mm_voice(self, **overrides):
-        params = dict(speed=1.0, vol=1.0, pitch=0, emotion="", model="speech-2.8-hd")
+        params = dict(speed=1.0, vol=1.0, pitch=0, emotion="", model="speech-2.8-hd",
+                      voice_id="bussshy01", language_boost="Russian")
         params.update(overrides)
         return types.SimpleNamespace(
             name="bussshy", provider="minimax", minimax=types.SimpleNamespace(**params)
@@ -111,6 +112,13 @@ class VoiceCacheKeyTests(unittest.TestCase):
             voice_cache_key(self._mm_voice(speed=1.0)),
             voice_cache_key(self._mm_voice(speed=1.5)),
         )
+
+    def test_minimax_voice_id_and_language_change_the_key(self):
+        # The same voice name re-pointed at another MiniMax voice must not
+        # replay the old voice's cached audio.
+        base = voice_cache_key(self._mm_voice())
+        self.assertNotEqual(base, voice_cache_key(self._mm_voice(voice_id="other01")))
+        self.assertNotEqual(base, voice_cache_key(self._mm_voice(language_boost="English")))
 
     def test_minimax_same_params_stable(self):
         self.assertEqual(

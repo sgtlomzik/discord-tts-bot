@@ -415,9 +415,9 @@ class TTSPhraseCache:
 def voice_cache_key(voice) -> str:
     """Cache key fragment for a voice record.
 
-    A piper voice is keyed by name. A MiniMax voice also folds in the params
-    that change the audio (speed/vol/pitch/emotion/model) so that re-tuning a
-    voice produces a fresh key — the old entry is no longer served and evicts
+    A piper voice is keyed by name. A MiniMax voice also folds in what
+    changes the audio (voice_id, speed/vol/pitch/emotion/model, language)
+    so that re-pointing or re-tuning a voice produces a fresh key — the old entry is no longer served and evicts
     by LRU. ``emotion="auto"`` is a constant here; the concrete emotion is
     derived from the text, which is already part of the full cache key.
     """
@@ -427,7 +427,8 @@ def voice_cache_key(voice) -> str:
     mm = getattr(voice, "minimax", None)
     if getattr(voice, "provider", None) == "minimax" and mm is not None:
         return "|".join(
-            str(x) for x in (name, mm.speed, mm.vol, mm.pitch, mm.emotion, mm.model)
+            str(x) for x in (name, mm.speed, mm.vol, mm.pitch, mm.emotion, mm.model,
+                             mm.voice_id, mm.language_boost)
         )
     return name
 
