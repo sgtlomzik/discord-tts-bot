@@ -30,7 +30,7 @@ def _env(name: str, default: str) -> str:
 
 @dataclass(frozen=True)
 class FishConfig:
-    api_key: str
+    api_key: str = field(repr=False)  # never in logs or tracebacks
     reference_id: str = ""
     model: str = "s2.1-pro-free"
     format: str = "opus"

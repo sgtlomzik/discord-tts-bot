@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -62,7 +62,7 @@ def _env(name: str, default: str) -> str:
 
 @dataclass(frozen=True)
 class GeminiConfig:
-    api_key: str
+    api_key: str = field(repr=False)  # never in logs or tracebacks
     model: str = DEFAULT_MODEL
     voice: str = DEFAULT_VOICE
     base_url: str = DEFAULT_BASE_URL

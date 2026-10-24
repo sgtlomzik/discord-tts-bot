@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
@@ -79,7 +79,7 @@ class MiniMaxVoiceNotFoundError(MiniMaxError, RequestError):
 
 @dataclass
 class MiniMaxConfig:
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)  # never in logs or tracebacks
     group_id: str = ""
     voice_id: str = ""
     model: str = "speech-2.8-turbo"

@@ -31,7 +31,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import AsyncIterator, Callable
 
@@ -91,9 +91,9 @@ def format_kind(output_format: str) -> tuple[str, int]:
 
 @dataclass(frozen=True)
 class ElevenLabsConfig:
-    api_key: str
+    api_key: str = field(repr=False)  # never in logs or tracebacks
     # More keys for the ring, tried after api_key in this order.
-    api_keys: tuple[str, ...] = ()
+    api_keys: tuple[str, ...] = field(default=(), repr=False)
     model: str = DEFAULT_MODEL
     format: str = DEFAULT_FORMAT
     voice_id: str = ""
