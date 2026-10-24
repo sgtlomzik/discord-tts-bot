@@ -25,6 +25,7 @@ from ttsbot.audio import (
     split_pcm_frames,
 )
 from ttsbot.models import PreparedAudio
+from ttsbot.voice_lifecycle import VoiceCooldown
 
 log = logging.getLogger("tts_bot")
 
@@ -70,6 +71,12 @@ class PlaybackMixin:
             return
         try:
             vc = await self.ensure_voice(job.voice_channel)
+        except VoiceCooldown as exc:
+            # The current connection (if any) is fine; only this job's
+            # channel cannot be reached yet.
+            log.warning("Skipped job guild=%s job=%s: %s", job.voice_channel.guild.id, job.job_id, exc)
+            await self._drain_channel(prepared)
+            return
         except Exception:
             log.exception("Voice prepare failed (playback)")
             existing = discord.utils.get(self.voice_clients, guild=job.voice_channel.guild)
