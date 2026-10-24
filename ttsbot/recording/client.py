@@ -105,11 +105,21 @@ class RecordingVoiceClient(discord.VoiceClient):
                 log.exception("Recording TTS note failed guild=%s", self.guild.id)
 
     def _start_recording(self) -> None:
+        # Recording is optional: a failure here (full disk, unwritable
+        # RECORDING_DIR) is logged and the voice connection stays up for TTS.
         if self._recorder is None and self.channel is not None:
-            self._recorder = ChannelRecorder(settings_from_config(), self.guild.id, self.channel.id,
-                                             guild_name=getattr(self.guild, "name", None),
-                                             channel_name=getattr(self.channel, "name", None))
-            self._recorder.start()
+            try:
+                recorder = ChannelRecorder(settings_from_config(), self.guild.id, self.channel.id,
+                                           guild_name=getattr(self.guild, "name", None),
+                                           channel_name=getattr(self.channel, "name", None))
+                recorder.start()
+            except Exception:
+                log.exception("Recording could not start guild=%s channel=%s; TTS continues",
+                              self.guild.id, self.channel.id)
+                return
+            self._recorder = recorder
+        if self._recorder is None:
+            return
         if not self._listening:
             self._connection.add_socket_listener(self._on_packet)
             self._listening = True
