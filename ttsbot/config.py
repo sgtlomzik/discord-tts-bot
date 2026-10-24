@@ -88,7 +88,7 @@ def reload() -> None:
     global VOICE_CONNECT_COOLDOWN_SECONDS
     global PIPER_MODELS_DIR, PIPER_MODEL_PATH, PIPER_CONFIG_PATH
     global PIPER_SPEAKER, PIPER_LENGTH_SCALE
-    global WHITELIST_USERS
+    global WHITELIST_USERS, OWNER_IDS
     global RECORDING_ENABLED, RECORDING_DIR, RECORDING_CHUNK_SECONDS
     global RECORDING_IDLE_CLOSE_SECONDS, RECORDING_PAUSE_MS, RECORDING_VAD_AGGRESSIVENESS
     global RECORDING_AUDIO_KEEP_DAYS, RECORDING_TRANSCRIPT_KEEP_DAYS, RECORDING_PRUNE_INTERVAL_HOURS
@@ -295,6 +295,9 @@ def reload() -> None:
         TTS_IDLE_FRAME_MODE = "comfort_noise"
 
     WHITELIST_USERS = parse_user_ids(os.getenv("WHITELIST_USERS", DEFAULT_WHITELIST))
+    # Who may change settings shared by every guild; the Discord
+    # application's owner always may.
+    OWNER_IDS = parse_user_ids(os.getenv("OWNER_IDS", ""))
 
 
 reload()
