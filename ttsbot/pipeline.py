@@ -34,7 +34,7 @@ from ttsbot.audio import (
     PCM_FRAME_MS,
     build_tts_stream_pcm_command,
 )
-from ttsbot.models import PreparedAudio, VOICE_PROFILES, VoiceProfile
+from ttsbot.models import PreparedAudio, VOICE_PROFILES, VoiceProfile, piper_default_profile
 from ttsbot.ogg_opus import (
     FRAME_CACHE_MAGIC,
     OggOpusDemuxer,
@@ -219,7 +219,7 @@ class SynthesisPipelineMixin:
         name = (
             voice_profile
             or self.voice_registry.fallback_profile
-            or config.DEFAULT_VOICE_PROFILE
+            or piper_default_profile()
         )
         rec = self.voice_registry.get(name)
         if rec is not None and rec.is_piper and rec.piper is not None:
@@ -231,7 +231,7 @@ class SynthesisPipelineMixin:
                 piper_speaker=rec.piper.speaker,
                 piper_length_scale=rec.piper.length_scale,
             )
-        return VOICE_PROFILES.get(name, VOICE_PROFILES[config.DEFAULT_VOICE_PROFILE])
+        return VOICE_PROFILES.get(name) or VOICE_PROFILES[piper_default_profile()]
 
     def persist_voice_registry(self) -> None:
         """Atomically write the current catalog to data/voices.json.

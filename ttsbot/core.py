@@ -30,7 +30,7 @@ from ttsbot.providers import (
 from ttsbot.minimax import load_minimax_config_from_env
 from ttsbot import config
 from ttsbot.intake import MessageQueueMixin
-from ttsbot.models import VOICE_PROFILES
+from ttsbot.models import VOICE_PROFILES, piper_default_profile
 from ttsbot.pipeline import SynthesisPipelineMixin
 from ttsbot.playback import PlaybackMixin
 from ttsbot.recording.groq import AudioBudget, GroqTranscriber
@@ -77,7 +77,7 @@ class TTSBot(
         self.voice_registry = voice_registry.load_or_seed(
             config.VOICES_REGISTRY_PATH,
             VOICE_PROFILES,
-            fallback_profile=config.DEFAULT_VOICE_PROFILE,
+            fallback_profile=piper_default_profile(),
             minimax_voice_id=_mm_seed.voice_id,
             minimax_model=_mm_seed.model,
             minimax_language_boost=_mm_seed.language_boost,

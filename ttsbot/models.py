@@ -97,12 +97,15 @@ def reload_voice_profiles() -> None:
         }
     )
 
-    if config.DEFAULT_VOICE_PROFILE not in VOICE_PROFILES:
-        log.warning(
-            "Unknown TTS_DEFAULT_VOICE_PROFILE=%s; using piper-ruslan",
-            config.DEFAULT_VOICE_PROFILE,
-        )
-        config.DEFAULT_VOICE_PROFILE = "piper-ruslan"
+
+
+def piper_default_profile() -> str:
+    """The Piper voice to fall back on: TTS_DEFAULT_VOICE_PROFILE when it is
+    a Piper voice, else piper-ruslan. The default itself may be a cloud
+    voice (fish-default); BotConfigStore checks it against the registry."""
+    if config.DEFAULT_VOICE_PROFILE in VOICE_PROFILES:
+        return config.DEFAULT_VOICE_PROFILE
+    return "piper-ruslan"
 
 
 reload_voice_profiles()
