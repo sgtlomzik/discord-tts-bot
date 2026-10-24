@@ -28,8 +28,8 @@ def register_events(bot):
         log.info("Voice profiles: %s", ",".join(sorted(VOICE_PROFILES)))
         log.info("Piper tuning: speaker=%s length_scale=%.2f", config.PIPER_SPEAKER, config.PIPER_LENGTH_SCALE)
         log.info(
-            "Per-message cap: max_text_length=%s tts_max_chars=%s",
-            config.MAX_TEXT_LENGTH, config.TTS_MAX_CHARS,
+            "Per-message cap: tts_max_chars=%s (env %s)",
+            bot.config_store.max_chars(), config.TTS_MAX_CHARS,
         )
         log.info(
             "Continuous stream: trim_silence=%s idle_mode=%s idle_volume_db=%s stream_tail_ms=%s max_idle_seconds=%s",

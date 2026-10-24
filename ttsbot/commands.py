@@ -1269,7 +1269,7 @@ def build_commands(bot):
         cache_on = getattr(bot.tts_dispatcher, "cache", None) is not None
         embed = discord.Embed(title="⚙️ TTS • Настройки", color=0x57F287)
         embed.add_field(name="Кэш", value="вкл" if cache_on else "выкл", inline=True)
-        embed.add_field(name="Лимит символов", value=str(config.TTS_MAX_CHARS), inline=True)
+        embed.add_field(name="Лимит символов", value=str(bot.config_store.max_chars()), inline=True)
         embed.add_field(name="Fish latency", value=f"`{bot.fish_latency}`", inline=True)
         if config.TTS_AUDIO_LIMIT_ENABLED:
             audio_limit = (
@@ -1457,13 +1457,13 @@ def build_commands(bot):
             return
         if chars is None:
             await interaction.response.send_message(
-                f"Текущий лимит: `{config.TTS_MAX_CHARS}` символов на сообщение.",
+                f"Текущий лимит: `{bot.config_store.max_chars()}` символов на сообщение.",
                 ephemeral=True,
             )
             return
         bot.config_store.set_tts_max_chars(int(chars))
         await interaction.response.send_message(
-            f"Лимит длины текста: `{config.TTS_MAX_CHARS}` символов на сообщение. "
+            f"Лимит длины текста: `{bot.config_store.max_chars()}` символов на сообщение. "
             "Более длинные сообщения будут обрезаться.",
             ephemeral=True,
         )

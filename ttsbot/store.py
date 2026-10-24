@@ -149,22 +149,14 @@ class BotConfigStore:
             elevenlabs_key = raw_settings.get("elevenlabs_key")
             if isinstance(elevenlabs_key, str) and elevenlabs_key:
                 self.settings["elevenlabs_key"] = elevenlabs_key
-        self._apply_settings()
 
-    def _apply_settings(self) -> None:
-        """Push stored overrides into the live config module."""
-        max_chars = self.settings.get("tts_max_chars")
-        if isinstance(max_chars, int) and max_chars > 0:
-            config.TTS_MAX_CHARS = max_chars
-            # TTS_MAX_CHARS is enforced at the enqueue boundary, but
-            # MAX_TEXT_LENGTH is a hard ceiling deeper in normalization —
-            # lift it so the requested limit actually takes effect.
-            if config.MAX_TEXT_LENGTH < max_chars:
-                config.MAX_TEXT_LENGTH = max_chars
+    def max_chars(self) -> int:
+        """The per-message character cap: /voicebot limit, else TTS_MAX_CHARS."""
+        value = self.settings.get("tts_max_chars")
+        return value if isinstance(value, int) and value > 0 else config.TTS_MAX_CHARS
 
     def set_tts_max_chars(self, value: int) -> None:
         self.settings["tts_max_chars"] = int(value)
-        self._apply_settings()
         self.save()
 
     def set_fish_latency(self, mode: str) -> None:

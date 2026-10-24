@@ -1,11 +1,11 @@
 """Environment-derived runtime configuration.
 
-All tunables live as UPPER_CASE module globals so the rest of the package
-(and the tests) can read *and mutate* them at call time via
+All tunables live as UPPER_CASE module globals, read at call time via
 ``config.NAME``. ``reload()`` re-reads everything from the environment;
-``bot.py`` calls it on every exec so each test module load starts from a
-clean, env-derived state (matching the old single-file behavior where
-re-executing bot.py re-parsed the environment).
+``app.create_bot()`` calls it, so each test's bot starts from a clean,
+env-derived state. Runtime code never assigns to these (a test enforces
+it): settings changed while the bot runs (``/voicebot limit``, Fish
+latency) live in ``BotConfigStore``.
 """
 
 import logging
