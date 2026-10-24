@@ -1497,6 +1497,27 @@ def build_commands(bot):
         await ctx.reply("TTS connected.", mention_author=False)
 
 
+    async def on_app_command_error(
+        interaction: discord.Interaction, error: app_commands.AppCommandError,
+    ) -> None:
+        """Answer every failed slash command instead of leaving it unanswered."""
+        if isinstance(error, app_commands.CheckFailure):
+            text = "Недостаточно прав для этой команды."
+        else:
+            original = getattr(error, "original", error)
+            name = getattr(getattr(interaction, "command", None), "qualified_name", "?")
+            log.error("Slash command /%s failed", name, exc_info=original)
+            text = f"Команда не выполнена: {type(original).__name__}: {original}"[:1900]
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except discord.HTTPException:
+            log.warning("Could not report a failed slash command to the user")
+
+    bot.tree.error(on_app_command_error)
+
     ns = dict(locals())
     ns.pop("bot", None)
     return ns

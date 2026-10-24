@@ -337,7 +337,7 @@ class FishLatencyCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(BotConfigStore(store.path, set()).settings["fish_latency"], "normal")
             with self.assertRaises(ValueError):
                 store.set_fish_latency("fastest")
-            with patch.object(store, "save", side_effect=OSError("disk full")):
+            with patch.object(store, "_write", side_effect=OSError("disk full")):
                 with self.assertRaises(OSError):
                     store.set_fish_latency("balanced")
             self.assertEqual(store.settings["fish_latency"], "normal")

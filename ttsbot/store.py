@@ -5,6 +5,7 @@ voices, per-user fixed phrases and custom-emoji pronunciation aliases.
 Plain JSON on disk, written atomically — intentionally not a database.
 """
 
+import copy
 import json
 import logging
 import tempfile
@@ -51,6 +52,11 @@ class BotConfigStore:
         # Runtime-adjustable global settings that override env defaults.
         self.settings: dict[str, int | str] = {}
         self.load()
+        # What is on disk now: a failed save() rolls memory back to it.
+        self._saved = self._snapshot()
+
+    def _snapshot(self) -> tuple:
+        return copy.deepcopy((self.guilds, self.emoji_aliases, self.settings))
 
     def _is_valid_voice(self, name: str) -> bool:
         if self.voice_registry is not None:
@@ -164,16 +170,8 @@ class BotConfigStore:
     def set_fish_latency(self, mode: str) -> None:
         if mode not in {"low", "balanced", "normal"}:
             raise ValueError("Fish latency must be low, balanced, or normal")
-        previous = self.settings.get("fish_latency")
         self.settings["fish_latency"] = mode
-        try:
-            self.save()
-        except OSError:
-            if previous is None:
-                self.settings.pop("fish_latency", None)
-            else:
-                self.settings["fish_latency"] = previous
-            raise
+        self.save()
 
     def set_elevenlabs_key(self, fingerprint: str) -> None:
         """Remember the active ElevenLabs key (its fingerprint, never the key)."""
@@ -181,6 +179,19 @@ class BotConfigStore:
         self.save()
 
     def save(self) -> None:
+        """Write the state; on failure roll memory back to the last save.
+
+        Mutators change memory and then save, so without the rollback a
+        failed write would leave settings in effect that are not on disk.
+        """
+        try:
+            self._write()
+        except Exception:
+            self.guilds, self.emoji_aliases, self.settings = copy.deepcopy(self._saved)
+            raise
+        self._saved = self._snapshot()
+
+    def _write(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "version": SCHEMA_VERSION,

@@ -187,6 +187,8 @@ class TTSBot(
         self.merge_locks: dict[tuple[int, int], asyncio.Lock] = {}
         self.merge_generations: dict[tuple[int, int], int] = {}
         self.last_user_message_ts: dict[tuple[int, int], float] = {}
+        # The catalog as saved; persist_voice_registry() rolls back to it.
+        self._saved_registry = self.voice_registry.snapshot()
 
     def _seed_elevenlabs_default(self, voice_id: str) -> None:
         """Point eleven-default at ELEVENLABS_VOICE_ID, keeping its tuning."""

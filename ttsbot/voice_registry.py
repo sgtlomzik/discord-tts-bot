@@ -167,6 +167,19 @@ class VoiceRegistry:
     def add(self, record: VoiceRecord) -> None:
         self.voices[record.name] = record
 
+    def snapshot(self) -> tuple:
+        """The catalog's state (records are frozen, so shallow copies do)."""
+        chain = list(self.fallback_chain) if self.fallback_chain is not None else None
+        return self.fallback_profile, dict(self.voices), self.version, chain
+
+    def restore(self, snapshot: tuple) -> None:
+        """Put back a snapshot() in place (the object is shared)."""
+        fallback, voices, version, chain = snapshot
+        self.fallback_profile = fallback
+        self.voices = dict(voices)
+        self.version = version
+        self.fallback_chain = list(chain) if chain is not None else None
+
     def fallback_record(self) -> Optional[VoiceRecord]:
         return self.voices.get(self.fallback_profile)
 
