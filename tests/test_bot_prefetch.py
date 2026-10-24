@@ -171,18 +171,16 @@ class PipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         tts_bot.warmup_tts = AsyncMock()
         tts_bot.is_closed = MagicMock(return_value=False)
 
+        session = tts_bot.start_session(1)
         for i in range(2):
-            await tts_bot.message_queue.put(_job(bot_mod, text=f"msg{i}"))
+            await session.queue.put(_job(bot_mod, text=f"msg{i}"))
 
-        gen = asyncio.create_task(tts_bot._generation_worker())
-        play = asyncio.create_task(tts_bot._playback_worker())
         try:
-            await asyncio.wait_for(tts_bot.message_queue.join(), timeout=15)
-            await asyncio.wait_for(tts_bot.ready_queue.join(), timeout=15)
+            await asyncio.wait_for(session.queue.join(), timeout=15)
+            await asyncio.wait_for(session.ready.join(), timeout=15)
         finally:
-            gen.cancel()
-            play.cancel()
-            for t in (gen, play):
+            await tts_bot.supervisor.stop_all()
+            for t in ():
                 try:
                     await t
                 except asyncio.CancelledError:
@@ -196,7 +194,7 @@ class PipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         tts_bot = bot_mod.TTSBot()
         job = _job(bot_mod, gid=7)
         prepared = bot_mod.PreparedAudio(job=job, channel=asyncio.Queue())
-        tts_bot.active_prepared.add(prepared)
+        tts_bot.session_for(7).active.add(prepared)
         cleared = tts_bot.clear_queue_for_guild(7)
         self.assertTrue(prepared.cancelled)
         self.assertGreaterEqual(cleared, 1)

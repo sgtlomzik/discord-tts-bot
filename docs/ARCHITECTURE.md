@@ -129,20 +129,31 @@ the idle disconnect when no allowed member remains with the bot.
 
 ## 4. Queue and Worker Model
 
-The jobs go through two queues:
+Each guild has its own `GuildSession` (`ttsbot/session.py`), created on
+first use by `session_for()`. A guild's first message calls
+`start_session()`, which starts the guild's two workers under the bot's
+`TaskSupervisor` (`tts-generation:<guild>` and `tts-playback:<guild>`):
 
 ```text
-message_queue (TTSJob) -> _generation_worker -> ready_queue (PreparedAudio, lookahead 1)
-                                                      -> _playback_worker -> player
+session.queue (TTSJob) -> _generation_worker -> session.ready (PreparedAudio, lookahead)
+                              | starts _generate(prepared) as a task
+                              v
+                         PreparedAudio.channel -> _playback_worker -> session.player
 ```
 
-The generation worker puts each `PreparedAudio` into `ready_queue` first
-(order and backpressure) and then generates its audio into the item's
-channel as batches of frames; the playback worker drains the channels in
-order into the guild's continuous player, so message N+1 is generated
-while N plays. `queue-clear`, `/voicebot off` and a disconnect mark the
-guild's items cancelled. The drain wait after a message is bounded, and a
-player stopped under the worker (`!tts stop`, a kick) never holds it.
+The generation worker puts each `PreparedAudio` into `session.ready` first,
+which fixes the play order and bounds the prefetch window
+(`TTS_PREFETCH_LOOKAHEAD`). It then starts that message's generation as its
+own task and moves on, so the next message's request goes out while the
+current one is still downloading or playing. The playback worker drains the
+channels strictly in order into the guild's continuous player.
+
+Guilds never wait for each other: a long message or a stuck player in one
+guild holds up only that guild. `queue-clear`, `/voicebot off` and a
+disconnect cancel the guild's queued and in-flight items
+(`GuildSession.cancel_all()`). The drain wait after a message is bounded,
+and a player stopped under the worker (`!tts stop`, a kick) never holds it.
+`/voicebot status` shows each worker's state and restart count.
 
 ## 5. Synthesis Paths
 
@@ -318,12 +329,19 @@ silence trimmed by ffmpeg (`TTS_TRIM_SILENCE`).
 
 ## 7. Voice Connection and Idle Handling
 
-The bot manages voice state separately from synthesis:
+The bot manages voice state separately from synthesis. It is kept in the
+guild's `GuildSession`, next to its queue:
 
-- per-guild voice connect locks prevent concurrent connect/move races;
-- connect cooldown prevents rapid retry loops after failures;
-- idle disconnect is scheduled after playback;
-- auto-connect is suppressed briefly after explicit or idle disconnect.
+- `voice_lock` prevents concurrent connect/move races;
+- `connect_cooldown_until` prevents rapid retry loops after a failed
+  connect or move; it is checked only when the bot has to connect or move,
+  never against a connection that already works (`VoiceCooldown` skips the
+  message without disconnecting);
+- `idle_disconnect_task` disconnects after `IDLE_DISCONNECT_SECONDS` without
+  allowed members, and `idle_stop_task` stops an idle continuous player;
+- `auto_connect_suppressed_until` holds auto-connect off briefly after an
+  explicit or idle disconnect;
+- `player` is the guild's `ContinuousTTSAudioSource`.
 
 This is a good separation to preserve when adding a new engine, because the TTS backend should not be responsible for voice lifecycle policy.
 

@@ -56,8 +56,9 @@ class MessageQueueMixin:
                 voice_profile=voice_profile,
                 message_ts=message_ts or now,
             )
+            session = self.start_session(voice_channel.guild.id)
             await asyncio.wait_for(
-                self.message_queue.put(job),
+                session.queue.put(job),
                 timeout=max(config.TTS_QUEUE_PUT_TIMEOUT_MS, 1) / 1000.0,
             )
             log.info(
@@ -66,7 +67,7 @@ class MessageQueueMixin:
                 text_channel_id,
                 voice_channel.id,
                 author_id,
-                self.message_queue.qsize(),
+                session.queue.qsize(),
                 len(text),
                 voice_profile,
                 job.job_id,
@@ -91,27 +92,7 @@ class MessageQueueMixin:
                                    message_ts=time.perf_counter())
 
     def clear_queue_for_guild(self, guild_id: int) -> int:
-        kept: list[TTSJob] = []
-        removed = 0
-        while True:
-            try:
-                job = self.message_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if job.guild_id == guild_id:
-                removed += 1
-                self.message_queue.task_done()
-            else:
-                kept.append(job)
-                self.message_queue.task_done()
-
-        for job in kept:
-            self.message_queue.put_nowait(job)
-
-        # Cancel prefetched/in-flight prepared audio for this guild so it is
-        # neither played nor finishes burning quota on generation.
-        for prepared in self.active_prepared:
-            if prepared.job.guild_id == guild_id and not prepared.cancelled:
-                prepared.cancelled = True
-                removed += 1
-        return removed
+        """Drop the guild's queued messages and cancel the ones in flight
+        (neither played nor finishing their generation); return how many."""
+        session = self.sessions.get(guild_id)
+        return session.cancel_all() if session is not None else 0

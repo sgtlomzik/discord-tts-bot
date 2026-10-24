@@ -466,32 +466,48 @@ class SynthesisPipelineMixin:
     # PreparedAudio ahead of playback_worker, which plays strictly FIFO.
     # ------------------------------------------------------------------
 
-    async def _generation_worker(self) -> None:
+    async def _generation_worker(self, session) -> None:
+        """Start generating each of the guild's messages in order.
+
+        A message's generation starts as soon as it fits the prefetch window
+        (``session.ready``, which also fixes the play order), so the next
+        message is generated while the current one is still downloading or
+        playing.
+        """
         await self.wait_until_ready()
-        await self.warmup_tts()
-        log.info("TTS generation worker started (lookahead=%d)", config.TTS_PREFETCH_LOOKAHEAD)
+        log.info("TTS generation worker started guild=%s lookahead=%d",
+                 session.guild_id, config.TTS_PREFETCH_LOOKAHEAD)
         while not self.is_closed():
-            job = await self.message_queue.get()
+            job = await session.queue.get()
             prepared = PreparedAudio(job=job, channel=asyncio.Queue())
-            self.active_prepared.add(prepared)
+            session.active.add(prepared)
             try:
-                # Backpressure: blocks here when we are already `lookahead`
-                # messages ahead of playback.
-                await self.ready_queue.put(prepared)
-                # wait_s: time in the queue before generation began (the
-                # previous message's download, or lookahead backpressure).
-                log.info(
-                    "Generation start guild=%s job=%s voice=%s wait_s=%.3f",
-                    job.guild_id, job.job_id, job.voice_profile, time.perf_counter() - job.queued_at,
-                )
-                await self._prepare_into(prepared)
-            except asyncio.CancelledError:
+                # Backpressure: waits while `lookahead` messages are ready ahead.
+                await session.ready.put(prepared)
+            except BaseException:
+                prepared.channel.put_nowait(None)
                 raise
-            except Exception:
-                log.exception("TTS generation pipeline error")
-                await prepared.channel.put(None)
             finally:
-                self.message_queue.task_done()
+                session.queue.task_done()
+            # wait_s: time in the queue before generation began.
+            log.info(
+                "Generation start guild=%s job=%s voice=%s wait_s=%.3f",
+                job.guild_id, job.job_id, job.voice_profile, time.perf_counter() - job.queued_at,
+            )
+            task = asyncio.create_task(self._generate(prepared), name=f"tts-generate:{job.guild_id}:{job.job_id}")
+            session.generating.add(task)
+            task.add_done_callback(session.generating.discard)
+
+    async def _generate(self, prepared: PreparedAudio) -> None:
+        """Generate one message; its channel always ends with the sentinel."""
+        try:
+            await self._prepare_into(prepared)
+        except asyncio.CancelledError:
+            prepared.channel.put_nowait(None)
+            raise
+        except Exception:
+            log.exception("TTS generation pipeline error job=%s", prepared.job.job_id)
+            await prepared.channel.put(None)
 
     async def _prepare_into(self, prepared: PreparedAudio) -> None:
         """Generate a job's audio into ``prepared.channel`` (frame batches).

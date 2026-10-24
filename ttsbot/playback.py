@@ -36,11 +36,12 @@ DRAIN_SLACK_SECONDS = 5.0
 class PlaybackMixin:
     """Continuous/file playback for PCM and Opus; mixed into TTSBot."""
 
-    async def _playback_worker(self) -> None:
+    async def _playback_worker(self, session) -> None:
+        """Play the guild's prepared messages in order."""
         await self.wait_until_ready()
-        log.info("TTS playback worker started")
+        log.info("TTS playback worker started guild=%s", session.guild_id)
         while not self.is_closed():
-            prepared = await self.ready_queue.get()
+            prepared = await session.ready.get()
             try:
                 await self._play_prepared(prepared)
             except asyncio.CancelledError:
@@ -49,8 +50,8 @@ class PlaybackMixin:
                 log.exception("TTS playback failed; disconnecting voice")
                 await self.disconnect_guild_voice(prepared.job.voice_channel.guild)
             finally:
-                self.active_prepared.discard(prepared)
-                self.ready_queue.task_done()
+                session.active.discard(prepared)
+                session.ready.task_done()
 
     async def _drain_channel(self, prepared: PreparedAudio) -> None:
         """Consume a prepared channel to its sentinel without playing."""
@@ -147,7 +148,8 @@ class PlaybackMixin:
         """
         guild_id = vc.guild.id
         self.cancel_continuous_idle_stop(guild_id)
-        source = self.continuous_sources.get(guild_id)
+        session = self.session_for(guild_id)
+        source = session.player
         source_created = False
         if source is None or source.stopped or not source.is_opus():
             if source is not None:
@@ -156,7 +158,7 @@ class PlaybackMixin:
             if not any(idle):
                 idle = OPUS_SILENCE_FRAME  # digital silence needs no encoder
             source = ContinuousTTSAudioSource(idle, opus=True)
-            self.continuous_sources[guild_id] = source
+            session.player = source
             source_created = True
 
         if initial_frames:

@@ -25,8 +25,9 @@ class MessageIntakeTests(unittest.IsolatedAsyncioTestCase):
         for text in texts:
             await tts_bot.queue_message(text, channel, 300, 400)
         jobs = []
-        while not tts_bot.message_queue.empty():
-            jobs.append(tts_bot.message_queue.get_nowait().text)
+        queue = tts_bot.session_for(100).queue
+        while not queue.empty():
+            jobs.append(queue.get_nowait().text)
         return jobs
 
     async def test_short_messages_are_queued_at_once_and_in_order(self):

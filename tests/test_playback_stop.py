@@ -74,7 +74,8 @@ class DisconnectCancelsTests(unittest.IsolatedAsyncioTestCase):
         tts_bot = bot_mod.TTSBot()
         mine = bot_mod.PreparedAudio(job=_job(bot_mod, gid=7), channel=asyncio.Queue())
         other = bot_mod.PreparedAudio(job=_job(bot_mod, gid=8), channel=asyncio.Queue())
-        tts_bot.active_prepared.update({mine, other})
+        tts_bot.session_for(7).active.add(mine)
+        tts_bot.session_for(8).active.add(other)
         guild = types.SimpleNamespace(id=7)
 
         await tts_bot.disconnect_guild_voice(guild)

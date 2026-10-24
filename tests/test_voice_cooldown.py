@@ -30,7 +30,7 @@ class EnsureVoiceCooldownTests(unittest.IsolatedAsyncioTestCase):
         guild = types.SimpleNamespace(id=5)
         channel = types.SimpleNamespace(id=50, guild=guild)
         vc = _connected_vc(channel)
-        tts_bot.voice_connect_cooldown_until[guild.id] = bot_mod.time.monotonic() + 60
+        tts_bot.session_for(guild.id).connect_cooldown_until = bot_mod.time.monotonic() + 60
 
         with patch.object(type(tts_bot), "voice_clients", new_callable=PropertyMock, return_value=[vc]):
             result = await tts_bot.ensure_voice(channel)
@@ -44,7 +44,7 @@ class EnsureVoiceCooldownTests(unittest.IsolatedAsyncioTestCase):
         here = types.SimpleNamespace(id=50, guild=guild)
         there = types.SimpleNamespace(id=51, guild=guild)
         vc = _connected_vc(here)
-        tts_bot.voice_connect_cooldown_until[guild.id] = bot_mod.time.monotonic() + 60
+        tts_bot.session_for(guild.id).connect_cooldown_until = bot_mod.time.monotonic() + 60
 
         with patch.object(type(tts_bot), "voice_clients", new_callable=PropertyMock, return_value=[vc]):
             with self.assertRaises(VoiceCooldown):

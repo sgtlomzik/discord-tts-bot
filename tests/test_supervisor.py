@@ -78,8 +78,8 @@ class BotWorkersTests(unittest.IsolatedAsyncioTestCase):
         tts_bot.tree.sync = AsyncMock(return_value=[])
         await tts_bot.setup_hook()
         try:
-            names = set(tts_bot.supervisor.status())
-            self.assertTrue({"tts-generation", "tts-playback"} <= names)
+            # The per-guild workers start with each guild's first message.
+            self.assertIn("tts-warmup", set(tts_bot.supervisor.status()))
         finally:
             await tts_bot.supervisor.stop_all()
 
