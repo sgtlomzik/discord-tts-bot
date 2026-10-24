@@ -307,6 +307,10 @@ class VoiceLifecycleMixin:
         return vc
 
     async def disconnect_guild_voice(self, guild: discord.Guild) -> None:
+        # Jobs being generated or played for this guild have nowhere to go.
+        for prepared in self.active_prepared:
+            if prepared.job.guild_id == guild.id:
+                prepared.cancelled = True
         self.cancel_idle_disconnect(guild.id)
         self.cancel_continuous_idle_stop(guild.id)
         source = self.continuous_sources.pop(guild.id, None)

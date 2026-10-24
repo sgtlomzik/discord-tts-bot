@@ -16,6 +16,7 @@ import discord
 from ttsbot import config
 from ttsbot.audio import (
     PCM_FRAME_BYTES,
+    PCM_FRAME_MS,
     ContinuousTTSAudioSource,
     OPUS_SILENCE_FRAME,
     build_idle_pcm_frame,
@@ -26,6 +27,11 @@ from ttsbot.audio import (
 from ttsbot.models import PreparedAudio
 
 log = logging.getLogger("tts_bot")
+
+# How much longer than the queued audio the playback worker waits for the
+# player to drain before it moves on (a player thread that died or a
+# stalled voice connection must not hold every later message).
+DRAIN_SLACK_SECONDS = 5.0
 
 
 class PlaybackMixin:
@@ -81,6 +87,11 @@ class PlaybackMixin:
                 break
             if prepared.cancelled:
                 continue  # stop feeding but drain to the sentinel
+            if source is not None and source.stopped:
+                # The player was stopped under us (!tts stop, off, a kick):
+                # nothing will read these frames, so drop the rest.
+                prepared.cancelled = True
+                continue
             if source is None:
                 source = self.ensure_continuous_player(vc, initial_frames=batch)
             else:
@@ -104,9 +115,15 @@ class PlaybackMixin:
                 note = getattr(vc, "note_spoken_text", None)
                 if note is not None:
                     note(job.author_id, job.text)
-        if total == 0 or source is None:
+        if total == 0 or source is None or source.stopped:
             return
-        await source.wait_until_drained()
+        budget = total * PCM_FRAME_MS / 1000 + DRAIN_SLACK_SECONDS
+        if not await source.wait_until_drained(budget):
+            log.warning(
+                "Playback drain timed out guild=%s job=%s frames=%d waited_s=%.1f",
+                job.voice_channel.guild.id, job.job_id, total, budget,
+            )
+            return
         log.info(
             "Playback finished guild=%s channel=%s frames=%d total_since_queue=%.3fs job=%s provider=%s",
             job.voice_channel.guild.id, job.voice_channel.id, total,

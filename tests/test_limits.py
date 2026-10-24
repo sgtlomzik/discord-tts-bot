@@ -155,6 +155,8 @@ async def _stutter_forever(data: bytes):
 
 
 class FakeSource:
+    stopped = False
+
     def __init__(self, frame_bytes: int):
         self.frame_bytes = frame_bytes
         self.frames: list[bytes] = []
