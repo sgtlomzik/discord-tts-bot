@@ -17,6 +17,7 @@ from ttsbot.recording.client import RecordingVoiceClient
 def _client():
     client = RecordingVoiceClient.__new__(RecordingVoiceClient)
     client._ssrc_users = {}
+    client._ignored_ssrcs = set()
     client._pending = {}
     client._dave_warned = set()
     client._dave_held = {}

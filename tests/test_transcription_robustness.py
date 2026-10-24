@@ -96,6 +96,25 @@ class WorkerRobustnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(worker.scan()[0]), 1)
 
 
+class ActiveSessionNamesTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rebuild_leaves_names_to_the_recorder_while_it_records(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        rec = ChannelRecorder(RecorderSettings(root=root), guild_id=1, channel_id=2)
+        rec.start()
+        self.addCleanup(rec.stop)
+        rec.submit(5, 0, FRAME, 1000.0)
+        budget = AudioBudget(root / "ledger.jsonl", per_hour=7200, per_day=28800)
+
+        async def name_for(guild_id, user_id):
+            return "from-api"
+
+        worker = TranscriptionWorker(root, FakeTranscriber([]), budget, name_for=name_for, tz=UTC)
+        (rec.path / "tts.jsonl").write_text('{"user_id": 9, "at": 1.0, "text": "x"}\n', encoding="utf-8")
+        await worker.rebuild(rec.path)
+        self.assertFalse((rec.path / "names.json").exists())  # the recorder's writer owns it
+
+
 class GroqAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejected_key_pauses_instead_of_failing_the_file(self):
         audio = Path(tempfile.mkdtemp()) / "a.ogg"

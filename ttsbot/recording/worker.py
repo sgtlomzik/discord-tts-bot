@@ -354,6 +354,10 @@ class TranscriptionWorker:
         if tts.exists():
             speakers |= {json.loads(line)["user_id"] for line in tts.read_text(encoding="utf-8").splitlines() if line}
         missing = [user_id for user_id in speakers if str(user_id) not in names]
+        if session in recorder.ACTIVE_SESSIONS:
+            # The recorder's writer thread owns names.json while it records;
+            # names it lacks are looked up once the session has ended.
+            missing = []
         for user_id in missing:
             name = await self.name_for(info["guild_id"], user_id)
             if name:

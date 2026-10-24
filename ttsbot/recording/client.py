@@ -32,6 +32,9 @@ log = logging.getLogger("tts_bot")
 _OP_READY = 2
 _OP_SPEAKING = 5
 _OP_CLIENT_DISCONNECT = 13
+# SPEAKING flags (voice gateway op 5).
+_SPEAKING_MICROPHONE = 1
+_SPEAKING_SOUNDSHARE = 2
 
 # Packets kept per unknown SSRC until its SPEAKING event names the user.
 _PENDING_PACKETS = 50
@@ -57,6 +60,7 @@ def settings_from_config() -> RecorderSettings:
 class RecordingVoiceClient(discord.VoiceClient):
     def __init__(self, client: discord.Client, channel: discord.abc.Connectable) -> None:
         self._ssrc_users: dict[int, int] = {}
+        self._ignored_ssrcs: set[int] = set()  # Go-Live sound streams
         self._pending: dict[int, collections.deque] = {}
         self._dave_warned: set[tuple[int, str]] = set()
         self._dave_held: dict[int, collections.deque] = {}
@@ -126,6 +130,7 @@ class RecordingVoiceClient(discord.VoiceClient):
 
     def _reset_streams(self) -> None:
         self._ssrc_users.clear()
+        self._ignored_ssrcs.clear()
         self._pending.clear()
         self._dave_held.clear()
         self._dave_warned.clear()
@@ -138,6 +143,14 @@ class RecordingVoiceClient(discord.VoiceClient):
         data = msg.get("d") or {}
         if op == _OP_SPEAKING and "ssrc" in data and "user_id" in data:
             ssrc, user_id = int(data["ssrc"]), int(data["user_id"])
+            flags = int(data.get("speaking") or 0)
+            if flags & _SPEAKING_MICROPHONE:
+                self._ignored_ssrcs.discard(ssrc)
+            elif flags & _SPEAKING_SOUNDSHARE or ssrc in self._ignored_ssrcs:
+                # Go-Live sound is the stream's audio, not the member's voice.
+                self._ignored_ssrcs.add(ssrc)
+                self._ssrc_users.pop(ssrc, None)
+                return
             if self._ssrc_users.get(ssrc) != user_id:
                 self._ssrc_users[ssrc] = user_id
                 log.debug("Voice receive ssrc=%s user=%s guild=%s", ssrc, user_id, self.guild.id)
@@ -167,6 +180,10 @@ class RecordingVoiceClient(discord.VoiceClient):
             return
         if packet.payload == rtp.OPUS_SILENCE:
             return
+        if packet.ssrc in self._ignored_ssrcs:
+            recorder.count("soundshare_packets")
+            self._pending.pop(packet.ssrc, None)
+            return
         wall = time.time()
         user_id = self._ssrc_users.get(packet.ssrc)
         if user_id is None:
@@ -189,7 +206,7 @@ class RecordingVoiceClient(discord.VoiceClient):
         connection = self._connection
         session = connection.dave_session
         if session is None or not connection.dave_protocol_version:
-            self._submit(recorder, user_id, packet.timestamp, packet.payload, wall)
+            self._submit(recorder, user_id, packet.timestamp, packet.payload, wall, packet.ssrc)
             return
         try:
             payload = session.decrypt(user_id, davey.MediaType.audio, packet.payload)
@@ -228,8 +245,8 @@ class RecordingVoiceClient(discord.VoiceClient):
                     recorder.count("dave_lost")
                     continue
                 recorder.count("dave_recovered")
-                self._submit(recorder, user_id, old.timestamp, old_payload, old_wall)
-        self._submit(recorder, user_id, packet.timestamp, payload, wall)
+                self._submit(recorder, user_id, old.timestamp, old_payload, old_wall, old.ssrc)
+        self._submit(recorder, user_id, packet.timestamp, payload, wall, packet.ssrc)
 
     def _note_name(self, recorder: ChannelRecorder, user_id: int, member) -> None:
         if member is None or user_id in self._named:
@@ -241,8 +258,9 @@ class RecordingVoiceClient(discord.VoiceClient):
             log.exception("Recording name note failed guild=%s", self.guild.id)
 
     @staticmethod
-    def _submit(recorder: ChannelRecorder, user_id: int, timestamp: int, payload: bytes, wall: float) -> None:
+    def _submit(recorder: ChannelRecorder, user_id: int, timestamp: int, payload: bytes, wall: float,
+                ssrc: int = 0) -> None:
         if not payload:
             recorder.count("empty_payloads")
             return
-        recorder.submit(user_id, timestamp, payload, wall)
+        recorder.submit(user_id, timestamp, payload, wall, ssrc=ssrc)

@@ -4,6 +4,11 @@ One ``ChannelRecorder`` covers one stay of the bot in one voice channel
 (a session folder). The voice socket thread calls ``submit()``; a writer
 thread owns every file, so the socket thread never waits for the disk.
 
+Each RTP stream (user and SSRC) gets its own track. Its packets wait in a
+small reorder window (``REORDER_PACKETS``) so ones the network delivered
+out of order are written in place; only duplicates and packets older
+than the window are dropped (``late_packets``).
+
 A file holds speech only. Discord sends nothing while a user is silent,
 and ``detector_factory`` (``vad.py``) drops what it does send between
 words: breathing, room noise, digital silence. A gap in what is kept
@@ -24,6 +29,7 @@ transcript can show it in place, and each speaker's display name to
 
 from __future__ import annotations
 
+import bisect
 import collections
 import json
 import logging
@@ -42,7 +48,22 @@ from ttsbot.recording.vad import DetectorFactory, SpeechGate
 log = logging.getLogger("tts_bot")
 
 _STOP = object()
+_NAME = object()
+_TEXT = object()
 _STATS_INTERVAL = 60.0
+# Packets held per stream to put reordered ones back in place (160 ms).
+REORDER_PACKETS = 8
+# A stream that sent nothing for this long has its held packets written.
+REORDER_FLUSH_SECONDS = 0.3
+# A wall-clock gap this long between packets means the sender paused, so
+# nothing older is still on its way.
+_SENDER_PAUSE_SECONDS = 0.2
+
+
+def _signed(delta: int) -> int:
+    """An RTP timestamp difference (mod 2**32) as a signed number."""
+    delta &= 0xFFFFFFFF
+    return delta - 0x100000000 if delta >= 0x80000000 else delta
 
 # Session folders a recorder in this process is still writing to.
 ACTIVE_SESSIONS: set[Path] = set()
@@ -60,6 +81,7 @@ class RecorderSettings:
 @dataclass
 class _Track:
     user_id: int
+    ssrc: int = 0
     index: int = 0
     writer: OggOpusWriter | None = None
     pieces: list[list[float]] = field(default_factory=list)
@@ -72,6 +94,11 @@ class _Track:
     detector: Callable[[bytes], bool] | None = None
     gate: SpeechGate = field(default_factory=SpeechGate)
     last_received: float = float("-inf")  # wall time of the last packet heard
+    # Reorder window: (timestamp, opus, wall) sorted by timestamp.
+    held: list[tuple[int, bytes, float]] = field(default_factory=list)
+    released: int | None = None  # RTP timestamp of the last packet let through
+    held_wall: float = 0.0  # wall time of the newest held packet
+    last_arrival: float = 0.0  # monotonic time the last packet arrived
 
 
 def _utc_stamp(epoch: float) -> str:
@@ -90,7 +117,8 @@ class ChannelRecorder:
         self.path = settings.root / str(guild_id) / f"{_utc_stamp(self.started_at)}-{channel_id}"
         self.counters: collections.Counter[str] = collections.Counter()
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
-        self._tracks: dict[int, _Track] = {}
+        self._tracks: dict[tuple[int, int], _Track] = {}  # by (user, ssrc)
+        self._next_index: dict[int, int] = {}  # file numbering is per user
         self._logged_packets = 0
         self._thread = threading.Thread(
             target=self._run, name=f"voice-recorder-{guild_id}", daemon=True
@@ -105,24 +133,28 @@ class ChannelRecorder:
         self._thread.start()
         log.info("Recording started guild=%s channel=%s path=%s", self.guild_id, self.channel_id, self.path)
 
-    def submit(self, user_id: int, timestamp: int, opus: bytes, wall: float | None = None) -> None:
-        self._queue.put((user_id, timestamp, opus, time.time() if wall is None else wall))
+    def submit(self, user_id: int, timestamp: int, opus: bytes, wall: float | None = None, *,
+               ssrc: int = 0) -> None:
+        self._queue.put((user_id, timestamp, opus, time.time() if wall is None else wall, ssrc))
 
     def count(self, name: str, amount: int = 1) -> None:
         self.counters[name] += amount
 
     def note_name(self, user_id: int, name: str) -> None:
-        path = self.path / "names.json"
-        names = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        if names.get(str(user_id)) != name:
-            names[str(user_id)] = name
-            write_atomic(path, json.dumps(names, ensure_ascii=False, indent=1))
+        """Remember a speaker's display name (written by the writer thread)."""
+        self._to_writer(_NAME, user_id, name)
 
     def note_text(self, user_id: int, text: str, wall: float | None = None) -> None:
         """Record text the bot spoke for ``user_id`` (TTS) at ``wall``."""
-        entry = {"user_id": user_id, "at": round(time.time() if wall is None else wall, 3), "text": text}
-        with (self.path / "tts.jsonl").open("a", encoding="utf-8") as out:
-            out.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self._to_writer(_TEXT, user_id, text, time.time() if wall is None else wall)
+
+    def _to_writer(self, *item: object) -> None:
+        # Only the writer thread touches the files, so the socket thread
+        # never waits for the disk and names.json has a single writer.
+        if self._thread.is_alive():
+            self._queue.put(item)
+        else:
+            self._dispatch(item)
 
     def stop(self, timeout: float = 10.0) -> None:
         if not self._thread.is_alive():
@@ -139,14 +171,14 @@ class ChannelRecorder:
         next_stats = time.monotonic() + _STATS_INTERVAL
         while True:
             try:
-                item = self._queue.get(timeout=1.0)
+                item = self._queue.get(timeout=0.25)
             except queue.Empty:
                 item = None
             if item is _STOP:
                 break
             try:
                 if item is not None:
-                    self._handle(*item)
+                    self._dispatch(item)
                 self._close_idle(time.monotonic())
             except Exception:
                 log.exception("Recording writer failed guild=%s", self.guild_id)
@@ -161,19 +193,73 @@ class ChannelRecorder:
                 break
             if item is not _STOP:
                 try:
-                    self._handle(*item)
+                    self._dispatch(item)
                 except Exception:
                     log.exception("Recording writer failed guild=%s", self.guild_id)
         for track in self._tracks.values():
+            try:
+                self._release(track, len(track.held))
+            except Exception:
+                log.exception("Recording writer failed guild=%s", self.guild_id)
             self._close_chunk(track, reason="stop")
 
-    def _handle(self, user_id: int, timestamp: int, opus: bytes, wall: float) -> None:
-        track = self._tracks.get(user_id)
+    def _dispatch(self, item: tuple) -> None:
+        if item[0] is _NAME:
+            self._write_name(item[1], item[2])
+        elif item[0] is _TEXT:
+            self._write_text(item[1], item[2], item[3])
+        else:
+            self._handle(*item)
+
+    def _write_name(self, user_id: int, name: str) -> None:
+        path = self.path / "names.json"
+        names = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if names.get(str(user_id)) != name:
+            names[str(user_id)] = name
+            write_atomic(path, json.dumps(names, ensure_ascii=False, indent=1))
+
+    def _write_text(self, user_id: int, text: str, wall: float) -> None:
+        entry = {"user_id": user_id, "at": round(wall, 3), "text": text}
+        with (self.path / "tts.jsonl").open("a", encoding="utf-8") as out:
+            out.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def _handle(self, user_id: int, timestamp: int, opus: bytes, wall: float, ssrc: int = 0) -> None:
+        key = (user_id, ssrc)
+        track = self._tracks.get(key)
         if track is None:
             factory = self.settings.detector_factory
-            track = self._tracks[user_id] = _Track(
-                user_id=user_id, detector=factory() if factory else None, gate=SpeechGate()
+            track = self._tracks[key] = _Track(
+                user_id=user_id, ssrc=ssrc, detector=factory() if factory else None, gate=SpeechGate()
             )
+        track.last_arrival = time.monotonic()
+        if track.held and wall - track.held_wall > _SENDER_PAUSE_SECONDS:
+            self._release(track, len(track.held))  # the sender paused: nothing older is coming
+        self._hold(track, timestamp, opus, wall)
+        if len(track.held) > REORDER_PACKETS:
+            self._release(track, len(track.held) - REORDER_PACKETS)
+
+    def _hold(self, track: _Track, timestamp: int, opus: bytes, wall: float) -> None:
+        """Put a packet into the stream's reorder window, in timestamp order."""
+        if track.released is not None:
+            ref = track.released
+        else:
+            ref = track.held[0][0] if track.held else timestamp
+        offset = _signed(timestamp - ref)
+        offsets = [_signed(held[0] - ref) for held in track.held]
+        if (track.released is not None and offset <= 0) or offset in offsets:
+            self.count("late_packets")  # a duplicate, or older than what was written
+            return
+        track.held.insert(bisect.bisect(offsets, offset), (timestamp, opus, wall))
+        track.held_wall = max(track.held_wall, wall)
+
+    def _release(self, track: _Track, count: int) -> None:
+        """Let the oldest *count* held packets through to the writer."""
+        for _ in range(count):
+            timestamp, opus, wall = track.held.pop(0)
+            track.released = timestamp
+            self._process(track, timestamp, opus, wall)
+
+    def _process(self, track: _Track, timestamp: int, opus: bytes, wall: float) -> None:
         try:
             samples = opus_packet_samples(opus)
         except UnsupportedOpusStream:
@@ -231,7 +317,7 @@ class ChannelRecorder:
     def _open_chunk(self, track: _Track, wall: float) -> None:
         folder = self.path / str(track.user_id)
         folder.mkdir(exist_ok=True)
-        track.index += 1
+        track.index = self._next_index[track.user_id] = self._next_index.get(track.user_id, 0) + 1
         path = folder / f"{track.index:04d}.ogg"
         track.writer = OggOpusWriter(path, serial=(track.user_id ^ track.index))
         track.pieces = []
@@ -247,6 +333,8 @@ class ChannelRecorder:
 
     def _close_idle(self, now: float) -> None:
         for track in self._tracks.values():
+            if track.held and now - track.last_arrival > REORDER_FLUSH_SECONDS:
+                self._release(track, len(track.held))
             if track.writer is not None and now - track.last_seen > self.settings.idle_close_seconds:
                 self._close_chunk(track, reason="idle")
 
@@ -298,7 +386,8 @@ class ChannelRecorder:
         self._logged_packets = packets
         log.info(
             "Recording %s guild=%s channel=%s users=%d %s",
-            "finished" if final else "stats", self.guild_id, self.channel_id, len(self._tracks),
+            "finished" if final else "stats", self.guild_id, self.channel_id,
+            len({track.user_id for track in self._tracks.values()}),
             " ".join(f"{name}={value}" for name, value in sorted(counters.items())) or "packets=0",
         )
 
