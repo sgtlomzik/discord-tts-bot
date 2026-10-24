@@ -265,13 +265,13 @@ class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
             cache = TTSPhraseCache(TTSCacheConfig(enabled=True, cache_dir=Path(tmp)))
             pipeline = self._pipeline(handle, cache)
             first = PreparedAudio(job=_job(), channel=asyncio.Queue())
-            self.assertEqual(await pipeline._generate_gemini_stream_into(first, _voice()), "ok")
+            self.assertEqual(await pipeline._stream_voice_into(first, _voice()), "ok")
             self.assertEqual(first.provider, "gemini")
             live = await self._drain(first)
             self.assertEqual(len(live), 25)  # 0.5 s of audio
             self.assertTrue(all(len(f) == PCM_FRAME_BYTES for f in live))
             second = PreparedAudio(job=_job(), channel=asyncio.Queue())
-            self.assertEqual(await pipeline._generate_gemini_stream_into(second, _voice()), "cache")
+            self.assertEqual(await pipeline._stream_voice_into(second, _voice()), "cache")
             self.assertEqual(calls, 1)
             self.assertEqual(b"".join(await self._drain(second)), b"".join(live))
             self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
@@ -287,7 +287,7 @@ class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         pipeline = self._pipeline(lambda r: httpx.Response(200, headers={"content-type": PCM_CT}, stream=Gated()))
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
-        task = asyncio.create_task(pipeline._generate_gemini_stream_into(prepared, _voice()))
+        task = asyncio.create_task(pipeline._stream_voice_into(prepared, _voice()))
         first = await asyncio.wait_for(prepared.channel.get(), 2)
         self.assertFalse(task.done())
         self.assertGreater(len(first), 0)
@@ -300,7 +300,7 @@ class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
             pipeline = self._pipeline(lambda r: httpx.Response(
                 200, headers={"content-type": PCM_CT}, stream=_Chunks([_pcm()], fail_after=True)), cache)
             prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
-            self.assertEqual(await pipeline._generate_gemini_stream_into(prepared, _voice()), "truncated")
+            self.assertEqual(await pipeline._stream_voice_into(prepared, _voice()), "truncated")
             self.assertEqual(cache.size, 0)
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
@@ -311,7 +311,7 @@ class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
         ):
             pipeline = self._pipeline(lambda r, resp=response: resp)
             prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
-            self.assertEqual(await pipeline._generate_gemini_stream_into(prepared, _voice()), "pre_audio")
+            self.assertEqual(await pipeline._stream_voice_into(prepared, _voice()), "pre_audio")
             self.assertTrue(prepared.channel.empty())
         self.assertIsInstance(prepared.error, GeminiQuotaExhaustedError)
         self.assertGreater(pipeline.tts_dispatcher.breaker_for("gemini").cooldown_remaining, 800)
@@ -324,18 +324,18 @@ class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
         pipeline = self._pipeline(slow)
         prepared = PreparedAudio(job=_job("x"), channel=asyncio.Queue())
         with patch.object(config, "GEMINI_TTFA_TIMEOUT", 0.05), patch.object(config, "GEMINI_TTFA_PER_CHAR", 0.0):
-            self.assertEqual(await pipeline._generate_gemini_stream_into(prepared, _voice()), "pre_audio")
+            self.assertEqual(await pipeline._stream_voice_into(prepared, _voice()), "pre_audio")
 
     async def test_cancelled_job_stops(self):
         pipeline = self._pipeline(lambda r: self.fail("request sent"))
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue(), cancelled=True)
-        self.assertEqual(await pipeline._generate_gemini_stream_into(prepared, _voice()), "cancelled")
+        self.assertEqual(await pipeline._stream_voice_into(prepared, _voice()), "cancelled")
 
     async def test_open_breaker_skips_the_api(self):
         pipeline = self._pipeline(lambda r: self.fail("request sent"))
         pipeline.tts_dispatcher.breaker_for("gemini").trip(60)
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
-        self.assertEqual(await pipeline._generate_gemini_stream_into(prepared, _voice()), "pre_audio")
+        self.assertEqual(await pipeline._stream_voice_into(prepared, _voice()), "pre_audio")
 
     async def test_prepare_into_falls_back_to_piper_file_path(self):
         pipeline = self._pipeline(lambda r: httpx.Response(500, text="down"))

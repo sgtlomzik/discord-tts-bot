@@ -10,6 +10,8 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from ttsbot import voice_registry as vr
+from ttsbot.providers import MiniMaxProvider
+from types import MethodType
 from test_bot import load_bot_module, temp_config_store
 
 
@@ -175,6 +177,7 @@ class StutterGuardTests(unittest.IsolatedAsyncioTestCase):
         tts_bot = bot_mod.TTSBot()
         cloud = MagicMock()
         cloud.stream_audio = lambda *a, **k: _stutter_forever(_MP3)
+        cloud.stream_spec = MethodType(MiniMaxProvider.stream_spec, cloud)
         tts_bot.tts_dispatcher.register("minimax", cloud)
 
         cfg = bot_mod.config
@@ -190,7 +193,7 @@ class StutterGuardTests(unittest.IsolatedAsyncioTestCase):
         prepared = bot_mod.PreparedAudio(job=job, channel=asyncio.Queue())
         try:
             status, frames = await asyncio.wait_for(
-                tts_bot._stream_to_channel(prepared, _minimax_voice()),
+                tts_bot._run_stream(prepared, _minimax_voice(), cloud.stream_spec(prepared.job.text, _minimax_voice())),
                 timeout=15,
             )
         finally:

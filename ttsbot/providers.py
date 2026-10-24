@@ -61,6 +61,7 @@ from ttsbot.health import (  # noqa: F401  (CircuitState is re-exported)
 from ttsbot.gemini import write_wav
 from ttsbot.httpclient import attach_warmer, provider_limits
 from ttsbot.pcm import apply_gain, pcm_cache_header, read_pcm_cache
+from ttsbot.streams import StreamSpec
 
 if TYPE_CHECKING:  # pragma: no cover
     import httpx
@@ -958,6 +959,18 @@ class MiniMaxProvider:
                 f"MiniMax rate-limited (status_code={status_code}): {status_msg}"
             )
         raise MiniMaxError(f"MiniMax status_code={status_code}: {status_msg}")
+
+    def stream_spec(self, text: str, voice) -> StreamSpec:
+        """MP3 chunks over SSE, decoded by ffmpeg."""
+        mm = voice.minimax
+        return StreamSpec(
+            kind="mp3", cache_key=voice_cache_key(voice), ttfa=bot_config.TTS_STREAM_TTFA_TIMEOUT,
+            label="MiniMax",
+            open=lambda: self.stream_audio(
+                text, voice_id=mm.voice_id, model=mm.model, speed=mm.speed, vol=mm.vol,
+                pitch=mm.pitch, emotion=mm.emotion, language_boost=mm.language_boost,
+            ),
+        )
 
     async def stream_audio(
         self,

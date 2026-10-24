@@ -14,8 +14,10 @@ from typing import AsyncIterator
 
 import httpx
 
+from ttsbot import config as bot_config
 from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
 from ttsbot.httpclient import attach_warmer, provider_limits
+from ttsbot.streams import StreamSpec
 
 log = logging.getLogger("tts_bot")
 
@@ -240,6 +242,22 @@ class FishProvider:
             async with flight.condition:
                 flight.done = True
                 flight.condition.notify_all()
+
+    def stream_spec(self, text: str, voice) -> StreamSpec:
+        """Ogg/Opus: played as-is at pitch 0, else decoded with the pitch shift.
+
+        The cache key leaves the pitch out (ffmpeg applies it afterwards),
+        so a re-pitched voice replays its cached Ogg.
+        """
+        params = voice.fish
+        cfg = self.config
+        return StreamSpec(
+            kind="opus" if params.pitch == 0 else "ogg",
+            cache_key=cfg.cache_key(params.reference_id, params),
+            ttfa=bot_config.FISH_TTFA_TIMEOUT, label="Fish", pitch=params.pitch,
+            open=lambda: self.stream_audio(text, reference_id=params.reference_id, params=params,
+                                           request_config=cfg),
+        )
 
     async def stream_audio(
         self, text: str, *, reference_id: str = "", params: object | None = None,

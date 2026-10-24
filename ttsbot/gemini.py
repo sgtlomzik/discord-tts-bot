@@ -21,8 +21,10 @@ from typing import AsyncIterator
 
 import httpx
 
+from ttsbot import config as bot_config
 from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError
 from ttsbot.httpclient import attach_warmer, provider_limits
+from ttsbot.streams import StreamSpec
 
 log = logging.getLogger("tts_bot")
 
@@ -223,6 +225,17 @@ class GeminiProvider:
         if self.config.referer:
             headers["HTTP-Referer"] = self.config.referer
         return headers
+
+    def stream_spec(self, text: str, voice) -> StreamSpec:
+        """Raw PCM. OpenRouter sends nothing until the whole clip is
+        generated, so the first-audio budget grows with the text."""
+        params = voice.gemini
+        return StreamSpec(
+            kind="pcm", cache_key=self.config.cache_key(params),
+            ttfa=bot_config.GEMINI_TTFA_TIMEOUT + bot_config.GEMINI_TTFA_PER_CHAR * len(text),
+            label="Gemini", volume_db=params.volume_db,
+            open=lambda: self.open_stream(text, params),
+        )
 
     async def open_stream(self, text: str, params: object | None = None) -> GeminiAudioStream:
         """Send the request and return once the response headers are in.

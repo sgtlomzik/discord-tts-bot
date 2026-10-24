@@ -32,7 +32,6 @@ from ttsbot.providers import (
     MiniMaxProvider,
     MiniMaxVoiceNotFoundError,
     load_minimax_config_from_env,
-    voice_cache_key,
 )
 from ttsbot import config
 from ttsbot.audio import (
@@ -568,14 +567,79 @@ class SynthesisPipelineMixin:
             await prepared.channel.put(None)
 
     async def _stream_voice_into(self, prepared: PreparedAudio, voice) -> str:
-        """Stream one voice into ``prepared.channel`` by its provider."""
-        if voice.is_fish:
-            return await self._generate_fish_stream_into(prepared, voice)
-        if voice.is_gemini:
-            return await self._generate_gemini_stream_into(prepared, voice)
-        if voice.is_elevenlabs:
-            return await self._generate_elevenlabs_stream_into(prepared, voice)
-        return await self._generate_stream_into(prepared, voice)
+        """Stream one voice into ``prepared.channel``: cache, breaker, API.
+
+        Works for any registered provider: it describes the stream
+        (``stream_spec``), this method does the rest. Returns ok,
+        truncated, pre_audio (nothing played: the next voice speaks),
+        cache or cancelled.
+        """
+        job = prepared.job
+        dispatcher = self.tts_dispatcher
+        provider = dispatcher.provider_for(voice.provider)
+        breaker = dispatcher.breaker_for(voice.provider)
+        spec = provider.stream_spec(job.text, voice)
+        frames = await self._cached_frames(spec, job.text, voice)
+        if frames and not prepared.cancelled:
+            await prepared.channel.put(frames)
+            prepared.provider = "cache"
+            return "cache"
+        if prepared.cancelled:
+            return "cancelled"
+        if not breaker.allow_request():
+            log.info("%s circuit breaker open; next voice guild=%s", spec.label, job.guild_id)
+            return "pre_audio"
+        # Set before streaming so the playback worker logs the provider on
+        # the first frame.
+        prepared.provider = voice.provider
+        status, _ = await self._run_stream(prepared, voice, spec)
+        if status == "ok":
+            breaker.record_success()
+        elif status != "cancelled":
+            # A request-only error (missing voice, one message too long) is
+            # not counted: it must not pause the provider's other voices.
+            dispatcher.record_failure(breaker, prepared.error)
+        return status
+
+    async def _cached_frames(self, spec, text: str, voice) -> list[bytes]:
+        """The cached audio of ``spec`` as frames, or [] (miss or unreadable)."""
+        cache = self.tts_dispatcher.cache
+        if cache is None:
+            return []
+        if spec.kind == "opus":
+            cached = cache.lookup(text, spec.cache_key + DISCORD_OPUS_CACHE_SUFFIX)
+        else:
+            cached = cache.lookup(text, spec.cache_key)
+        if cached is None:
+            return []
+        try:
+            if spec.kind == "opus":
+                frames = list(read_frame_cache(cached))
+            elif spec.kind == "pcm":
+                rate, channels, pcm = read_pcm_cache(cached)
+                frames = pcm_to_frames(pcm, rate, channels, spec.volume_db)
+            else:
+                frames = await self._safe_pcm_frames(cached, spec.pitch)
+        except (OSError, ValueError) as exc:  # UnsupportedOpusStream is a ValueError
+            log.warning("Invalid %s cache file %s (%s); regenerating", spec.label, cached, exc)
+            return []
+        return limit_pcm_frames(frames, text, voice)
+
+    async def _run_stream(self, prepared: PreparedAudio, voice, spec) -> tuple[str, int]:
+        """Play ``spec``'s stream by its kind; (status, frames)."""
+        if spec.kind == "opus":
+            return await self._stream_ogg_opus_to_channel(
+                prepared, voice, spec.open(), spec.cache_key, ttfa_timeout=spec.ttfa, label=spec.label,
+            )
+        if spec.kind == "pcm":
+            return await self._stream_pcm_to_channel(
+                prepared, voice, spec.open, spec.cache_key,
+                budget=spec.ttfa, label=spec.label, volume_db=spec.volume_db,
+            )
+        return await self._decode_stream_to_channel(
+            prepared, voice, spec.open(), "ogg" if spec.kind == "ogg" else "mp3", spec.cache_key,
+            "opus" if spec.kind == "ogg" else "mp3", ttfa_timeout=spec.ttfa, pitch=spec.pitch,
+        )
 
     def _log_fallback(self, job, voice, nxt, error) -> None:
         """One line per fallback step; quiet (INFO) while the provider is paused."""
@@ -599,191 +663,6 @@ class SynthesisPipelineMixin:
         except Exception:
             log.exception("PCM decode failed for %s", path)
             return []
-
-    async def _generate_stream_into(self, prepared: PreparedAudio, voice) -> str:
-        job = prepared.job
-        cb = self.tts_dispatcher.breaker_for("minimax")
-        cache = self.tts_dispatcher.cache
-        if cache is not None:
-            cached = cache.lookup(job.text, voice_cache_key(voice))
-            if cached is not None:
-                frames = limit_pcm_frames(await self._safe_pcm_frames(cached), job.text, voice)
-                if frames and not prepared.cancelled:
-                    await prepared.channel.put(frames)
-                    prepared.provider = "cache"
-                    log.info(
-                        "Cache HIT (prefetch) guild=%s voice=%s frames=%d (no API)",
-                        job.guild_id, voice.name, len(frames),
-                    )
-                    return "cache"
-        if prepared.cancelled:
-            return "cancelled"
-        if not cb.allow_request():
-            return "pre_audio"  # breaker open -> caller does Piper fallback
-        # Set the label before streaming so the playback worker logs the
-        # provider on the first frame (a pre-audio fallback overwrites it
-        # with the Piper provider in _generate_file_into).
-        prepared.provider = "minimax"
-        status, _ = await self._stream_to_channel(prepared, voice)
-        if status == "ok":
-            cb.record_success()
-        elif status != "cancelled":
-            self.tts_dispatcher.record_failure(cb, prepared.error)
-        return status
-
-    async def _generate_fish_stream_into(self, prepared: PreparedAudio, voice) -> str:
-        job = prepared.job
-        fish_cfg = self.tts_dispatcher.provider_for("fish").config
-        cb = self.tts_dispatcher.breaker_for("fish")
-        cache = self.tts_dispatcher.cache
-        ogg_cache_key = fish_cfg.cache_key(voice.fish.reference_id, voice.fish)
-        # Pitch is applied by ffmpeg, so only pitch 0 can skip decoding.
-        direct = voice.fish.pitch == 0
-        if cache is not None:
-            if direct:
-                cached = cache.lookup(job.text, ogg_cache_key + DISCORD_OPUS_CACHE_SUFFIX)
-            else:
-                cached = cache.lookup(job.text, ogg_cache_key)
-            if cached is not None:
-                if direct:
-                    try:
-                        frames = limit_pcm_frames(list(read_frame_cache(cached)), job.text, voice)
-                    except (OSError, UnsupportedOpusStream):
-                        log.warning("Invalid Discord Opus cache file %s; regenerating", cached)
-                        frames = []
-                else:
-                    frames = limit_pcm_frames(
-                        await self._safe_pcm_frames(cached, voice.fish.pitch), job.text, voice,
-                    )
-                if frames and not prepared.cancelled:
-                    await prepared.channel.put(frames)
-                    prepared.provider = "cache"
-                    return "cache"
-        if prepared.cancelled:
-            return "cancelled"
-        if not cb.allow_request():
-            log.info("Fish circuit breaker open; next voice guild=%s", job.guild_id)
-            return "pre_audio"
-        prepared.provider = "fish"
-        stream = self._stream_fish_opus_to_channel if direct else self._stream_fish_to_channel
-        status, _ = await stream(prepared, voice, ogg_cache_key, request_config=fish_cfg)
-        if status == "ok":
-            cb.record_success()
-        elif status != "cancelled":
-            self.tts_dispatcher.record_failure(cb, prepared.error)
-        return status
-
-    async def _generate_gemini_stream_into(self, prepared: PreparedAudio, voice) -> str:
-        """Gemini PCM through PcmFramer: cache, breaker, then the API.
-
-        No ffmpeg on this path: raw PCM is resampled and framed in-process,
-        both for a cache hit and for a live response.
-        """
-        job = prepared.job
-        gemini = self.tts_dispatcher.provider_for("gemini")
-        cb = self.tts_dispatcher.breaker_for("gemini")
-        cache = self.tts_dispatcher.cache
-        cache_key = gemini.config.cache_key(voice.gemini)
-        if cache is not None:
-            cached = cache.lookup(job.text, cache_key)
-            if cached is not None:
-                try:
-                    rate, channels, pcm = read_pcm_cache(cached)
-                    frames = limit_pcm_frames(
-                        pcm_to_frames(pcm, rate, channels, voice.gemini.volume_db), job.text, voice,
-                    )
-                except (OSError, ValueError) as exc:
-                    log.warning("Invalid Gemini cache file %s (%s); regenerating", cached, exc)
-                    frames = []
-                if frames and not prepared.cancelled:
-                    await prepared.channel.put(frames)
-                    prepared.provider = "cache"
-                    return "cache"
-        if prepared.cancelled:
-            return "cancelled"
-        if not cb.allow_request():
-            log.info("Gemini circuit breaker open; next voice guild=%s", job.guild_id)
-            return "pre_audio"
-        prepared.provider = "gemini"
-        status, _ = await self._stream_gemini_to_channel(prepared, voice, cache_key)
-        if status == "ok":
-            cb.record_success()
-        elif status != "cancelled":
-            self.tts_dispatcher.record_failure(cb, prepared.error)
-        return status
-
-    async def _generate_elevenlabs_stream_into(self, prepared: PreparedAudio, voice) -> str:
-        """ElevenLabs: cache, breaker, then the streaming API.
-
-        ``opus_48000_*`` output is Ogg/Opus with 20 ms packets, so it takes
-        the Fish direct path (packets go to Discord as-is, cached as .dopus);
-        ``pcm_*`` output takes the Gemini PcmFramer path. Neither uses ffmpeg
-        unless the Opus packets turn out not to be 20 ms.
-        """
-        job = prepared.job
-        elevenlabs = self.tts_dispatcher.provider_for("elevenlabs")
-        cfg = elevenlabs.config
-        cb = self.tts_dispatcher.breaker_for("elevenlabs")
-        cache = self.tts_dispatcher.cache
-        params = voice.elevenlabs
-        cache_key = cfg.cache_key(params)
-        opus = cfg.kind == "opus"
-        if cache is not None:
-            cached = cache.lookup(job.text, cache_key + DISCORD_OPUS_CACHE_SUFFIX if opus else cache_key)
-            if cached is not None:
-                try:
-                    if opus:
-                        frames = list(read_frame_cache(cached))
-                    else:
-                        rate, channels, pcm = read_pcm_cache(cached)
-                        frames = pcm_to_frames(pcm, rate, channels)
-                    frames = limit_pcm_frames(frames, job.text, voice)
-                except (OSError, ValueError) as exc:  # UnsupportedOpusStream is a ValueError
-                    log.warning("Invalid ElevenLabs cache file %s (%s); regenerating", cached, exc)
-                    frames = []
-                if frames and not prepared.cancelled:
-                    await prepared.channel.put(frames)
-                    prepared.provider = "cache"
-                    return "cache"
-        if prepared.cancelled:
-            return "cancelled"
-        if not cb.allow_request():
-            log.info("ElevenLabs circuit breaker open; next voice guild=%s", job.guild_id)
-            return "pre_audio"
-        prepared.provider = "elevenlabs"
-        if opus:
-            status, _ = await self._stream_ogg_opus_to_channel(
-                prepared, voice, elevenlabs.stream_audio(job.text, params), cache_key,
-                ttfa_timeout=config.ELEVENLABS_TTFA_TIMEOUT, label="ElevenLabs",
-            )
-        else:
-            status, _ = await self._stream_pcm_to_channel(
-                prepared, voice, lambda: elevenlabs.open_stream(job.text, params), cache_key,
-                budget=config.ELEVENLABS_TTFA_TIMEOUT, label="ElevenLabs",
-            )
-        if status == "ok":
-            cb.record_success()
-        elif status != "cancelled":
-            # A missing voice or one too-long message (a request error) is
-            # not counted: it must not pause every ElevenLabs voice.
-            self.tts_dispatcher.record_failure(cb, prepared.error)
-        return status
-
-    async def _stream_gemini_to_channel(
-        self, prepared: PreparedAudio, voice, cache_key: str,
-    ) -> tuple[str, int]:
-        """Gemini PCM into the shared PCM path.
-
-        The first-audio budget grows with the text because OpenRouter sends
-        nothing until the whole clip is generated.
-        """
-        job = prepared.job
-        return await self._stream_pcm_to_channel(
-            prepared, voice, lambda: self.tts_dispatcher.provider_for("gemini").open_stream(job.text, voice.gemini),
-            cache_key,
-            budget=config.GEMINI_TTFA_TIMEOUT + config.GEMINI_TTFA_PER_CHAR * len(job.text),
-            label="Gemini", volume_db=voice.gemini.volume_db,
-        )
 
     async def _stream_pcm_to_channel(
         self, prepared: PreparedAudio, voice, open_stream, cache_key: str, *,
@@ -934,29 +813,6 @@ class SynthesisPipelineMixin:
                 except OSError:
                     log.exception("Failed to remove temp file: %s", filename)
 
-    async def _stream_to_channel(self, prepared: PreparedAudio, voice) -> tuple[str, int]:
-        """Stream MiniMax MP3 into the shared incremental decoder."""
-        mm = voice.minimax
-        agen = self.tts_dispatcher.provider_for("minimax").stream_audio(
-            prepared.job.text, voice_id=mm.voice_id, model=mm.model, speed=mm.speed,
-            vol=mm.vol, pitch=mm.pitch, emotion=mm.emotion, language_boost=mm.language_boost,
-        )
-        return await self._decode_stream_to_channel(
-            prepared, voice, agen, "mp3", voice_cache_key(voice), "mp3",
-        )
-
-    async def _stream_fish_opus_to_channel(
-        self, prepared: PreparedAudio, voice, ogg_cache_key: str, *, request_config=None,
-    ) -> tuple[str, int]:
-        """Fish Ogg/Opus into the shared direct-packet path."""
-        agen = self.tts_dispatcher.provider_for("fish").stream_audio(
-            prepared.job.text, reference_id=voice.fish.reference_id, params=voice.fish,
-            request_config=request_config,
-        )
-        return await self._stream_ogg_opus_to_channel(
-            prepared, voice, agen, ogg_cache_key, ttfa_timeout=config.FISH_TTFA_TIMEOUT, label="Fish",
-        )
-
     async def _stream_ogg_opus_to_channel(
         self, prepared: PreparedAudio, voice, agen, ogg_cache_key: str, *,
         ttfa_timeout: float, label: str,
@@ -1105,21 +961,9 @@ class SynthesisPipelineMixin:
                 part_path.unlink(missing_ok=True)
         return status, frames_count
 
-    async def _stream_fish_to_channel(
-        self, prepared: PreparedAudio, voice, cache_key: str, *, request_config=None,
-    ) -> tuple[str, int]:
-        """Stream Fish Ogg/Opus into the shared incremental decoder."""
-        agen = self.tts_dispatcher.provider_for("fish").stream_audio(
-            prepared.job.text, reference_id=voice.fish.reference_id, params=voice.fish,
-            request_config=request_config,
-        )
-        return await self._decode_stream_to_channel(
-            prepared, voice, agen, "ogg", cache_key, "opus", ttfa_timeout=config.FISH_TTFA_TIMEOUT,
-        )
-
     async def _decode_stream_to_channel(
         self, prepared: PreparedAudio, voice, agen, input_format: str,
-        cache_key: str, cache_suffix: str, *, ttfa_timeout: float | None = None,
+        cache_key: str, cache_suffix: str, *, ttfa_timeout: float | None = None, pitch: int = 0,
     ) -> tuple[str, int]:
         """Tee compressed audio to an atomic cache file and ffmpeg stdin.
 
@@ -1155,10 +999,7 @@ class SynthesisPipelineMixin:
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                *build_tts_stream_pcm_command(
-                    input_format,
-                    voice.fish.pitch if input_format == "ogg" and getattr(voice, "is_fish", False) else 0,
-                ),
+                *build_tts_stream_pcm_command(input_format, pitch),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,

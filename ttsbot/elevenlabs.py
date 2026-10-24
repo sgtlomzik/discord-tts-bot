@@ -37,10 +37,12 @@ from typing import AsyncIterator, Callable
 
 import httpx
 
+from ttsbot import config as bot_config
 from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
 from ttsbot.gemini import write_wav
 from ttsbot.health import QuotaReport, fingerprint
 from ttsbot.httpclient import attach_warmer, provider_limits
+from ttsbot.streams import StreamSpec
 
 log = logging.getLogger("tts_bot")
 
@@ -555,6 +557,17 @@ class ElevenLabsProvider:
         # the caller stops early (length limit, cancel, mid-stream error).
         self._count(text, response.headers.get("character-cost"), index)
         return ElevenLabsAudioStream(self, response, text, output_format)
+
+    def stream_spec(self, text: str, voice) -> StreamSpec:
+        """``opus_48000_*``: Ogg/Opus with 20 ms packets, played as-is;
+        ``pcm_*``: raw PCM framed in-process. Neither needs ffmpeg."""
+        params = voice.elevenlabs
+        opus = self.config.kind == "opus"
+        return StreamSpec(
+            kind="opus" if opus else "pcm", cache_key=self.config.cache_key(params),
+            ttfa=bot_config.ELEVENLABS_TTFA_TIMEOUT, label="ElevenLabs",
+            open=(lambda: self.stream_audio(text, params)) if opus else (lambda: self.open_stream(text, params)),
+        )
 
     async def stream_audio(self, text: str, params: object | None = None) -> AsyncIterator[bytes]:
         """Audio bytes as they arrive, in the configured format."""

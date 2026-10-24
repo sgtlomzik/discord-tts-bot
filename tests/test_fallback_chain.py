@@ -16,7 +16,7 @@ from ttsbot.elevenlabs import (
     ElevenLabsAuthError, ElevenLabsConfig, ElevenLabsError, ElevenLabsProvider, ElevenLabsQuotaExhaustedError,
     ElevenLabsRateLimitError, ElevenLabsVoiceNotFoundError,
 )
-from ttsbot.fish import FishConfig, FishError, _http_error as fish_http_error
+from ttsbot.fish import FishConfig, FishError, FishProvider, _http_error as fish_http_error
 from ttsbot.health import (
     CircuitBreaker, CircuitBreakerConfig, CircuitState, FailureKind, HealthStore, QuotaReport,
     classify_failure,
@@ -30,6 +30,8 @@ from ttsbot.providers import (
 from ttsbot.voice_registry import (
     ElevenLabsParams, FishParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict,
 )
+
+from support import with_spec  # noqa: E402
 
 
 class Clock:
@@ -524,7 +526,7 @@ class PrefetchChainTests(unittest.IsolatedAsyncioTestCase):
     def _pipeline(self, registry):
         pipeline = SynthesisPipelineMixin()
         pipeline.voice_registry = registry
-        pipeline.tts_dispatcher = TTSDispatcher(local=MagicMock(), providers={"fish": SimpleNamespace(config=FishConfig(api_key="fk")), "elevenlabs": SimpleNamespace(config=ElevenLabsConfig(api_key="xk"))})
+        pipeline.tts_dispatcher = TTSDispatcher(local=MagicMock(), providers={"fish": with_spec(SimpleNamespace(config=FishConfig(api_key="fk")), FishProvider), "elevenlabs": with_spec(SimpleNamespace(config=ElevenLabsConfig(api_key="xk")), ElevenLabsProvider)})
         pipeline._should_attempt_stream = lambda voice: voice.provider != "piper"
         pipeline._generate_file_into = AsyncMock()
         return pipeline
@@ -532,26 +534,35 @@ class PrefetchChainTests(unittest.IsolatedAsyncioTestCase):
     async def test_elevenlabs_quota_streams_the_fish_fallback(self):
         pipeline = self._pipeline(_registry())
 
-        async def eleven(prepared, voice):
-            prepared.error = ElevenLabsQuotaExhaustedError("402", 402)
-            return "pre_audio"
+        spoken = []
 
-        pipeline._generate_elevenlabs_stream_into = AsyncMock(side_effect=eleven)
-        pipeline._generate_fish_stream_into = AsyncMock(return_value="ok")
+        async def stream(prepared, voice):
+            spoken.append(voice.name)
+            if voice.provider == "elevenlabs":
+                prepared.error = ElevenLabsQuotaExhaustedError("402", 402)
+                return "pre_audio"
+            return "ok"
+
+        pipeline._stream_voice_into = AsyncMock(side_effect=stream)
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         await pipeline._prepare_into(prepared)
-        self.assertEqual(pipeline._generate_fish_stream_into.await_args.args[1].name, "fish-default")
+        self.assertEqual(spoken, ["eleven-george", "fish-default"])
         pipeline._generate_file_into.assert_not_awaited()
         self.assertIsNone(await prepared.channel.get())
 
     async def test_fish_failure_skips_other_fish_voices_and_ends_with_piper(self):
         pipeline = self._pipeline(_registry(("fish-default", "pirat", "piper-ruslan")))
-        pipeline._generate_elevenlabs_stream_into = AsyncMock(return_value="pre_audio")
-        pipeline._generate_fish_stream_into = AsyncMock(return_value="pre_audio")
+        providers = []
+
+        async def stream(prepared, voice):
+            providers.append(voice.provider)
+            return "pre_audio"
+
+        pipeline._stream_voice_into = AsyncMock(side_effect=stream)
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         with self.assertLogs("tts_bot", "WARNING") as logs:
             await pipeline._prepare_into(prepared)
-        self.assertEqual(pipeline._generate_fish_stream_into.await_count, 1)
+        self.assertEqual(providers.count("fish"), 1)
         voice, rest = pipeline._generate_file_into.await_args.args[1:]
         self.assertEqual((voice.name, rest), ("piper-ruslan", []))
         self.assertIn("voice=eleven-george -> fish-default", "\n".join(logs.output))

@@ -21,6 +21,13 @@ from ttsbot import events as tts_events
 from ttsbot.core import TTSBot, intents
 
 
+def with_spec(fake, cls):
+    """``fake`` with ``cls.stream_spec`` bound to it, so the pipeline can
+    ask a stand-in provider for its stream like a real one."""
+    fake.stream_spec = types.MethodType(cls.stream_spec, fake)
+    return fake
+
+
 def _names(module) -> dict:
     return {name: value for name, value in vars(module).items() if not name.startswith("__")}
 

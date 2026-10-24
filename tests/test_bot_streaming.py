@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock
 from ttsbot import voice_registry as vr
 from test_bot import load_bot_module
 from ttsbot.providers import TTSCacheConfig, TTSPhraseCache, voice_cache_key
+from ttsbot.providers import MiniMaxProvider
+from types import MethodType
 
 
 async def _chunks_then_raise(data: bytes):
@@ -110,15 +112,16 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
         cache.store(job.text, src, voice_cache_key(voice))
         cloud = MagicMock()
         cloud.stream_audio = MagicMock(side_effect=AssertionError("API hit"))
+        cloud.stream_spec = MethodType(MiniMaxProvider.stream_spec, cloud)
         tts_bot.tts_dispatcher.register("minimax", cloud)
 
         hit = PreparedAudio(job=job, channel=asyncio.Queue())
-        self.assertEqual(await tts_bot._generate_stream_into(hit, voice), "cache")
+        self.assertEqual(await tts_bot._stream_voice_into(hit, voice), "cache")
         # A re-tuned voice must not be served the old audio.
         tuned = replace(voice, minimax=replace(voice.minimax, speed=1.3))
         tts_bot.tts_dispatcher.breaker_for("minimax").trip(60)  # the miss must not call the API
         miss = PreparedAudio(job=job, channel=asyncio.Queue())
-        self.assertEqual(await tts_bot._generate_stream_into(miss, tuned), "pre_audio")
+        self.assertEqual(await tts_bot._stream_voice_into(miss, tuned), "pre_audio")
         cloud.stream_audio.assert_not_called()
 
 class StreamFallbackSemanticsTests(unittest.IsolatedAsyncioTestCase):
