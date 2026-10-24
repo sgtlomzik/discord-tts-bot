@@ -561,7 +561,9 @@ class SynthesisPipelineMixin:
         # the first frame.
         prepared.provider = voice.provider
         status, _ = await self._run_stream(prepared, voice, spec)
-        if status == "ok":
+        if status == "ok" or (status == "truncated" and prepared.error is None):
+            # Cut without an error (the length limit on a stutter loop, an
+            # Opus stream that changed format): the provider answered.
             breaker.record_success()
         elif status != "cancelled":
             # A request-only error (missing voice, one message too long) is
@@ -1095,6 +1097,7 @@ class SynthesisPipelineMixin:
             return ("truncated", frames_count)
         if mid_error:
             _discard()
+            prepared.error = mid_error[0]  # counts against the provider
             log.warning("Stream failed mid-stream after %d frames (%s); truncated",
                         frames_count, mid_error[0])
             return ("truncated", frames_count)

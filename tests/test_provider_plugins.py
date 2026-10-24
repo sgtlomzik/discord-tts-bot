@@ -27,12 +27,15 @@ ONE_SECOND_24K_MONO = b"\x10\x00" * 24000
 class AcmeStream:
     rate, channels = 24000, 1
 
-    def __init__(self, pcm: bytes) -> None:
+    def __init__(self, pcm: bytes, fail_after: Exception | None = None) -> None:
         self.pcm = pcm
+        self.fail_after = fail_after
 
     async def chunks(self):
         half = len(self.pcm) // 2
         yield self.pcm[:half]
+        if self.fail_after is not None:
+            raise self.fail_after
         yield self.pcm[half:]
 
     async def aclose(self) -> None:
@@ -44,8 +47,11 @@ class AcmeProvider:
 
     name = "acme"
 
-    def __init__(self, fail: Exception | None = None) -> None:
+    def __init__(self, fail: Exception | None = None, pcm: bytes = ONE_SECOND_24K_MONO,
+                 fail_after: Exception | None = None) -> None:
         self.fail = fail
+        self.pcm = pcm
+        self.fail_after = fail_after
         self.requests = 0
 
     def stream_spec(self, text: str, voice) -> StreamSpec:
@@ -53,7 +59,7 @@ class AcmeProvider:
             self.requests += 1
             if self.fail is not None:
                 raise self.fail
-            return AcmeStream(ONE_SECOND_24K_MONO)
+            return AcmeStream(self.pcm, self.fail_after)
 
         return StreamSpec(kind="pcm", cache_key=f"acme:{voice.name}", ttfa=2.0, label="Acme", open=open_stream)
 
@@ -110,6 +116,25 @@ class ProviderPluginTests(unittest.IsolatedAsyncioTestCase):
         prepared = self._prepared()
         await bot._prepare_into(prepared)
         self.assertEqual(await _drain(prepared), [])
+        self.assertEqual(bot.tts_dispatcher.breaker_for("acme").consecutive_failures, 1)
+
+    async def test_a_stream_cut_at_the_length_limit_does_not_pause_the_provider(self):
+        # A stutter loop is cut by the frame limit: the provider answered,
+        # so three of them in a row must not pause it.
+        bot = self._bot(AcmeProvider(pcm=ONE_SECOND_24K_MONO * 30))
+        for _ in range(3):
+            prepared = self._prepared()
+            await bot._prepare_into(prepared)
+            await _drain(prepared)
+        breaker = bot.tts_dispatcher.breaker_for("acme")
+        self.assertEqual(breaker.consecutive_failures, 0)
+        self.assertTrue(breaker.allow_request())
+
+    async def test_a_stream_broken_after_audio_still_counts(self):
+        bot = self._bot(AcmeProvider(fail_after=ConnectionResetError("dropped")))
+        prepared = self._prepared()
+        await bot._prepare_into(prepared)
+        self.assertGreater(len(await _drain(prepared)), 0)
         self.assertEqual(bot.tts_dispatcher.breaker_for("acme").consecutive_failures, 1)
 
     def test_the_per_provider_methods_are_gone(self):

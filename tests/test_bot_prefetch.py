@@ -15,6 +15,7 @@ from test_bot_streaming import (
     FakeSource,
     _MP3,
     _chunks,
+    _chunks_then_raise,
     _minimax_voice,
 )
 from ttsbot.providers import TTSCacheConfig, TTSPhraseCache, voice_cache_key
@@ -68,6 +69,21 @@ class StreamToChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(frames, 0)
         self.assertEqual(sum(len(b) for b in batches), frames)
         self.assertIsNotNone(cache.lookup(job.text, voice_cache_key(_minimax_voice())))  # committed
+
+    async def test_a_decoded_stream_broken_after_audio_counts_against_the_provider(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        cloud = MagicMock()
+        cloud.stream_audio = lambda *a, **k: _chunks_then_raise(_MP3)
+        cloud.stream_spec = MethodType(MiniMaxProvider.stream_spec, cloud)
+        tts_bot.tts_dispatcher.register("minimax", cloud)
+        tts_bot.voice_registry.add(_minimax_voice())
+        prepared = bot_mod.PreparedAudio(job=_job(bot_mod), channel=asyncio.Queue())
+        status = await tts_bot._stream_voice_into(prepared, _minimax_voice())
+        _drain_nowait(prepared)
+        self.assertEqual(status, "truncated")
+        self.assertIsInstance(prepared.error, RuntimeError)
+        self.assertEqual(tts_bot.tts_dispatcher.breaker_for("minimax").consecutive_failures, 1)
 
     async def test_cancelled_before_audio_yields_no_frames(self):
         bot_mod = load_bot_module()
