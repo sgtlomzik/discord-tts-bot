@@ -110,13 +110,13 @@ class StreamPumpTests(unittest.IsolatedAsyncioTestCase):
         cache.store(job.text, src, voice_cache_key(voice))
         cloud = MagicMock()
         cloud.stream_audio = MagicMock(side_effect=AssertionError("API hit"))
-        tts_bot.tts_dispatcher._cloud = cloud
+        tts_bot.tts_dispatcher.register("minimax", cloud)
 
         hit = PreparedAudio(job=job, channel=asyncio.Queue())
         self.assertEqual(await tts_bot._generate_stream_into(hit, voice), "cache")
         # A re-tuned voice must not be served the old audio.
         tuned = replace(voice, minimax=replace(voice.minimax, speed=1.3))
-        tts_bot.tts_dispatcher.circuit_breaker.trip(60)  # the miss must not call the API
+        tts_bot.tts_dispatcher.breaker_for("minimax").trip(60)  # the miss must not call the API
         miss = PreparedAudio(job=job, channel=asyncio.Queue())
         self.assertEqual(await tts_bot._generate_stream_into(miss, tuned), "pre_audio")
         cloud.stream_audio.assert_not_called()
@@ -125,7 +125,7 @@ class StreamFallbackSemanticsTests(unittest.IsolatedAsyncioTestCase):
     def _bot_with_cloud(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
-        tts_bot.tts_dispatcher._cloud = MagicMock()
+        tts_bot.tts_dispatcher.register("minimax", MagicMock())
         tts_bot.ensure_voice = AsyncMock(return_value=MagicMock())
         tts_bot.ensure_continuous_player = MagicMock(
             return_value=FakeSource(bot_mod.PCM_FRAME_BYTES)
@@ -139,8 +139,8 @@ class StreamFallbackSemanticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tts_bot._should_attempt_stream(_minimax_voice()))
         self.assertFalse(tts_bot._should_attempt_stream(_piper_voice()))
         self.assertFalse(tts_bot._should_attempt_stream(None))
-        tts_bot.tts_dispatcher._cloud = None
-        self.assertFalse(tts_bot._should_attempt_stream(_minimax_voice()))
+        # A bot without MiniMax credentials has no MiniMax provider to stream.
+        self.assertFalse(bot_mod.TTSBot()._should_attempt_stream(_minimax_voice()))
 
 if __name__ == "__main__":
     unittest.main()

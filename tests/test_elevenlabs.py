@@ -431,13 +431,11 @@ class ElevenLabsTooLongPipelineTests(unittest.IsolatedAsyncioTestCase):
             lambda r: _error(401, "quota_exceeded", "You have 900 credits remaining.")), base_url="https://el.test")
         self.addAsyncCleanup(client.aclose)
         pipeline = SynthesisPipelineMixin()
-        pipeline.tts_dispatcher = TTSDispatcher(
-            local=MagicMock(), elevenlabs=ElevenLabsProvider(_config(), client),
-        )
+        pipeline.tts_dispatcher = TTSDispatcher(local=MagicMock(), providers={"elevenlabs": ElevenLabsProvider(_config(), client)})
         for _ in range(5):
             prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
             self.assertEqual(await pipeline._generate_elevenlabs_stream_into(prepared, _voice()), "pre_audio")
-        self.assertEqual(pipeline.tts_dispatcher.elevenlabs_circuit_breaker.state, CircuitState.CLOSED)
+        self.assertEqual(pipeline.tts_dispatcher.breaker_for("elevenlabs").state, CircuitState.CLOSED)
 
 
 class ElevenLabsRegistryTests(unittest.TestCase):
@@ -462,11 +460,7 @@ class ElevenLabsRegistryTests(unittest.TestCase):
 
 class ElevenLabsDispatcherTests(unittest.IsolatedAsyncioTestCase):
     def _dispatcher(self, elevenlabs, cache=None, local=None):
-        return TTSDispatcher(
-            local=local or SimpleNamespace(name="local", synthesize=AsyncMock()),
-            elevenlabs=elevenlabs, cache=cache, fallback_profile="piper-ruslan",
-            config=DispatcherConfig(quota_cooldown_seconds=900),
-        )
+        return TTSDispatcher(local=local or SimpleNamespace(name="local", synthesize=AsyncMock()), cache=cache, fallback_profile="piper-ruslan", config=DispatcherConfig(quota_cooldown_seconds=900), providers={"elevenlabs": elevenlabs})
 
     async def test_routes_voice_and_caches_ogg(self):
         eleven = SimpleNamespace(config=_config(), fetch=AsyncMock(return_value=("opus", 48000, b"OggS-x")))
@@ -503,7 +497,7 @@ class ElevenLabsDispatcherTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await dispatcher.synthesize("x", out, voice=_voice()), "local")
         local.synthesize.assert_awaited_once_with("x", out, "piper-ruslan")
         self.assertEqual(cache.size, 0)
-        self.assertEqual(dispatcher.elevenlabs_circuit_breaker.consecutive_failures, 1)
+        self.assertEqual(dispatcher.breaker_for("elevenlabs").consecutive_failures, 1)
 
     async def test_quota_and_retry_after_set_breaker_cooldown(self):
         eleven = SimpleNamespace(config=_config(), fetch=AsyncMock())
@@ -512,11 +506,11 @@ class ElevenLabsDispatcherTests(unittest.IsolatedAsyncioTestCase):
             dispatcher = self._dispatcher(eleven)
             eleven.fetch.side_effect = ElevenLabsQuotaExhaustedError("quota", 401)
             await dispatcher.synthesize("x", out, voice=_voice())
-            self.assertGreater(dispatcher.elevenlabs_circuit_breaker.cooldown_remaining, 800)
+            self.assertGreater(dispatcher.breaker_for("elevenlabs").cooldown_remaining, 800)
             dispatcher = self._dispatcher(eleven)
             eleven.fetch.side_effect = ElevenLabsRateLimitError("429", 429, retry_after=20)
             await dispatcher.synthesize("x", out, voice=_voice())
-            breaker = dispatcher.elevenlabs_circuit_breaker
+            breaker = dispatcher.breaker_for("elevenlabs")
             self.assertEqual(breaker.state, CircuitState.OPEN)
             calls = eleven.fetch.await_count
             await dispatcher.synthesize("x", out, voice=_voice())
@@ -528,11 +522,8 @@ class ElevenLabsDispatcherTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             for _ in range(5):
                 self.assertEqual(await dispatcher.synthesize("x", Path(tmp) / "o.wav", voice=_voice()), "local")
-            self.assertEqual(dispatcher.elevenlabs_circuit_breaker.consecutive_failures, 0)
-            dispatcher = TTSDispatcher(
-                local=SimpleNamespace(name="local", synthesize=AsyncMock()), elevenlabs=eleven,
-                config=DispatcherConfig(primary=PrimaryProvider.ELEVENLABS),
-            )
+            self.assertEqual(dispatcher.breaker_for("elevenlabs").consecutive_failures, 0)
+            dispatcher = TTSDispatcher(local=SimpleNamespace(name="local", synthesize=AsyncMock()), config=DispatcherConfig(primary=PrimaryProvider.ELEVENLABS), providers={"elevenlabs": eleven})
             eleven.fetch.reset_mock()
             self.assertEqual(await dispatcher.synthesize("x", Path(tmp) / "o.wav"), "local")
             eleven.fetch.assert_not_awaited()  # no ELEVENLABS_VOICE_ID: not even tried
@@ -546,10 +537,7 @@ class ElevenLabsPipelineTests(unittest.IsolatedAsyncioTestCase):
     def _pipeline(self, handler, cache=None, fmt="opus_48000_64"):
         provider, client = _provider(handler, fmt)
         pipeline = SynthesisPipelineMixin()
-        pipeline.tts_dispatcher = TTSDispatcher(
-            local=MagicMock(), elevenlabs=provider, cache=cache,
-            config=DispatcherConfig(quota_cooldown_seconds=900),
-        )
+        pipeline.tts_dispatcher = TTSDispatcher(local=MagicMock(), cache=cache, config=DispatcherConfig(quota_cooldown_seconds=900), providers={"elevenlabs": provider})
         self.addAsyncCleanup(client.aclose)
         return pipeline
 
@@ -578,7 +566,7 @@ class ElevenLabsPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(len(live), 25)
             # Opus packets, not 3840-byte PCM frames: nothing was decoded.
             self.assertTrue(all(len(p) < PCM_FRAME_BYTES and opus_packet_samples(p) == 960 for p in live))
-            key = pipeline.tts_dispatcher.elevenlabs.config.cache_key(_voice().elevenlabs)
+            key = pipeline.tts_dispatcher.provider_for("elevenlabs").config.cache_key(_voice().elevenlabs)
             self.assertEqual(cache.lookup(_job().text, key + DISCORD_OPUS_CACHE_SUFFIX).suffix, ".dopus")
             second = PreparedAudio(job=_job(), channel=asyncio.Queue())
             self.assertEqual(await pipeline._generate_elevenlabs_stream_into(second, _voice()), "cache")
@@ -645,7 +633,7 @@ class ElevenLabsPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(prepared.error, ElevenLabsQuotaExhaustedError)
         # ElevenLabs can report its quota: paused until the health worker
         # asks it (within a minute), not on a blind 30 min timer.
-        breaker = pipeline.tts_dispatcher.elevenlabs_circuit_breaker
+        breaker = pipeline.tts_dispatcher.breaker_for("elevenlabs")
         self.assertIs(breaker.state, CircuitState.OPEN)
         self.assertEqual(breaker.kind.value, "quota")
         self.assertTrue(breaker.await_check)
@@ -655,7 +643,7 @@ class ElevenLabsPipelineTests(unittest.IsolatedAsyncioTestCase):
         pipeline = self._pipeline(lambda r: _audio(stream=_Chunks([_ogg(1)[:900]], fail_after=True), cost="6.5"))
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         await pipeline._generate_elevenlabs_stream_into(prepared, _voice())
-        provider = pipeline.tts_dispatcher.elevenlabs
+        provider = pipeline.tts_dispatcher.provider_for("elevenlabs")
         self.assertEqual((provider.session_requests, provider.session_credits), (1, 6))
 
     async def test_missing_voice_does_not_pause_other_voices(self):
@@ -664,7 +652,7 @@ class ElevenLabsPipelineTests(unittest.IsolatedAsyncioTestCase):
             prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
             self.assertEqual(await pipeline._generate_elevenlabs_stream_into(prepared, _voice()), "pre_audio")
         self.assertIsInstance(prepared.error, ElevenLabsVoiceNotFoundError)
-        self.assertEqual(pipeline.tts_dispatcher.elevenlabs_circuit_breaker.state, CircuitState.CLOSED)
+        self.assertEqual(pipeline.tts_dispatcher.breaker_for("elevenlabs").state, CircuitState.CLOSED)
 
     async def test_ring_switches_key_before_audio_and_plays(self):
         ogg = _ogg()
@@ -684,13 +672,13 @@ class ElevenLabsPipelineTests(unittest.IsolatedAsyncioTestCase):
             ElevenLabsConfig(api_key="k1", api_keys=("k2",)), client, on_key_switch=switched.append,
         )
         pipeline = SynthesisPipelineMixin()
-        pipeline.tts_dispatcher = TTSDispatcher(local=MagicMock(), elevenlabs=provider)
+        pipeline.tts_dispatcher = TTSDispatcher(local=MagicMock(), providers={"elevenlabs": provider})
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         self.assertEqual(await pipeline._generate_elevenlabs_stream_into(prepared, _voice()), "ok")
         self.assertTrue(await self._drain(prepared))
         self.assertEqual(used, ["k1", "k2"])
         self.assertEqual(switched, [key_fingerprint("k2")])
-        self.assertEqual(pipeline.tts_dispatcher.elevenlabs_circuit_breaker.consecutive_failures, 0)
+        self.assertEqual(pipeline.tts_dispatcher.breaker_for("elevenlabs").consecutive_failures, 0)
 
     async def test_slow_first_audio_times_out_to_piper(self):
         async def slow(request):
@@ -709,7 +697,7 @@ class ElevenLabsPipelineTests(unittest.IsolatedAsyncioTestCase):
         pipeline = self._pipeline(lambda r: self.fail("request sent"))
         cancelled = PreparedAudio(job=_job(), channel=asyncio.Queue(), cancelled=True)
         self.assertEqual(await pipeline._generate_elevenlabs_stream_into(cancelled, _voice()), "cancelled")
-        pipeline.tts_dispatcher.elevenlabs_circuit_breaker.trip(60)
+        pipeline.tts_dispatcher.breaker_for("elevenlabs").trip(60)
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         self.assertEqual(await pipeline._generate_elevenlabs_stream_into(prepared, _voice()), "pre_audio")
 

@@ -61,10 +61,7 @@ class WarmerTests(unittest.IsolatedAsyncioTestCase):
             "gemini": GeminiProvider(GeminiConfig(api_key="k")),
             "minimax": MiniMaxProvider(MiniMaxConfig(api_key="k", base_url="https://api.minimax.io")),
         }
-        dispatcher = TTSDispatcher(
-            local=MagicMock(), cloud=providers["minimax"], fish=providers["fish"],
-            gemini=providers["gemini"], elevenlabs=providers["elevenlabs"],
-        )
+        dispatcher = TTSDispatcher(local=MagicMock(), providers={"minimax": providers["minimax"], "fish": providers["fish"], "gemini": providers["gemini"], "elevenlabs": providers["elevenlabs"]})
         hosts = {
             "elevenlabs": "api.elevenlabs.io", "fish": "api.fish.audio",
             "gemini": "openrouter.ai", "minimax": "api.minimax.io",

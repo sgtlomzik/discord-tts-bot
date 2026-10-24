@@ -34,7 +34,7 @@ class OnePipelineTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict("os.environ", {"TTS_CONTINUOUS_STREAM": "0"}):
             bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
-        tts_bot.tts_dispatcher._fish = MagicMock()
+        tts_bot.tts_dispatcher.register("fish", MagicMock())
         fish = voice_registry.VoiceRecord(
             name="f", label="F", description="", provider=voice_registry.PROVIDER_FISH,
             fish=voice_registry.FishParams(reference_id="r"),

@@ -27,7 +27,6 @@ from ttsbot.providers import (
     TTSDispatcher,
     TTSPhraseCache,
     load_cache_config_from_env,
-    load_circuit_breaker_from_env,
     load_dispatcher_config_from_env,
     load_minimax_config_from_env,
 )
@@ -168,12 +167,14 @@ class TTSBot(
             )
         self.tts_dispatcher = TTSDispatcher(
             local=LocalProvider(_piper_synthesize),
-            cloud=self._build_cloud_provider(),
-            fish=self.fish_provider,
-            gemini=self.gemini_provider,
-            elevenlabs=self.elevenlabs_provider,
+            # Registration order is the order /fallback status lists them in.
+            providers={
+                "minimax": self._build_cloud_provider(),
+                "fish": self.fish_provider,
+                "gemini": self.gemini_provider,
+                "elevenlabs": self.elevenlabs_provider,
+            },
             config=load_dispatcher_config_from_env(),
-            circuit_breaker=load_circuit_breaker_from_env(),
             cache=self.tts_cache,
             fallback_profile=self.voice_registry.fallback_profile,
         )
@@ -299,7 +300,7 @@ class TTSBot(
 
         # Gracefully close the cloud provider's HTTP keep-alive pool.
         # Local Piper has no async resources to release.
-        cloud = getattr(self.tts_dispatcher, "cloud", None)
+        cloud = self.tts_dispatcher.provider_for("minimax")
         if cloud is not None and hasattr(cloud, "aclose"):
             try:
                 await cloud.aclose()

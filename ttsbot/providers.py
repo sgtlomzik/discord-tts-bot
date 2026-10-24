@@ -32,7 +32,6 @@ import logging
 import os
 import shutil
 import uuid
-import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
@@ -42,6 +41,7 @@ from typing import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Mapping,
     Optional,
     Protocol,
 )
@@ -58,9 +58,7 @@ from ttsbot.health import (  # noqa: F401  (CircuitState is re-exported)
     classify_failure,
     fingerprint,
 )
-from ttsbot.elevenlabs import ElevenLabsProvider
-from ttsbot.fish import FishProvider
-from ttsbot.gemini import GeminiProvider, write_wav
+from ttsbot.gemini import write_wav
 from ttsbot.httpclient import attach_warmer, provider_limits
 from ttsbot.pcm import apply_gain, pcm_cache_header, read_pcm_cache
 
@@ -1169,30 +1167,20 @@ class TTSDispatcher:
     def __init__(
         self,
         local: LocalProvider,
-        cloud: Optional[TTSProvider] = None,
-        fish: Optional[FishProvider] = None,
-        gemini: Optional[GeminiProvider] = None,
-        elevenlabs: Optional[ElevenLabsProvider] = None,
-        circuit_breaker: Optional[CircuitBreaker] = None,
+        providers: Optional[Mapping[str, object]] = None,
+        *,
+        breakers: Optional[Mapping[str, CircuitBreaker]] = None,
         config: Optional[DispatcherConfig] = None,
         cache: Optional[TTSPhraseCache] = None,
         fallback_profile: str = "",
     ) -> None:
         self._local = local
-        self._cloud = cloud  # None when MiniMax is not configured
-        self._fish = fish
-        self._cb = circuit_breaker or CircuitBreaker()
-        self._fish_cb = load_circuit_breaker_from_env()
-        self._gemini = gemini
-        self._gemini_cb = load_circuit_breaker_from_env()
-        self._elevenlabs = elevenlabs
-        self._elevenlabs_cb = load_circuit_breaker_from_env()
-        self._breakers: dict[str, CircuitBreaker] = {
-            "minimax": self._cb, "fish": self._fish_cb,
-            "gemini": self._gemini_cb, "elevenlabs": self._elevenlabs_cb,
-        }
-        for name, breaker in self._breakers.items():
-            breaker.name = breaker.name or PROVIDER_LABELS[name]
+        # Cloud providers by the name voice records use ("fish", ...), each
+        # with its own circuit breaker; an unconfigured one is left out.
+        self._providers: dict[str, object] = {}
+        self._breakers: dict[str, CircuitBreaker] = {}
+        for name, provider in (providers or {}).items():
+            self.register(name, provider, (breakers or {}).get(name))
         # Providers whose check_quota() could not tell (e.g. keys without
         # the permission to read their quota): probed on the backoff instead.
         self._quota_unknown: set[str] = set()
@@ -1205,9 +1193,18 @@ class TTSDispatcher:
     def config(self) -> DispatcherConfig:
         return self._config
 
-    @property
-    def circuit_breaker(self) -> CircuitBreaker:
-        return self._cb
+    def register(self, name: str, provider, breaker: Optional[CircuitBreaker] = None) -> None:
+        """Add a cloud provider under the name its voices use.
+
+        It gets its own circuit breaker (from the CB_* settings unless one
+        is given). ``None`` (not configured) is ignored.
+        """
+        if provider is None:
+            return
+        breaker = breaker or load_circuit_breaker_from_env()
+        breaker.name = breaker.name or PROVIDER_LABELS.get(name, name)
+        self._providers[name] = provider
+        self._breakers[name] = breaker
 
     # -- provider health ------------------------------------------------
 
@@ -1216,8 +1213,8 @@ class TTSDispatcher:
         return self._breakers.get(provider or "")
 
     def provider_names(self) -> list[str]:
-        """The configured cloud providers, in a stable order."""
-        return [name for name in self._breakers if self.provider_for(name) is not None]
+        """The configured cloud providers, in registration order."""
+        return list(self._providers)
 
     def _name_of(self, breaker: CircuitBreaker) -> str:
         return next((name for name, b in self._breakers.items() if b is breaker), "")
@@ -1343,45 +1340,10 @@ class TTSDispatcher:
 
     # -- providers --------------------------------------------------------
 
-    @property
-    def cloud(self) -> Optional[TTSProvider]:
-        return self._cloud
-
-    @property
-    def fish(self) -> Optional[FishProvider]:
-        return self._fish
-
-    @property
-    def fish_circuit_breaker(self) -> CircuitBreaker:
-        return self._fish_cb
-
-    @property
-    def gemini(self) -> Optional[GeminiProvider]:
-        return self._gemini
-
-    @property
-    def gemini_circuit_breaker(self) -> CircuitBreaker:
-        return self._gemini_cb
-
-    @property
-    def elevenlabs(self) -> Optional[ElevenLabsProvider]:
-        return self._elevenlabs
-
-    @property
-    def elevenlabs_circuit_breaker(self) -> CircuitBreaker:
-        return self._elevenlabs_cb
-
     def provider_for(self, provider: str | None):
         """The configured provider object for a voice record's ``provider``
-        value, or None (Piper, unknown, or not configured). Register every
-        new cloud provider here (and in ``_breakers``) so typing warm-ups,
-        health checks and the fallback chain reach it."""
-        return {
-            "minimax": self._cloud,
-            "fish": self._fish,
-            "gemini": self._gemini,
-            "elevenlabs": self._elevenlabs,
-        }.get(provider or "")
+        value, or None (Piper, unknown, or not configured)."""
+        return self._providers.get(provider or "")
 
     @property
     def cache(self) -> Optional[TTSPhraseCache]:
@@ -1397,7 +1359,7 @@ class TTSDispatcher:
         if primary is PrimaryProvider.LOCAL:
             return "piper"
         if primary is PrimaryProvider.ELEVENLABS and not (
-            self._elevenlabs is not None and self._elevenlabs.config.voice_id
+            self.provider_for("elevenlabs") is not None and self.provider_for("elevenlabs").config.voice_id
         ):
             return "piper"  # no ELEVENLABS_VOICE_ID: no voice to use
         return primary.value
@@ -1449,19 +1411,19 @@ class TTSDispatcher:
     async def _synthesize_one(self, text: str, filename: Path, voice, provider: str):
         """One voice, no fallback: ``(provider used or "", error or None)``."""
         if provider == "gemini":
-            if self._gemini is None:
+            if self.provider_for("gemini") is None:
                 return "", None
             return await self._synthesize_gemini(text, filename, getattr(voice, "gemini", None))
         if provider == "elevenlabs":
-            if self._elevenlabs is None:
+            if self.provider_for("elevenlabs") is None:
                 return "", None
             return await self._synthesize_elevenlabs(text, filename, getattr(voice, "elevenlabs", None))
         if provider == "fish":
-            if self._fish is None:
+            if self.provider_for("fish") is None:
                 return "", None
             return await self._synthesize_fish(text, filename, voice)
         if provider == "minimax":
-            if self._cloud is None:
+            if self.provider_for("minimax") is None:
                 return "", None
             return await self._synthesize_minimax(text, filename, voice)
         voice_key = voice_cache_key(voice)
@@ -1491,22 +1453,22 @@ class TTSDispatcher:
 
     async def _synthesize_fish(self, text: str, filename: Path, voice):
         params = getattr(voice, "fish", None)
-        cfg = self._fish.config
+        cfg = self._providers["fish"].config
         reference_id = getattr(params, "reference_id", "") or cfg.reference_id
         cache_key = cfg.cache_key(reference_id, params)
         if self._cache_hit(text, filename, cache_key):
             return "cache", None
-        if self._breaker_closed_to(self._fish_cb):
+        if self._breaker_closed_to(self._breakers["fish"]):
             return "", None
         try:
-            await self._fish.synthesize(
+            await self._providers["fish"].synthesize(
                 text, filename, reference_id=reference_id, params=params, request_config=cfg,
             )
         except Exception as exc:
-            self.record_failure(self._fish_cb, exc)
+            self.record_failure(self._breakers["fish"], exc)
             log.warning("Fish synthesis failed (%s: %s)", type(exc).__name__, exc)
             return "", exc
-        self._fish_cb.record_success()
+        self._breakers["fish"].record_success()
         self._maybe_cache(text, filename, cache_key, suffix="opus")
         return "fish", None
 
@@ -1514,30 +1476,30 @@ class TTSDispatcher:
         voice_key = voice_cache_key(voice)
         if self._cache_hit(text, filename, voice_key):
             return "cache", None
-        if self._breaker_closed_to(self._cb):
+        if self._breaker_closed_to(self._breakers["minimax"]):
             return "", None
         mm = getattr(voice, "minimax", None) if voice is not None else None
         try:
             if mm is not None:
-                await self._cloud.synthesize(
+                await self._providers["minimax"].synthesize(
                     text, filename,
                     voice_id=mm.voice_id, model=mm.model,
                     speed=mm.speed, vol=mm.vol, pitch=mm.pitch,
                     emotion=mm.emotion, language_boost=mm.language_boost,
                 )
             else:
-                await self._cloud.synthesize(text, filename)
+                await self._providers["minimax"].synthesize(text, filename)
         except Exception as exc:
-            log.warning("TTS provider %s failed (%s: %s)", self._cloud.name, type(exc).__name__, exc)
-            self.record_failure(self._cb, exc)
+            log.warning("TTS provider %s failed (%s: %s)", self._providers["minimax"].name, type(exc).__name__, exc)
+            self.record_failure(self._breakers["minimax"], exc)
             return "", exc
-        self._cb.record_success()
+        self._breakers["minimax"].record_success()
         self._maybe_cache(text, filename, voice_key)
-        return self._cloud.name, None
+        return self._providers["minimax"].name, None
 
     async def _synthesize_gemini(self, text: str, filename: Path, params):
         """Gemini file path: cache, then the API."""
-        cache_key = self._gemini.config.cache_key(params)
+        cache_key = self._providers["gemini"].config.cache_key(params)
         volume_db = float(getattr(params, "volume_db", 0.0) or 0.0)
         if self._cache is not None:
             cached = self._cache.lookup(text, cache_key)
@@ -1548,15 +1510,15 @@ class TTSDispatcher:
                     return "cache", None
                 except (OSError, ValueError) as exc:
                     log.warning("Unreadable Gemini cache file %s (%s); regenerating", cached, exc)
-        if self._breaker_closed_to(self._gemini_cb):
+        if self._breaker_closed_to(self._breakers["gemini"]):
             return "", None
         try:
-            rate, channels, pcm = await self._gemini.fetch_pcm(text, params)
+            rate, channels, pcm = await self._providers["gemini"].fetch_pcm(text, params)
         except Exception as exc:
-            self.record_failure(self._gemini_cb, exc)
+            self.record_failure(self._breakers["gemini"], exc)
             log.warning("Gemini synthesis failed (%s: %s)", type(exc).__name__, exc)
             return "", exc
-        self._gemini_cb.record_success()
+        self._breakers["gemini"].record_success()
         write_wav(filename, rate, channels, apply_gain(pcm, volume_db))
         if self._cache is not None:
             try:
@@ -1571,7 +1533,7 @@ class TTSDispatcher:
         Opus is cached as the raw Ogg (.opus, decoded by ffmpeg), PCM as a
         .pcm entry; the streaming path keeps its own Discord-frame entries.
         """
-        cfg = self._elevenlabs.config
+        cfg = self._providers["elevenlabs"].config
         cache_key = cfg.cache_key(params)
         if self._cache is not None:
             cached = self._cache.lookup(text, cache_key)
@@ -1585,17 +1547,17 @@ class TTSDispatcher:
                     return "cache", None
                 except (OSError, ValueError) as exc:
                     log.warning("Unreadable ElevenLabs cache file %s (%s); regenerating", cached, exc)
-        if self._breaker_closed_to(self._elevenlabs_cb):
+        if self._breaker_closed_to(self._breakers["elevenlabs"]):
             return "", None
         # The file path reads the whole clip, so the budget grows with the text.
         budget = bot_config.ELEVENLABS_TTFA_TIMEOUT + 0.03 * len(text)
         try:
-            kind, rate, data = await asyncio.wait_for(self._elevenlabs.fetch(text, params), budget)
+            kind, rate, data = await asyncio.wait_for(self._providers["elevenlabs"].fetch(text, params), budget)
         except Exception as exc:
-            self.record_failure(self._elevenlabs_cb, exc)
+            self.record_failure(self._breakers["elevenlabs"], exc)
             log.warning("ElevenLabs synthesis failed (%s: %s)", type(exc).__name__, exc)
             return "", exc
-        self._elevenlabs_cb.record_success()
+        self._breakers["elevenlabs"].record_success()
         if kind == "pcm":
             write_wav(filename, rate, 1, data)
             entry, suffix = pcm_cache_header(rate, 1) + data, "pcm"

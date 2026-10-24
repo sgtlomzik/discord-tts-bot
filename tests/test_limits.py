@@ -175,7 +175,7 @@ class StutterGuardTests(unittest.IsolatedAsyncioTestCase):
         tts_bot = bot_mod.TTSBot()
         cloud = MagicMock()
         cloud.stream_audio = lambda *a, **k: _stutter_forever(_MP3)
-        tts_bot.tts_dispatcher._cloud = cloud
+        tts_bot.tts_dispatcher.register("minimax", cloud)
 
         cfg = bot_mod.config
         cfg.TTS_AUDIO_CHARS_PER_SECOND = 12.0

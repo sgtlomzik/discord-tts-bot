@@ -93,12 +93,7 @@ class DispatcherSkeletonTests(unittest.TestCase):
             filename.write_bytes(local_writes)
 
         local = LocalProvider(fake_piper)
-        return TTSDispatcher(
-            local=local,
-            cloud=cloud,
-            circuit_breaker=cb or CircuitBreaker(),
-            config=DispatcherConfig(primary=primary),
-        )
+        return TTSDispatcher(local=local, config=DispatcherConfig(primary=primary), providers={"minimax": cloud}, breakers={"minimax": cb or CircuitBreaker()})
 
     def test_primary_local_routes_through_local_even_if_cloud_present(self):
         async def fake_cloud(text, filename):
@@ -199,7 +194,7 @@ class DispatcherSkeletonTests(unittest.TestCase):
 
         local = LocalProvider(fake_piper)
         cb = CircuitBreaker()
-        d = TTSDispatcher(local=local, circuit_breaker=cb)
+        d = TTSDispatcher(local=local, breakers={"minimax": cb})
 
         with self.assertRaises(RuntimeError):
             run(d.warm_local("x", Path("/tmp/zzz.wav")))
@@ -328,10 +323,7 @@ class CircuitBreakerStateMachineTests(unittest.TestCase):
         cb, clock = self._make(threshold=2, cooldown=60.0)
         # Two failures trip the breaker.
         local = LocalProvider(_write_bytes_provider(b"LOCAL"))
-        d = TTSDispatcher(
-            local=local, cloud=cloud, circuit_breaker=cb,
-            config=DispatcherConfig(primary=PrimaryProvider.MINIMAX),
-        )
+        d = TTSDispatcher(local=local, config=DispatcherConfig(primary=PrimaryProvider.MINIMAX), providers={"minimax": cloud}, breakers={"minimax": cb})
         async def expect_fallback():
             # The cloud raises — CB records failure.
             async def boom(text, filename):

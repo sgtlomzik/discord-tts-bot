@@ -183,11 +183,7 @@ class GeminiRegistryTests(unittest.TestCase):
 
 class GeminiDispatcherTests(unittest.IsolatedAsyncioTestCase):
     def _dispatcher(self, gemini, cache=None, local=None):
-        return TTSDispatcher(
-            local=local or SimpleNamespace(name="local", synthesize=AsyncMock()),
-            gemini=gemini, cache=cache, fallback_profile="piper-ruslan",
-            config=DispatcherConfig(quota_cooldown_seconds=900),
-        )
+        return TTSDispatcher(local=local or SimpleNamespace(name="local", synthesize=AsyncMock()), cache=cache, fallback_profile="piper-ruslan", config=DispatcherConfig(quota_cooldown_seconds=900), providers={"gemini": gemini})
 
     async def test_routes_gemini_voice_and_caches_raw_pcm(self):
         gemini = SimpleNamespace(config=GeminiConfig(api_key="k"),
@@ -217,7 +213,7 @@ class GeminiDispatcherTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await dispatcher.synthesize("x", out, voice=_voice()), "local")
         local.synthesize.assert_awaited_once_with("x", out, "piper-ruslan")
         self.assertEqual(cache.size, 0)
-        self.assertEqual(dispatcher.gemini_circuit_breaker.consecutive_failures, 1)
+        self.assertEqual(dispatcher.breaker_for("gemini").consecutive_failures, 1)
 
     async def test_quota_and_retry_after_set_breaker_cooldown(self):
         gemini = SimpleNamespace(config=GeminiConfig(api_key="k"), fetch_pcm=AsyncMock())
@@ -226,11 +222,11 @@ class GeminiDispatcherTests(unittest.IsolatedAsyncioTestCase):
             out = Path(tmp) / "o.wav"
             gemini.fetch_pcm.side_effect = GeminiQuotaExhaustedError("402", 402)
             await dispatcher.synthesize("x", out, voice=_voice())
-            self.assertGreater(dispatcher.gemini_circuit_breaker.cooldown_remaining, 800)
+            self.assertGreater(dispatcher.breaker_for("gemini").cooldown_remaining, 800)
             dispatcher = self._dispatcher(gemini)
             gemini.fetch_pcm.side_effect = GeminiRateLimitError("429", 429, retry_after=20)
             await dispatcher.synthesize("x", out, voice=_voice())
-            breaker = dispatcher.gemini_circuit_breaker
+            breaker = dispatcher.breaker_for("gemini")
             self.assertEqual(breaker.state, CircuitState.OPEN)
             self.assertTrue(10 < breaker.cooldown_remaining <= 20)
             calls = gemini.fetch_pcm.await_count
@@ -246,10 +242,7 @@ class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
     def _pipeline(self, handler, cache=None):
         provider, client = _provider(handler)
         pipeline = SynthesisPipelineMixin()
-        pipeline.tts_dispatcher = TTSDispatcher(
-            local=MagicMock(), gemini=provider, cache=cache,
-            config=DispatcherConfig(quota_cooldown_seconds=900),
-        )
+        pipeline.tts_dispatcher = TTSDispatcher(local=MagicMock(), cache=cache, config=DispatcherConfig(quota_cooldown_seconds=900), providers={"gemini": provider})
         self.addAsyncCleanup(client.aclose)
         return pipeline
 
@@ -321,7 +314,7 @@ class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await pipeline._generate_gemini_stream_into(prepared, _voice()), "pre_audio")
             self.assertTrue(prepared.channel.empty())
         self.assertIsInstance(prepared.error, GeminiQuotaExhaustedError)
-        self.assertGreater(pipeline.tts_dispatcher.gemini_circuit_breaker.cooldown_remaining, 800)
+        self.assertGreater(pipeline.tts_dispatcher.breaker_for("gemini").cooldown_remaining, 800)
 
     async def test_slow_first_audio_times_out_to_piper(self):
         async def slow(request):
@@ -340,7 +333,7 @@ class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_open_breaker_skips_the_api(self):
         pipeline = self._pipeline(lambda r: self.fail("request sent"))
-        pipeline.tts_dispatcher.gemini_circuit_breaker.trip(60)
+        pipeline.tts_dispatcher.breaker_for("gemini").trip(60)
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         self.assertEqual(await pipeline._generate_gemini_stream_into(prepared, _voice()), "pre_audio")
 

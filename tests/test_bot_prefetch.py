@@ -55,7 +55,7 @@ class StreamToChannelTests(unittest.IsolatedAsyncioTestCase):
         tts_bot.tts_dispatcher._cache = cache
         cloud = MagicMock()
         cloud.stream_audio = lambda *a, **k: _chunks(_MP3)
-        tts_bot.tts_dispatcher._cloud = cloud
+        tts_bot.tts_dispatcher.register("minimax", cloud)
 
         job = _job(bot_mod)
         prepared = bot_mod.PreparedAudio(job=job, channel=asyncio.Queue())
@@ -71,7 +71,7 @@ class StreamToChannelTests(unittest.IsolatedAsyncioTestCase):
         tts_bot = bot_mod.TTSBot()
         cloud = MagicMock()
         cloud.stream_audio = lambda *a, **k: _chunks(_MP3)
-        tts_bot.tts_dispatcher._cloud = cloud
+        tts_bot.tts_dispatcher.register("minimax", cloud)
         prepared = bot_mod.PreparedAudio(job=_job(bot_mod), channel=asyncio.Queue())
         prepared.cancelled = True
         status, frames = await tts_bot._stream_to_channel(prepared, _minimax_voice())
@@ -98,7 +98,7 @@ class PrepareIntoTests(unittest.IsolatedAsyncioTestCase):
 
         cloud = MagicMock()
         cloud.stream_audio = MagicMock(side_effect=AssertionError("API on cache hit!"))
-        tts_bot.tts_dispatcher._cloud = cloud
+        tts_bot.tts_dispatcher.register("minimax", cloud)
 
         prepared = bot_mod.PreparedAudio(job=job, channel=asyncio.Queue())
         await tts_bot._prepare_into(prepared)
@@ -130,7 +130,7 @@ class PipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         tts_bot = bot_mod.TTSBot()
         cloud = MagicMock()
         cloud.stream_audio = lambda *a, **k: _chunks(_MP3)
-        tts_bot.tts_dispatcher._cloud = cloud
+        tts_bot.tts_dispatcher.register("minimax", cloud)
         tts_bot.voice_registry.add(_minimax_voice())  # jobs resolve to streaming
 
         played: list[int] = []

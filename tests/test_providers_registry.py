@@ -33,12 +33,7 @@ def _dispatcher(*, cloud=True, primary=PrimaryProvider.MINIMAX, fallback="piper-
     if cloud:
         cloud_mock = AsyncMock()
         cloud_mock.name = "minimax"
-    disp = TTSDispatcher(
-        local=local,
-        cloud=cloud_mock,
-        config=DispatcherConfig(primary=primary),
-        fallback_profile=fallback,
-    )
+    disp = TTSDispatcher(local=local, config=DispatcherConfig(primary=primary), fallback_profile=fallback, providers={"minimax": cloud_mock})
     return disp, local, cloud_mock
 
 
@@ -68,7 +63,7 @@ class DispatcherRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(used, "local")
         # fell back to the registry fallback piper profile
         local.synthesize.assert_awaited_once_with("привет", Path("/tmp/x.mp3"), "piper-ruslan")
-        self.assertEqual(disp.circuit_breaker.consecutive_failures, 1)
+        self.assertEqual(disp.breaker_for("minimax").consecutive_failures, 1)
 
     async def test_minimax_record_with_no_cloud_uses_fallback_piper(self):
         disp, local, _ = _dispatcher(cloud=False)

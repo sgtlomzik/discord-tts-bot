@@ -285,7 +285,7 @@ class SynthesisPipelineMixin:
         (voice id not exist) yields a clear rejection. Used by voice-add
         before persisting a new voice.
         """
-        cloud = getattr(self.tts_dispatcher, "cloud", None)
+        cloud = self.tts_dispatcher.provider_for("minimax")
         if cloud is None:
             return False, "MiniMax не настроен (нет MINIMAX_API_KEY)."
         tmp = config.TMP_DIR / f"voiceadd_{uuid.uuid4().hex}.mp3"
@@ -313,7 +313,7 @@ class SynthesisPipelineMixin:
         prefix). The name is re-checked after the probe because clone/add
         take long enough for another command to claim it meanwhile.
         """
-        fish = self.tts_dispatcher.fish
+        fish = self.tts_dispatcher.provider_for("fish")
         probe = config.TMP_DIR / f"fish_probe_{uuid.uuid4().hex}.opus"
         try:
             await fish.synthesize("Проверка голоса.", probe, reference_id=reference_id)
@@ -349,7 +349,7 @@ class SynthesisPipelineMixin:
         Returns "" on success or a short reason (lowercase, for a message
         prefix). The probe is one short billed request.
         """
-        gemini = self.tts_dispatcher.gemini
+        gemini = self.tts_dispatcher.provider_for("gemini")
         params = voice_registry.GeminiParams(voice=voice)
         try:
             _, _, pcm = await gemini.fetch_pcm("Проверка голоса.", params)
@@ -382,7 +382,7 @@ class SynthesisPipelineMixin:
         Returns "" on success or a short reason (lowercase, for a message
         prefix). The probe is one short billed request (~8 credits).
         """
-        elevenlabs = self.tts_dispatcher.elevenlabs
+        elevenlabs = self.tts_dispatcher.provider_for("elevenlabs")
         params = voice_registry.ElevenLabsParams(voice_id=voice_id)
         try:
             _, _, audio = await elevenlabs.fetch("Проверка голоса.", params)
@@ -415,7 +415,7 @@ class SynthesisPipelineMixin:
         On success the second tuple member is the new reference_id. On a
         post-creation failure the error includes the id so it can be recovered.
         """
-        fish = getattr(self.tts_dispatcher, "fish", None)
+        fish = self.tts_dispatcher.provider_for("fish")
         if fish is None:
             return False, "Fish Audio не настроен (нет FISH_API_KEY)."
         try:
@@ -492,15 +492,7 @@ class SynthesisPipelineMixin:
         return (
             config.TTS_STREAMING_ENABLED
             and voice is not None
-            and (
-                (getattr(voice, "is_minimax", False) and self.tts_dispatcher.cloud is not None)
-                or (getattr(voice, "is_fish", False) and self.tts_dispatcher.fish is not None)
-                or (getattr(voice, "is_gemini", False) and self.tts_dispatcher.gemini is not None)
-                or (
-                    getattr(voice, "is_elevenlabs", False)
-                    and getattr(self.tts_dispatcher, "elevenlabs", None) is not None
-                )
-            )
+            and self.tts_dispatcher.provider_for(getattr(voice, "provider", None)) is not None
         )
 
     # ------------------------------------------------------------------
@@ -610,7 +602,7 @@ class SynthesisPipelineMixin:
 
     async def _generate_stream_into(self, prepared: PreparedAudio, voice) -> str:
         job = prepared.job
-        cb = self.tts_dispatcher.circuit_breaker
+        cb = self.tts_dispatcher.breaker_for("minimax")
         cache = self.tts_dispatcher.cache
         if cache is not None:
             cached = cache.lookup(job.text, voice_cache_key(voice))
@@ -641,8 +633,8 @@ class SynthesisPipelineMixin:
 
     async def _generate_fish_stream_into(self, prepared: PreparedAudio, voice) -> str:
         job = prepared.job
-        fish_cfg = self.tts_dispatcher.fish.config
-        cb = self.tts_dispatcher.fish_circuit_breaker
+        fish_cfg = self.tts_dispatcher.provider_for("fish").config
+        cb = self.tts_dispatcher.breaker_for("fish")
         cache = self.tts_dispatcher.cache
         ogg_cache_key = fish_cfg.cache_key(voice.fish.reference_id, voice.fish)
         # Pitch is applied by ffmpeg, so only pitch 0 can skip decoding.
@@ -688,8 +680,8 @@ class SynthesisPipelineMixin:
         both for a cache hit and for a live response.
         """
         job = prepared.job
-        gemini = self.tts_dispatcher.gemini
-        cb = self.tts_dispatcher.gemini_circuit_breaker
+        gemini = self.tts_dispatcher.provider_for("gemini")
+        cb = self.tts_dispatcher.breaker_for("gemini")
         cache = self.tts_dispatcher.cache
         cache_key = gemini.config.cache_key(voice.gemini)
         if cache is not None:
@@ -729,9 +721,9 @@ class SynthesisPipelineMixin:
         unless the Opus packets turn out not to be 20 ms.
         """
         job = prepared.job
-        elevenlabs = self.tts_dispatcher.elevenlabs
+        elevenlabs = self.tts_dispatcher.provider_for("elevenlabs")
         cfg = elevenlabs.config
-        cb = self.tts_dispatcher.elevenlabs_circuit_breaker
+        cb = self.tts_dispatcher.breaker_for("elevenlabs")
         cache = self.tts_dispatcher.cache
         params = voice.elevenlabs
         cache_key = cfg.cache_key(params)
@@ -787,7 +779,7 @@ class SynthesisPipelineMixin:
         """
         job = prepared.job
         return await self._stream_pcm_to_channel(
-            prepared, voice, lambda: self.tts_dispatcher.gemini.open_stream(job.text, voice.gemini),
+            prepared, voice, lambda: self.tts_dispatcher.provider_for("gemini").open_stream(job.text, voice.gemini),
             cache_key,
             budget=config.GEMINI_TTFA_TIMEOUT + config.GEMINI_TTFA_PER_CHAR * len(job.text),
             label="Gemini", volume_db=voice.gemini.volume_db,
@@ -945,7 +937,7 @@ class SynthesisPipelineMixin:
     async def _stream_to_channel(self, prepared: PreparedAudio, voice) -> tuple[str, int]:
         """Stream MiniMax MP3 into the shared incremental decoder."""
         mm = voice.minimax
-        agen = self.tts_dispatcher.cloud.stream_audio(
+        agen = self.tts_dispatcher.provider_for("minimax").stream_audio(
             prepared.job.text, voice_id=mm.voice_id, model=mm.model, speed=mm.speed,
             vol=mm.vol, pitch=mm.pitch, emotion=mm.emotion, language_boost=mm.language_boost,
         )
@@ -957,7 +949,7 @@ class SynthesisPipelineMixin:
         self, prepared: PreparedAudio, voice, ogg_cache_key: str, *, request_config=None,
     ) -> tuple[str, int]:
         """Fish Ogg/Opus into the shared direct-packet path."""
-        agen = self.tts_dispatcher.fish.stream_audio(
+        agen = self.tts_dispatcher.provider_for("fish").stream_audio(
             prepared.job.text, reference_id=voice.fish.reference_id, params=voice.fish,
             request_config=request_config,
         )
@@ -1117,7 +1109,7 @@ class SynthesisPipelineMixin:
         self, prepared: PreparedAudio, voice, cache_key: str, *, request_config=None,
     ) -> tuple[str, int]:
         """Stream Fish Ogg/Opus into the shared incremental decoder."""
-        agen = self.tts_dispatcher.fish.stream_audio(
+        agen = self.tts_dispatcher.provider_for("fish").stream_audio(
             prepared.job.text, reference_id=voice.fish.reference_id, params=voice.fish,
             request_config=request_config,
         )
