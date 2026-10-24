@@ -1208,7 +1208,7 @@ def build_commands(bot):
             )
         else:
             embed.add_field(name="Кэш", value="выключен", inline=False)
-        embed.add_field(name="Очередь", value=str(bot.message_queue.qsize()), inline=True)
+        embed.add_field(name="Очередь", value=str(bot.queue_size()), inline=True)
         def _cb_state(breaker) -> str:
             if breaker is None:
                 return "—"
@@ -1393,7 +1393,7 @@ def build_commands(bot):
                 [
                     f"Enabled: `{guild_config.enabled}`",
                     f"Voice channel: `{channel_name}`",
-                    f"Queue: `{bot.message_queue.qsize()}`",
+                    f"Queue: `{bot.queue_size(interaction.guild.id)}`",
                     f"Default voice: `{guild_config.default_voice}`",
                     f"Allowed users: `{len(guild_config.allowed_users)}`",
                     "Workers: " + (", ".join(

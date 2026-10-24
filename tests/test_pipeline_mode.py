@@ -23,10 +23,11 @@ class OnePipelineTests(unittest.IsolatedAsyncioTestCase):
         tts_bot.tree.sync = AsyncMock(return_value=[])
         await tts_bot.setup_hook()
         try:
+            self.assertNotIn("tts-worker", set(tts_bot.supervisor.status()))
+            tts_bot.session_for(1)  # a guild's first message starts its workers
             names = set(tts_bot.supervisor.status())
-            self.assertIn("tts-generation", names)
-            self.assertIn("tts-playback", names)
-            self.assertNotIn("tts-worker", names)
+            self.assertIn("tts-generation:1", names)
+            self.assertIn("tts-playback:1", names)
         finally:
             await tts_bot.supervisor.stop_all()
 

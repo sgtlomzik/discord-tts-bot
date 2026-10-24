@@ -477,18 +477,18 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         guild_two = types.SimpleNamespace(id=2)
         channel_one = types.SimpleNamespace(id=10, guild=guild_one)
         channel_two = types.SimpleNamespace(id=20, guild=guild_two)
-        await tts_bot.message_queue.put(
+        await tts_bot.session_for(1).queue.put(
             bot_mod.TTSJob("one", channel_one, 0.0, 100, 1, 1000, "piper-ruslan")
         )
-        await tts_bot.message_queue.put(
+        await tts_bot.session_for(2).queue.put(
             bot_mod.TTSJob("two", channel_two, 0.0, 200, 2, 2000, "piper-ruslan")
         )
 
         removed = tts_bot.clear_queue_for_guild(1)
-        kept = await tts_bot.message_queue.get()
 
         self.assertEqual(removed, 1)
-        self.assertEqual(kept.guild_id, 2)
+        self.assertEqual(tts_bot.queue_size(1), 0)
+        self.assertEqual((await tts_bot.session_for(2).queue.get()).guild_id, 2)
 
     async def test_enqueue_tts_uses_piper_ruslan_profile(self):
         bot_mod = load_bot_module()
@@ -501,7 +501,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         await tts_bot.enqueue_tts("hello", voice_channel, 300, 400)
 
-        job = await tts_bot.message_queue.get()
+        job = await tts_bot.session_for(guild.id).queue.get()
         self.assertEqual(job.voice_profile, "piper-ruslan")
 
     async def test_slash_tts_test_responds_before_enqueueing_audio(self):
