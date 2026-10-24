@@ -11,32 +11,26 @@ an empty list means no fallback at all.
 This module owns the **catalog** of available voices — what voices exist
 and how to drive each engine. It is deliberately separate from the
 **selection** state (per-guild default + per-user override), which lives
-in the existing ``BotConfigStore`` (``data/config.json``). Never store
+in the existing ``BotConfigStore``. Never store
 ``active_voice``/default/per-user assignments here.
 
-The catalog persists in ``data/voices.json`` (the ``./data`` directory is
-a mounted volume that survives container rebuilds). Writes are atomic
-(temp file + ``os.replace``).
+The catalog persists in the ``voices`` and ``voice_catalog`` tables of
+``data/state.db`` (``ttsbot.statedb``), saved in one transaction.
 
-On first start the file does not exist; ``load_or_seed`` migrates the
-current hardcoded ``VOICE_PROFILES`` (all Piper) plus one MiniMax record
-seeded from ``MINIMAX_VOICE_ID`` (if set) into a fresh catalog. After the
-upgrade, behavior is identical: the same Piper profile names remain valid,
-so existing selection state keeps resolving.
+On first start there is no catalog; ``load_or_seed`` builds one from the
+hardcoded ``VOICE_PROFILES`` (all Piper) plus one MiniMax record seeded
+from ``MINIMAX_VOICE_ID`` (if set). A ``voices.json`` of an earlier version
+is imported before that (``statedb.import_json_state``).
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
-import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 
-from ttsbot.statefile import StateFileError, read_json_object
+from ttsbot.statefile import StateFileError
 
 log = logging.getLogger("tts_bot.registry")
 
@@ -385,7 +379,7 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
     if provider not in (
         PROVIDER_PIPER, PROVIDER_MINIMAX, PROVIDER_FISH, PROVIDER_GEMINI, PROVIDER_ELEVENLABS,
     ):
-        log.warning("voices.json: skipping %r with unknown provider %r", name, provider)
+        log.warning("Voice catalog: skipping %r with unknown provider %r", name, provider)
         return None
     label = str(d.get("label", name) or name)
     description = str(d.get("description", "") or "")
@@ -400,16 +394,16 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
         if provider == PROVIDER_ELEVENLABS else None
     )
     if provider == PROVIDER_MINIMAX and not (minimax and minimax.voice_id):
-        log.warning("voices.json: skipping minimax voice %r with no voice_id", name)
+        log.warning("Voice catalog: skipping minimax voice %r with no voice_id", name)
         return None
     if provider == PROVIDER_FISH and not (fish and fish.reference_id):
-        log.warning("voices.json: skipping fish voice %r with no reference_id", name)
+        log.warning("Voice catalog: skipping fish voice %r with no reference_id", name)
         return None
     if provider == PROVIDER_GEMINI and not (gemini and gemini.voice):
-        log.warning("voices.json: skipping gemini voice %r with no voice", name)
+        log.warning("Voice catalog: skipping gemini voice %r with no voice", name)
         return None
     if provider == PROVIDER_ELEVENLABS and not (elevenlabs and elevenlabs.voice_id):
-        log.warning("voices.json: skipping elevenlabs voice %r with no voice_id", name)
+        log.warning("Voice catalog: skipping elevenlabs voice %r with no voice_id", name)
         return None
     return VoiceRecord(
         name=name,
@@ -462,31 +456,24 @@ def registry_from_dict(data: dict) -> Optional[VoiceRegistry]:
 # ---------------------------------------------------------------------------
 
 
-def load_registry(path: Path) -> Optional[VoiceRegistry]:
-    """Load the catalog from disk, or None if there is no file.
+def load_registry(db) -> Optional[VoiceRegistry]:
+    """The saved catalog, or None if none was saved yet.
 
-    A file that cannot be used raises StateFileError: reseeding would
+    A catalog that cannot be used raises StateFileError: reseeding would
     overwrite every cloud voice and the fallback chain.
     """
-    data = read_json_object(path)
+    data = db.load_voice_catalog()
     if data is None:
         return None
     reg = registry_from_dict(data)
     if reg is None:
-        raise StateFileError(f"{path} has an invalid structure (\"voices\" must be an object)")
+        raise StateFileError(f"{db.path}: the voice catalog has an invalid structure")
     return reg
 
 
-def save_registry(path: Path, reg: VoiceRegistry) -> None:
-    """Atomically write the catalog (temp file + os.replace)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=str(path.parent), delete=False
-    ) as tmp:
-        json.dump(registry_to_dict(reg), tmp, ensure_ascii=False, indent=2)
-        tmp.write("\n")
-        tmp_path = Path(tmp.name)
-    os.replace(tmp_path, path)
+def save_registry(db, reg: VoiceRegistry) -> None:
+    """Save the catalog in one transaction."""
+    db.save_voice_catalog(registry_to_dict(reg))
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +536,7 @@ def seed_registry(
 
 
 def load_or_seed(
-    path: Path,
+    db,
     piper_profiles: dict,
     *,
     fallback_profile: str,
@@ -557,16 +544,12 @@ def load_or_seed(
     minimax_model: str = "speech-2.8-turbo",
     minimax_language_boost: str = "Russian",
 ) -> VoiceRegistry:
-    """Load the catalog if present; otherwise seed from current config + save.
-
-    The seeded catalog is written back so the next start is a plain load and
-    operators can hand-edit the file.
-    """
-    existing = load_registry(path)
+    """Load the catalog if one was saved; otherwise seed one and save it."""
+    existing = load_registry(db)
     if existing is not None:
         log.info(
-            "Voice registry loaded path=%s voices=%d fallback=%s",
-            path, len(existing.voices), existing.fallback_profile,
+            "Voice registry loaded from %s voices=%d fallback=%s",
+            db.path, len(existing.voices), existing.fallback_profile,
         )
         return existing
 
@@ -577,26 +560,9 @@ def load_or_seed(
         minimax_model=minimax_model,
         minimax_language_boost=minimax_language_boost,
     )
-    # Persist the seed only when the data directory already exists (the
-    # container's mounted ./data volume). On a host import where the path
-    # parent is absent (e.g. unit tests importing bot.py with the default
-    # /app/data path), keep the registry in-memory rather than creating
-    # stray directories on the host filesystem.
-    if path.parent.exists():
-        try:
-            save_registry(path, seeded)
-            log.info(
-                "Voice registry seeded path=%s voices=%s fallback=%s minimax_seed=%s",
-                path, seeded.names(), seeded.fallback_profile,
-                minimax_voice_id or "none",
-            )
-        except OSError:
-            log.exception(
-                "Failed to persist seeded voices.json at %s (continuing in-memory)", path
-            )
-    else:
-        log.info(
-            "Voice registry seeded in-memory (data dir %s absent); voices=%s fallback=%s",
-            path.parent, seeded.names(), seeded.fallback_profile,
-        )
+    save_registry(db, seeded)
+    log.info(
+        "Voice registry seeded in %s voices=%s fallback=%s minimax_seed=%s",
+        db.path, seeded.names(), seeded.fallback_profile, minimax_voice_id or "none",
+    )
     return seeded

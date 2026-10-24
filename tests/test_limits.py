@@ -79,33 +79,6 @@ class FrameLimitMathTests(unittest.TestCase):
         self.assertEqual(len(out), 100)
 
 
-class MaxCharsSettingTests(unittest.TestCase):
-    def test_set_tts_max_chars_applies_and_persists(self):
-        bot_mod = load_bot_module()
-        store = temp_config_store(bot_mod)
-        store.set_tts_max_chars(800)
-        self.assertEqual(bot_mod.config.TTS_MAX_CHARS, 800)
-        # the hard normalization ceiling must not silently undercut the limit
-        self.assertGreaterEqual(bot_mod.config.MAX_TEXT_LENGTH, 800)
-
-        # a fresh store from the same file re-applies the override
-        bot_mod.config.reload()
-        self.assertNotEqual(bot_mod.config.TTS_MAX_CHARS, 800)
-        reloaded = bot_mod.BotConfigStore(store.path, set())
-        self.assertEqual(reloaded.settings.get("tts_max_chars"), 800)
-        self.assertEqual(bot_mod.config.TTS_MAX_CHARS, 800)
-        bot_mod.config.reload()
-
-    def test_lowering_limit_does_not_lower_hard_ceiling(self):
-        bot_mod = load_bot_module()
-        store = temp_config_store(bot_mod)
-        original_ceiling = bot_mod.config.MAX_TEXT_LENGTH
-        store.set_tts_max_chars(100)
-        self.assertEqual(bot_mod.config.TTS_MAX_CHARS, 100)
-        self.assertEqual(bot_mod.config.MAX_TEXT_LENGTH, original_ceiling)
-        bot_mod.config.reload()
-
-
 class SlashLimitCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_slash_limit_sets_and_reports(self):
         bot_mod = load_bot_module()
@@ -119,7 +92,7 @@ class SlashLimitCommandTests(unittest.IsolatedAsyncioTestCase):
             bot_mod.tts_commands, "require_bot_owner", AsyncMock(return_value=True)
         ):
             await bot_mod.slash_tts_limit.callback(interaction, 700)
-        self.assertEqual(bot_mod.config.TTS_MAX_CHARS, 700)
+        self.assertEqual(bot_mod.bot.config_store.max_chars(), 700)
         msg = interaction.response.send_message.await_args.args[0]
         self.assertIn("700", msg)
 

@@ -527,7 +527,7 @@ def build_commands(bot):
         try:
             bot.persist_voice_registry()
         except OSError as exc:
-            log.exception("Failed to persist voices.json after voice-add")
+            log.exception("Failed to save the voice catalog after voice-add")
             await interaction.followup.send(
                 f"Голос проверен, но не сохранён на диск: {exc}", ephemeral=True
             )
@@ -683,7 +683,7 @@ def build_commands(bot):
         try:
             bot.persist_voice_registry()
         except OSError as exc:
-            log.exception("Failed to persist voices.json after voice-describe")
+            log.exception("Failed to save the voice catalog after voice-describe")
             await interaction.response.send_message(
                 f"Не удалось сохранить: {exc}", ephemeral=True
             )
@@ -870,7 +870,7 @@ def build_commands(bot):
         try:
             bot.persist_voice_registry()
         except OSError as exc:
-            log.exception("Failed to persist voices.json after voice-tune")
+            log.exception("Failed to save the voice catalog after voice-tune")
             await interaction.response.send_message(
                 f"Не удалось сохранить: {exc}", ephemeral=True
             )
@@ -918,7 +918,7 @@ def build_commands(bot):
             bot.persist_voice_registry()
         except OSError as exc:
             bot.voice_registry.add(rec)
-            log.exception("Failed to persist voices.json after voice-tune")
+            log.exception("Failed to save the voice catalog after voice-tune")
             await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
             return
 
@@ -1128,7 +1128,7 @@ def build_commands(bot):
             reg.fallback_chain = previous_chain
             if previous_record is not None:
                 reg.add(previous_record)
-            log.exception("Failed to persist voices.json after changing the fallback chain")
+            log.exception("Failed to save the voice catalog after changing the fallback chain")
             await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
             return
         log.info("Fallback chain changed voice=%s chain=%s", record.name if record else "*", names)
@@ -1269,7 +1269,7 @@ def build_commands(bot):
         cache_on = getattr(bot.tts_dispatcher, "cache", None) is not None
         embed = discord.Embed(title="⚙️ TTS • Настройки", color=0x57F287)
         embed.add_field(name="Кэш", value="вкл" if cache_on else "выкл", inline=True)
-        embed.add_field(name="Лимит символов", value=str(config.TTS_MAX_CHARS), inline=True)
+        embed.add_field(name="Лимит символов", value=str(bot.config_store.max_chars()), inline=True)
         embed.add_field(name="Fish latency", value=f"`{bot.fish_latency}`", inline=True)
         if config.TTS_AUDIO_LIMIT_ENABLED:
             audio_limit = (
@@ -1457,13 +1457,13 @@ def build_commands(bot):
             return
         if chars is None:
             await interaction.response.send_message(
-                f"Текущий лимит: `{config.TTS_MAX_CHARS}` символов на сообщение.",
+                f"Текущий лимит: `{bot.config_store.max_chars()}` символов на сообщение.",
                 ephemeral=True,
             )
             return
         bot.config_store.set_tts_max_chars(int(chars))
         await interaction.response.send_message(
-            f"Лимит длины текста: `{config.TTS_MAX_CHARS}` символов на сообщение. "
+            f"Лимит длины текста: `{bot.config_store.max_chars()}` символов на сообщение. "
             "Более длинные сообщения будут обрезаться.",
             ephemeral=True,
         )

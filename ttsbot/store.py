@@ -1,23 +1,19 @@
-"""Persistent per-guild settings (data/config.json).
+"""Persistent per-guild settings (the guilds, emoji_aliases and settings
+tables of data/state.db, see ttsbot.statedb).
 
 BotConfigStore keeps the enable flag, allowed users, default and per-user
-voices, per-user fixed phrases and custom-emoji pronunciation aliases.
-Plain JSON on disk, written atomically — intentionally not a database.
+voices, per-user fixed phrases, custom-emoji pronunciation aliases and the
+settings changed at runtime. It works on memory and saves everything in
+one transaction after each change.
 """
 
 import copy
-import json
 import logging
-import tempfile
-from pathlib import Path
 
 from ttsbot import config
 from ttsbot.models import GuildConfig, VOICE_PROFILES
-from ttsbot.statefile import StateFileError, read_json_object
 
 log = logging.getLogger("tts_bot")
-
-SCHEMA_VERSION = 1
 
 
 def _as_dict(value: object) -> dict:
@@ -35,8 +31,8 @@ def _as_bool(value: object, default: bool = True) -> bool:
 
 
 class BotConfigStore:
-    def __init__(self, path: Path, fallback_users: set[int], voice_registry=None) -> None:
-        self.path = path
+    def __init__(self, db, fallback_users: set[int], voice_registry=None) -> None:
+        self.db = db  # ttsbot.statedb.StateDB
         self.fallback_users = set(fallback_users)
         # Validate stored voice names against the unified registry when
         # available (so MiniMax assignments survive reload); otherwise fall
@@ -76,16 +72,9 @@ class BotConfigStore:
         return fallback if fallback and self._is_valid_voice(fallback) else config.DEFAULT_VOICE_PROFILE
 
     def load(self) -> None:
-        # A damaged file stops startup (StateFileError) instead of being
-        # replaced by defaults on the next save.
-        data = read_json_object(self.path)
-        if data is None:
-            return
-        version = data.get("version", SCHEMA_VERSION)
-        if not isinstance(version, int) or version > SCHEMA_VERSION:
-            raise StateFileError(
-                f"{self.path} has schema version {version!r}; this build reads up to {SCHEMA_VERSION}"
-            )
+        # Values are checked as they are read: the rows may come from a
+        # hand-edited config.json of an earlier version (statedb import).
+        data = self.db.load_config()
 
         guilds = _as_dict(data.get("guilds"))
         for guild_id_raw, raw_config in guilds.items():
@@ -149,22 +138,14 @@ class BotConfigStore:
             elevenlabs_key = raw_settings.get("elevenlabs_key")
             if isinstance(elevenlabs_key, str) and elevenlabs_key:
                 self.settings["elevenlabs_key"] = elevenlabs_key
-        self._apply_settings()
 
-    def _apply_settings(self) -> None:
-        """Push stored overrides into the live config module."""
-        max_chars = self.settings.get("tts_max_chars")
-        if isinstance(max_chars, int) and max_chars > 0:
-            config.TTS_MAX_CHARS = max_chars
-            # TTS_MAX_CHARS is enforced at the enqueue boundary, but
-            # MAX_TEXT_LENGTH is a hard ceiling deeper in normalization —
-            # lift it so the requested limit actually takes effect.
-            if config.MAX_TEXT_LENGTH < max_chars:
-                config.MAX_TEXT_LENGTH = max_chars
+    def max_chars(self) -> int:
+        """The per-message character cap: /voicebot limit, else TTS_MAX_CHARS."""
+        value = self.settings.get("tts_max_chars")
+        return value if isinstance(value, int) and value > 0 else config.TTS_MAX_CHARS
 
     def set_tts_max_chars(self, value: int) -> None:
         self.settings["tts_max_chars"] = int(value)
-        self._apply_settings()
         self.save()
 
     def set_fish_latency(self, mode: str) -> None:
@@ -192,9 +173,7 @@ class BotConfigStore:
         self._saved = self._snapshot()
 
     def _write(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
-            "version": SCHEMA_VERSION,
             "guilds": {
                 str(guild_id): {
                     "enabled": config.enabled,
@@ -217,16 +196,7 @@ class BotConfigStore:
             },
             "settings": dict(sorted(self.settings.items())),
         }
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=str(self.path.parent),
-            delete=False,
-        ) as tmp_file:
-            json.dump(data, tmp_file, ensure_ascii=False, indent=2)
-            tmp_file.write("\n")
-            tmp_path = Path(tmp_file.name)
-        tmp_path.replace(self.path)
+        self.db.save_config(data)
 
     def get_guild(self, guild_id: int) -> GuildConfig:
         config = self.guilds.get(guild_id)

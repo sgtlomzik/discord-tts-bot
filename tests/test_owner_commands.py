@@ -39,12 +39,12 @@ class OwnerOnlyTests(unittest.IsolatedAsyncioTestCase):
         self.bot = self.bot_mod.bot
         self.bot.config_store = temp_config_store(self.bot_mod)
         self.bot.is_owner = AsyncMock(return_value=False)
-        self.limit_before = self.bot_mod.config.TTS_MAX_CHARS
+        self.limit_before = self.bot.config_store.max_chars()
 
     async def test_a_guild_manager_cannot_change_the_global_limit(self):
         interaction = _interaction(_manager())
         await self.bot_mod.slash_tts_limit.callback(interaction, 777)
-        self.assertEqual(self.bot_mod.config.TTS_MAX_CHARS, self.limit_before)
+        self.assertEqual(self.bot.config_store.max_chars(), self.limit_before)
         text = interaction.response.send_message.call_args.args[0]
         self.assertIn("владелец", text)
 
@@ -52,13 +52,13 @@ class OwnerOnlyTests(unittest.IsolatedAsyncioTestCase):
         self.bot.is_owner = AsyncMock(return_value=True)
         interaction = _interaction(_manager())
         await self.bot_mod.slash_tts_limit.callback(interaction, 777)
-        self.assertEqual(self.bot_mod.config.TTS_MAX_CHARS, 777)
+        self.assertEqual(self.bot.config_store.max_chars(), 777)
 
     async def test_owner_ids_from_the_environment_count_too(self):
         self.bot_mod.config.OWNER_IDS = {7}
         interaction = _interaction(_manager(7))
         await self.bot_mod.slash_tts_limit.callback(interaction, 555)
-        self.assertEqual(self.bot_mod.config.TTS_MAX_CHARS, 555)
+        self.assertEqual(self.bot.config_store.max_chars(), 555)
 
     async def test_global_voice_commands_are_owner_only(self):
         for name, args in [

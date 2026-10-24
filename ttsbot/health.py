@@ -20,7 +20,7 @@ kind decides the pause:
   cannot is probed by a real request after 30 min, 1 h, 2 h ... 24 h.
 - AUTH: the key is invalid. Same schedule as QUOTA, starting at 1 h.
 
-Breaker state survives restarts in ``data/provider_health.json``
+Breaker state survives restarts in ``data/state.db`` (``provider_health``)
 (``HealthStore``), keyed by provider with a fingerprint of its keys: a
 changed key starts from a clean state.
 """
@@ -28,14 +28,10 @@ changed key starts from a clean state.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import os
-import tempfile
 import time
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Callable, Optional
 
 from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
@@ -492,22 +488,14 @@ def format_duration(seconds: float) -> str:
 
 
 class HealthStore:
-    """Breaker snapshots in one JSON file, written atomically on change."""
+    """Breaker snapshots in the state database, saved on every change."""
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._data: dict[str, dict] = {}
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict) and isinstance(raw.get("breakers"), dict):
-                self._data = {str(k): v for k, v in raw["breakers"].items() if isinstance(v, dict)}
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError):
-            log.warning("Ignoring unreadable %s", path, exc_info=True)
+    def __init__(self, db) -> None:
+        self.db = db  # ttsbot.statedb.StateDB
+        self._data: dict[str, dict] = db.load_health()
 
     def bind(self, key: str, breaker: CircuitBreaker, fingerprint: str = "") -> None:
-        """Restore ``breaker`` from the file and save it on every change.
+        """Restore ``breaker`` from the database and save it on every change.
 
         A snapshot taken with other credentials (``fingerprint``) is dropped.
         """
@@ -520,26 +508,10 @@ class HealthStore:
             else:
                 log.info("Credentials of %s changed; forgetting its saved health", key)
                 self._data.pop(key, None)
+                self.db.forget_health(key)
 
         def save(changed: CircuitBreaker) -> None:
             self._data[key] = {**changed.to_dict(), "fingerprint": fingerprint}
-            self._write()
+            self.db.save_health(key, self._data[key])
 
         breaker.on_change = save
-
-    def _write(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 1, "breakers": dict(sorted(self._data.items()))}
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=str(self.path.parent), delete=False, suffix=".tmp",
-        ) as tmp:
-            try:
-                json.dump(payload, tmp, ensure_ascii=False, indent=2)
-                tmp.write("\n")
-                tmp.flush()
-                os.fsync(tmp.fileno())
-            except BaseException:
-                tmp.close()
-                os.unlink(tmp.name)
-                raise
-        os.replace(tmp.name, self.path)

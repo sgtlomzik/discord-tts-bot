@@ -34,9 +34,10 @@ from ttsbot.voice_registry import (
 )
 from ttsbot.streams import StreamSpec
 from ttsbot.session import GuildSession
+from ttsbot.statedb import StateDB
 from support import with_spec
-from scripts.migrate_fish_default import migrate
 from test_bot import load_bot_module
+from support import state_from
 
 
 class _TwoChunkStream(httpx.AsyncByteStream):
@@ -53,14 +54,14 @@ class FishProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_default_voice_tuning_survives_bot_restart(self):
         from ttsbot.core import TTSBot
 
-        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "VOICES_REGISTRY_PATH", Path(tmp) / "voices.json"), \
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "STATE_DB_PATH", Path(tmp) / "state.db"), \
                 patch.object(config, "BOT_CONFIG_PATH", Path(tmp) / "config.json"), \
                 patch.dict(os.environ, {"FISH_API_KEY": "test-key", "FISH_REFERENCE_ID": "voice-id", "TTS_CACHE_ENABLED": "0"}):
             first = TTSBot()
             try:
                 original = first.voice_registry.get("fish-default")
                 first.voice_registry.add(replace(original, fish=replace(original.fish, speed=1.4)))
-                save_registry(config.VOICES_REGISTRY_PATH, first.voice_registry)
+                save_registry(first.state_db, first.voice_registry)
                 first.set_fish_latency("balanced")
                 second = TTSBot()
                 try:
@@ -268,28 +269,6 @@ class FishProviderTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FishCacheTests(unittest.TestCase):
-    def test_migration_preserves_whitelist_and_other_settings(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.json"
-            original = {
-                "version": 1,
-                "guilds": {"123": {"enabled": True, "allowed_users": [1, 2],
-                                    "default_voice": "bussshy01", "user_voices": {"1": "papich"},
-                                    "user_fixed_phrases": {"2": "Привет"}}},
-                "emoji_aliases": {"456": {"name": "smile", "say": "улыбка"}},
-                "settings": {"tts_max_chars": 300},
-            }
-            path.write_text(json.dumps(original), encoding="utf-8")
-            changed, cleared, backup = migrate(path)
-            self.assertEqual((changed, cleared), (1, 1))
-            self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), original)
-            updated = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(updated["guilds"]["123"]["default_voice"], "fish-default")
-            self.assertEqual(updated["guilds"]["123"]["user_voices"], {})
-            self.assertEqual(updated["guilds"]["123"]["allowed_users"], [1, 2])
-            self.assertEqual(updated["guilds"]["123"]["user_fixed_phrases"], {"2": "Привет"})
-            self.assertEqual(updated["emoji_aliases"], original["emoji_aliases"])
-
     def test_cache_key_changes_with_reference_model_and_tuning(self):
         cfg = FishConfig(api_key="ignored")
         self.assertEqual(cfg.latency, "low")
@@ -335,9 +314,9 @@ class FishCacheTests(unittest.TestCase):
 class FishLatencyCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_store_rejects_invalid_mode_and_rolls_back_failed_save(self):
         with tempfile.TemporaryDirectory() as tmp:
-            store = BotConfigStore(Path(tmp) / "config.json", set())
+            store = BotConfigStore(state_from(Path(tmp) / "config.json"), set())
             store.set_fish_latency("normal")
-            self.assertEqual(BotConfigStore(store.path, set()).settings["fish_latency"], "normal")
+            self.assertEqual(BotConfigStore(store.db, set()).settings["fish_latency"], "normal")
             with self.assertRaises(ValueError):
                 store.set_fish_latency("fastest")
             with patch.object(store, "_write", side_effect=OSError("disk full")):
@@ -350,7 +329,7 @@ class FishLatencyCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
             "BOT_CONFIG_PATH": str(Path(tmp) / "config.json"),
-            "VOICES_REGISTRY_PATH": str(Path(tmp) / "voices.json"),
+            "STATE_DB_PATH": str(Path(tmp) / "state.db"),
             "FISH_API_KEY": "test-key", "FISH_REFERENCE_ID": "voice-id",
             "FISH_LATENCY": "low", "TTS_CACHE_ENABLED": "0",
         }):
@@ -377,7 +356,7 @@ class FishLatencyCommandTests(unittest.IsolatedAsyncioTestCase):
                 original_key,
                 bot_mod.bot.tts_dispatcher.provider_for("fish").config.cache_key(voice.fish.reference_id, voice.fish),
             )
-            self.assertEqual(json.loads(Path(tmp, "config.json").read_text())["settings"]["fish_latency"], "balanced")
+            self.assertEqual(StateDB(Path(tmp, "state.db")).load_config()["settings"]["fish_latency"], "balanced")
             self.assertIn("balanced", sent[0])
             restarted = TTSBot()
             try:
@@ -752,13 +731,13 @@ class DefaultVoiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             with patch.object(config, "DEFAULT_VOICE_PROFILE", "piper-irina"):
-                store = BotConfigStore(path, set(), voice_registry=self._registry())
+                store = BotConfigStore(state_from(path), set(), voice_registry=self._registry())
                 self.assertEqual(store.get_guild(1).default_voice, "piper-irina")
             with patch.object(config, "DEFAULT_VOICE_PROFILE", "fish-default"):
-                store = BotConfigStore(path, set(), voice_registry=self._registry())
+                store = BotConfigStore(state_from(path), set(), voice_registry=self._registry())
                 self.assertEqual(store.get_guild(2).default_voice, "fish-default")
             with patch.object(config, "DEFAULT_VOICE_PROFILE", "no-such-voice"):
-                store = BotConfigStore(path, set(), voice_registry=self._registry())
+                store = BotConfigStore(state_from(path), set(), voice_registry=self._registry())
                 self.assertEqual(store.get_guild(3).default_voice, "piper-ruslan")
 
 

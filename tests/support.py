@@ -10,6 +10,7 @@ modules, the config module and the env-derived constants.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import types
 
@@ -19,6 +20,20 @@ from ttsbot import app, audio, config, models, store, textnorm, voice_registry
 from ttsbot import commands as tts_commands
 from ttsbot import events as tts_events
 from ttsbot.core import TTSBot, intents
+from ttsbot.statedb import StateDB, import_json_state
+
+
+# Each test bot keeps its state in its own in-memory database.
+os.environ.setdefault("STATE_DB_PATH", ":memory:")
+
+
+def state_from(config_path) -> StateDB:
+    """The state database in ``config_path``'s directory, with that
+    config.json (an earlier version's file) imported if it exists. Opening
+    it again gives the same state, as after a restart."""
+    db = StateDB(config_path.parent / "state.db")
+    import_json_state(db, config_path=config_path)
+    return db
 
 
 def with_spec(fake, cls):

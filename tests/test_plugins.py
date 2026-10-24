@@ -22,6 +22,7 @@ from ttsbot.minimax import MiniMaxProvider
 from ttsbot.models import VOICE_PROFILES
 from ttsbot.store import BotConfigStore
 from ttsbot.voice_registry import seed_registry
+from support import state_from
 
 NO_KEYS = {"MINIMAX_API_KEY": "", "FISH_API_KEY": "", "FISH_REFERENCE_ID": "", "OPENROUTER_API_KEY": "",
            "ELEVENLABS_API_KEY": "", "ELEVENLABS_API_KEYS": "", "ELEVENLABS_VOICE_ID": ""}
@@ -31,7 +32,7 @@ class PluginTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
-        self.store = BotConfigStore(Path(self.dir.name) / "config.json", set())
+        self.store = BotConfigStore(state_from(Path(self.dir.name) / "config.json"), set())
 
     def _providers(self, **env):
         with patch.dict(os.environ, {**NO_KEYS, **env}):

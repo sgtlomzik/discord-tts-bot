@@ -23,8 +23,10 @@ How the code is organised is described in [ARCHITECTURE.md](../ARCHITECTURE.md).
   (`.github/workflows/docker.yml`) publishes `latest` and `sha-<short sha>`
   for every push to `main`; production pins a `sha-` tag.
 - Runtime config: `.env` (untracked, mode 600).
-- State in `data/` (untracked): `config.json` (guild settings),
-  `voices.json` (voice catalog and fallback chain), `provider_health.json`,
+- State in `data/` (untracked): `state.db` (SQLite: guild settings,
+  voice catalog and fallback chain, provider pauses; the `config.json`,
+  `voices.json` and `provider_health.json` of earlier versions were
+  imported into it once and are no longer read),
   `tts_cache/`, `recordings/`.
 - Models: `models/` (Piper ONNX voices, read-only mount).
 
@@ -35,7 +37,7 @@ How the code is organised is described in [ARCHITECTURE.md](../ARCHITECTURE.md).
 - Guild default voice: `fish-default`; fallback chain
   `fish-default -> piper-ruslan`.
 - Health: one circuit breaker per cloud provider, persisted in
-  `data/provider_health.json`; `/fallback status` shows it.
+  `data/state.db`; `/fallback status` shows it.
 
 ## Deploying
 

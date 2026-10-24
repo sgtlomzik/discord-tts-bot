@@ -8,11 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 
 from support import load_bot_module  # noqa: E402,F401  (re-exported for other tests)
+from support import state_from
 
 
 def temp_config_store(bot_mod, fallback_users=None):
     tmp_dir = tempfile.TemporaryDirectory()
-    store = bot_mod.BotConfigStore(Path(tmp_dir.name) / "config.json", set(fallback_users or []))
+    store = bot_mod.BotConfigStore(state_from(Path(tmp_dir.name) / "config.json"), set(fallback_users or []))
     store._tmp_dir = tmp_dir
     return store
 
@@ -61,7 +62,7 @@ class TTSBotTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "config.json"
-            store = bot.BotConfigStore(path, {111})
+            store = bot.BotConfigStore(state_from(path), {111})
             config = store.get_guild(10)
 
             self.assertTrue(config.enabled)
@@ -73,7 +74,7 @@ class TTSBotTests(unittest.TestCase):
             store.set_default_voice(10, "piper-ruslan")
             store.set_user_voice(10, 222, "piper-ruslan")
 
-            loaded = bot.BotConfigStore(path, set())
+            loaded = bot.BotConfigStore(state_from(path), set())
             loaded_config = loaded.get_guild(10)
 
             self.assertFalse(loaded_config.enabled)
@@ -157,7 +158,7 @@ class TTSBotTests(unittest.TestCase):
         bot = load_bot_module()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            store = bot.BotConfigStore(Path(tmp_dir) / "config.json", set())
+            store = bot.BotConfigStore(state_from(Path(tmp_dir) / "config.json"), set())
             store.add_user(10, 222)
             store.set_user_voice(10, 222, "piper-ruslan")
             store.remove_user(10, 222)
@@ -171,13 +172,13 @@ class TTSBotTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "config.json"
-            store = bot.BotConfigStore(path, {111})
+            store = bot.BotConfigStore(state_from(path), {111})
 
             self.assertIsNone(store.fixed_phrase_for_user(10, 222))
 
             store.set_user_fixed_phrase(10, 222, "Бип-боп, это робот")
 
-            loaded = bot.BotConfigStore(path, set())
+            loaded = bot.BotConfigStore(state_from(path), set())
             self.assertEqual(loaded.fixed_phrase_for_user(10, 222), "Бип-боп, это робот")
 
             loaded.clear_user_fixed_phrase(10, 222)
@@ -187,7 +188,7 @@ class TTSBotTests(unittest.TestCase):
         bot = load_bot_module()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            store = bot.BotConfigStore(Path(tmp_dir) / "config.json", set())
+            store = bot.BotConfigStore(state_from(Path(tmp_dir) / "config.json"), set())
             store.add_user(10, 222)
             store.set_user_fixed_phrase(10, 222, "Заглушка")
             store.remove_user(10, 222)
@@ -205,7 +206,7 @@ class TTSBotTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            store = bot.BotConfigStore(path, set())
+            store = bot.BotConfigStore(state_from(path), set())
             config = store.get_guild(10)
 
             self.assertEqual(config.user_fixed_phrases, {333: "ok"})
@@ -220,7 +221,7 @@ class TTSBotTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            store = bot.BotConfigStore(path, set())
+            store = bot.BotConfigStore(state_from(path), set())
             config = store.get_guild(10)
 
             self.assertEqual(config.default_voice, bot.config.DEFAULT_VOICE_PROFILE)

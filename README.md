@@ -81,6 +81,7 @@ pip install -r requirements.txt
 
 cp .env.example .env                      # edit DISCORD_TOKEN, WHITELIST_USERS
 set -a; . ./.env; set +a                  # nothing loads .env for you outside Docker
+mkdir -p data                             # state.db goes here
 export PIPER_MODELS_DIR=./models BOT_CONFIG_PATH=./data/config.json
 python bot.py
 ```
@@ -121,7 +122,7 @@ If Fish sends no audio packet within `FISH_TTFA_TIMEOUT` seconds (response
 headers alone do not count), that message is spoken by the next voice of
 the fallback chain and a `Fish first audio exceeded` warning is logged.
 
-The fallback chain is a list of voice names in `data/voices.json`, set with
+The fallback chain is a list of voice names in the voice catalog, set with
 `/fallback set chain:fish-default,piper-ruslan` (for every voice) or
 with `voice:` for one voice. Without one, the Piper `fallback_profile`
 speaks. Each provider is paused according to why it failed: repeated
@@ -131,15 +132,10 @@ says it works again (ElevenLabs is checked at its quota reset time, others
 after `TTS_QUOTA_COOLDOWN_SECONDS`, doubling up to a day). Pauses survive
 restarts; `/fallback status` shows them and can reset one.
 
-To move an existing install to Fish in one step, stop the bot and run
-`python scripts/migrate_fish_default.py data/config.json`. It sets every
-guild's default voice to `fish-default`, clears per-user overrides and writes
-a timestamped backup next to `config.json`.
-
 `/voicebot voice-clone` creates a private Fish voice from an attached audio
 sample (any `audio/*` upload, or WAV/MP3/M4A/OGG/Opus/FLAC by extension; OGG
 covers Discord voice messages). The bot waits for training, checks a short TTS
-generation, then saves its `reference_id` in `data/voices.json`. Assign it
+generation, then saves its `reference_id` in the voice catalog. Assign it
 with `voice-set` or `voice-user`.
 Import a library voice with `/voicebot voice-fish-add name:my-voice
 reference_id:YOUR_ID`, then assign it with `/voicebot voice-user`.
@@ -147,7 +143,7 @@ reference_id:YOUR_ID`, then assign it with `/voicebot voice-user`.
 pitch, model, temperature, and top_p for each Fish voice. Set the global
 Fish latency mode in Discord with `/voicebot fish-latency mode:balanced`
 (`low`, `balanced`, or `normal`). Omit `mode` to show the current setting.
-The default is `low`; a Discord selection persists in `data/config.json`
+The default is `low`; a Discord selection persists in `data/state.db`
 across restarts and overrides `FISH_LATENCY` from `.env`. The mode is included
 in TTS cache keys. Pitch is applied
 locally by ffmpeg, so changing it reuses cached Fish audio, but it disables
@@ -183,7 +179,7 @@ last key comes the first. A message that is only longer than a key's
 remaining credits goes to the next key without moving the ring. When every
 key is empty, Piper speaks and ElevenLabs pauses for
 `TTS_QUOTA_COOLDOWN_SECONDS`. The active key survives restarts (its hash is
-kept in `data/config.json`), and `/voicebot stats` shows session credits
+kept in `data/state.db`), and `/voicebot stats` shows session credits
 per key. Cloned and Voice Library voices must exist in every account of the
 ring.
 

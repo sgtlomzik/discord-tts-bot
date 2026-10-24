@@ -83,6 +83,7 @@ pip install -r requirements.txt
 
 cp .env.example .env                      # заполните DISCORD_TOKEN, WHITELIST_USERS
 set -a; . ./.env; set +a                  # вне Docker .env никто не загружает за вас
+mkdir -p data                             # здесь будет state.db
 export PIPER_MODELS_DIR=./models BOT_CONFIG_PATH=./data/config.json
 python bot.py
 ```
@@ -130,15 +131,10 @@ HTTP 402, MiniMax коды 1008 и 2056), этот сервис отключае
 `TTS_QUOTA_COOLDOWN_SECONDS`; ограничение частоты запросов (HTTP 429,
 MiniMax код 1039) считается обычным сбоем.
 
-Чтобы разом перевести существующую установку на Fish, остановите бота и
-выполните `python scripts/migrate_fish_default.py data/config.json`. Скрипт
-ставит всем серверам голос `fish-default`, сбрасывает персональные голоса
-и сохраняет резервную копию рядом с `config.json`.
-
 `/voicebot voice-clone` создаёт приватный голос Fish из приложенного
 аудиофайла (любой файл с типом `audio/*` или WAV/MP3/M4A/OGG/Opus/FLAC по
 расширению; OGG — это голосовые сообщения Discord). Бот дожидается готовности модели, проверяет
-короткую генерацию и сохраняет новый `reference_id` в `data/voices.json`.
+короткую генерацию и сохраняет новый `reference_id` в каталоге голосов.
 Созданный профиль можно назначить через `voice-set` или `voice-user`.
 Готовый голос из библиотеки Fish можно добавить без клонирования:
 `/voicebot voice-fish-add name:my-voice reference_id:ID_ИЗ_FISH`, затем
@@ -150,7 +146,7 @@ emotion:happy pitch:2 volume_db:3`. Доступны также `model`, `temper
 и `top_p`. Общий для всех Fish-голосов режим задержки меняется в Discord:
 `/voicebot fish-latency mode:balanced` (варианты `low`, `balanced`, `normal`).
 Без `mode` команда показывает текущий режим. По умолчанию используется `low`;
-выбор в Discord сохраняется в `data/config.json`, переживает перезапуск и
+выбор в Discord сохраняется в `data/state.db`, переживает перезапуск и
 переопределяет `FISH_LATENCY` из `.env`. Режим учитывается в ключе TTS-кэша.
 Скорость, громкость, выразительность и режим задержки передаются в Fish API;
 высота тона меняется локально через ffmpeg: её смена не требует новых
@@ -186,7 +182,7 @@ Library требуют платного тарифа ElevenLabs; стандар�
 просто длиннее остатка ключа, уходит на следующий ключ без смены активного.
 Если пусты все ключи, говорит Piper, а ElevenLabs отдыхает
 `TTS_QUOTA_COOLDOWN_SECONDS`. Активный ключ переживает перезапуск (в
-`data/config.json` хранится его хэш), `/voicebot stats` показывает кредиты
+`data/state.db` хранится его хэш), `/voicebot stats` показывает кредиты
 за сессию по каждому ключу. Клоны и голоса из Voice Library должны быть в
 каждом аккаунте кольца.
 

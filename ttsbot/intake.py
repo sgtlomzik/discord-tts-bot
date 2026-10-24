@@ -34,7 +34,7 @@ class MessageQueueMixin:
         # cloud quotas from walls of text and keeps Piper CPU bounded.
         cleaned = normalize_for_tts(
             text,
-            max_chars=config.TTS_MAX_CHARS,
+            max_chars=self.config_store.max_chars(),
             emoji_aliases=self.config_store.emoji_say_map(),
         )
         if not cleaned:

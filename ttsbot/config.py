@@ -1,11 +1,11 @@
 """Environment-derived runtime configuration.
 
-All tunables live as UPPER_CASE module globals so the rest of the package
-(and the tests) can read *and mutate* them at call time via
+All tunables live as UPPER_CASE module globals, read at call time via
 ``config.NAME``. ``reload()`` re-reads everything from the environment;
-``bot.py`` calls it on every exec so each test module load starts from a
-clean, env-derived state (matching the old single-file behavior where
-re-executing bot.py re-parsed the environment).
+``app.create_bot()`` calls it, so each test's bot starts from a clean,
+env-derived state. Runtime code never assigns to these (a test enforces
+it): settings changed while the bot runs (``/voicebot limit``, Fish
+latency) live in ``BotConfigStore``.
 """
 
 import logging
@@ -67,7 +67,7 @@ def reload() -> None:
     global TTS_STREAM_TTFA_TIMEOUT
     global FISH_TTFA_TIMEOUT, GEMINI_TTFA_TIMEOUT, GEMINI_TTFA_PER_CHAR
     global ELEVENLABS_TTFA_TIMEOUT, TTS_CONNECTION_KEEPALIVE_SECONDS
-    global PROVIDER_HEALTH_PATH, TTS_HEALTH_CHECK_INTERVAL
+    global PROVIDER_HEALTH_PATH, TTS_HEALTH_CHECK_INTERVAL, STATE_DB_PATH
     global TTS_PREFETCH_LOOKAHEAD
     global TTS_IDLE_FRAME_MODE, TTS_IDLE_VOLUME_DB, TTS_STREAM_TAIL_MS
     global TTS_MAX_CONTINUOUS_IDLE_SECONDS, IDLE_DISCONNECT_SECONDS
@@ -91,65 +91,66 @@ def reload() -> None:
     global WEB_MAINTENANCE_SECONDS, WEB_PREBUILD_RECENT, WEB_ALLOW_ANONYMOUS
 
     TMP_DIR = Path(os.getenv("TTS_TMP_DIR", "/dev/shm"))
+    # The JSON state files of earlier versions, imported once into
+    # STATE_DB_PATH (ttsbot.statedb) and no longer written. BOT_CONFIG_PATH
+    # also names the data directory the other paths default into.
     BOT_CONFIG_PATH = Path(os.getenv("BOT_CONFIG_PATH", "/app/data/config.json"))
-    # Catalog of available voices (Piper + MiniMax). Lives in the mounted
-    # ./data volume next to config.json; seeded on first start. This is the
-    # CATALOG only — selection state stays in BotConfigStore/config.json.
     VOICES_REGISTRY_PATH = Path(
         os.getenv("VOICES_REGISTRY_PATH", str(BOT_CONFIG_PATH.parent / "voices.json"))
     )
     DEFAULT_VOICE_PROFILE = os.getenv("TTS_DEFAULT_VOICE_PROFILE", "piper-ruslan").strip()
 
     TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-    MAX_TEXT_LENGTH = int(os.getenv("TTS_MAX_TEXT_LENGTH", "500"))
+    MAX_TEXT_LENGTH = _number("TTS_MAX_TEXT_LENGTH", 500, int, 1)
     # Per-message character cap applied at the enqueue boundary, before
     # any provider is invoked. The spec recommends ~300 to protect the
-    # cloud API quota from accidental walls of text. Default 300; the
-    # legacy TTS_MAX_TEXT_LENGTH cap (500) is still the hard ceiling if
-    # this is unset/zero.
-    TTS_MAX_CHARS = int(os.getenv("TTS_MAX_CHARS", "300"))
-    QUEUE_MAXSIZE = int(os.getenv("TTS_QUEUE_MAXSIZE", "50"))
+    # cloud API quota from accidental walls of text. Default 300; 0 uses
+    # TTS_MAX_TEXT_LENGTH, so a message is always capped.
+    TTS_MAX_CHARS = _number("TTS_MAX_CHARS", 300, int, 0) or MAX_TEXT_LENGTH
+    QUEUE_MAXSIZE = _number("TTS_QUEUE_MAXSIZE", 50, int)
     # Budget for the FIRST audio chunk only. After the first chunk the stream
     # lives as long as it needs (long messages legitimately stream for seconds).
-    TTS_STREAM_TTFA_TIMEOUT = float(
-        os.getenv("TTS_STREAM_TTFA_TIMEOUT", os.getenv("TTS_REQUEST_TIMEOUT", "2.5"))
+    TTS_STREAM_TTFA_TIMEOUT = _number(
+        "TTS_STREAM_TTFA_TIMEOUT", _number("TTS_REQUEST_TIMEOUT", 2.5, float), float
     )
     # Fish needs its own budget: its first byte takes 0.5-2.3 s in production,
     # so the MiniMax-tuned 2.5 s silently dropped ~3% of Fish messages to Piper.
-    FISH_TTFA_TIMEOUT = max(0.5, float(os.getenv("FISH_TTFA_TIMEOUT", "5")))
+    FISH_TTFA_TIMEOUT = _number("FISH_TTFA_TIMEOUT", 5.0, float, 0.5)
     # OpenRouter sends Gemini audio only after the whole clip is generated
     # (~1.2 s + ~18 ms per character measured), so the first-audio budget
     # grows with the text: base + per_char * len(text).
-    GEMINI_TTFA_TIMEOUT = max(0.5, float(os.getenv("GEMINI_TTFA_TIMEOUT", "3")))
-    GEMINI_TTFA_PER_CHAR = max(0.0, float(os.getenv("GEMINI_TTFA_PER_CHAR", "0.03")))
+    GEMINI_TTFA_TIMEOUT = _number("GEMINI_TTFA_TIMEOUT", 3.0, float, 0.5)
+    GEMINI_TTFA_PER_CHAR = _number("GEMINI_TTFA_PER_CHAR", 0.03, float, 0.0)
     # ElevenLabs streams while it generates: first audio measured 0.22-0.26 s
     # (0.66 s on a cold connection) for 2-133 characters, so a flat budget.
-    ELEVENLABS_TTFA_TIMEOUT = max(0.5, float(os.getenv("ELEVENLABS_TTFA_TIMEOUT", "3")))
+    ELEVENLABS_TTFA_TIMEOUT = _number("ELEVENLABS_TTFA_TIMEOUT", 3.0, float, 0.5)
     # While an allowed user sits in the bot's voice channel, ping their cloud
     # provider after this many idle seconds so the TLS connection stays open
     # (a new one costs 0.3-0.5 s through the VPN). ~1 KB per ping, no
     # credits. 0 disables; typing warm-ups still run.
-    TTS_CONNECTION_KEEPALIVE_SECONDS = max(0.0, float(os.getenv("TTS_CONNECTION_KEEPALIVE_SECONDS", "60")))
-    # Provider health (ttsbot/health.py): breaker state survives restarts in
-    # this file, and paused providers are checked (quota report, host ping)
-    # every TTS_HEALTH_CHECK_INTERVAL seconds once their pause is over.
+    TTS_CONNECTION_KEEPALIVE_SECONDS = _number("TTS_CONNECTION_KEEPALIVE_SECONDS", 60.0, float, 0.0)
     PROVIDER_HEALTH_PATH = Path(
         os.getenv("TTS_HEALTH_PATH", str(BOT_CONFIG_PATH.parent / "provider_health.json"))
     )
-    TTS_HEALTH_CHECK_INTERVAL = max(5.0, float(os.getenv("TTS_HEALTH_CHECK_INTERVAL", "30")))
+    # Guild settings, the voice catalog and provider pauses: one SQLite file
+    # in the mounted ./data volume (":memory:" keeps them in memory only).
+    STATE_DB_PATH = Path(os.getenv("STATE_DB_PATH", str(BOT_CONFIG_PATH.parent / "state.db")))
+    # Paused providers are checked (quota report, host ping) every
+    # TTS_HEALTH_CHECK_INTERVAL seconds once their pause is over.
+    TTS_HEALTH_CHECK_INTERVAL = _number("TTS_HEALTH_CHECK_INTERVAL", 30.0, float, 5.0)
     # Prefetch: generation runs ahead of playback so message N+1 is
     # synthesized while N is still playing; playback stays strictly FIFO.
     # Lookahead = messages generated ahead (1 is plenty).
-    TTS_PREFETCH_LOOKAHEAD = max(1, int(os.getenv("TTS_PREFETCH_LOOKAHEAD", "1")))
+    TTS_PREFETCH_LOOKAHEAD = _number("TTS_PREFETCH_LOOKAHEAD", 1, int, 1)
     TTS_IDLE_FRAME_MODE = os.getenv("TTS_IDLE_FRAME_MODE", "silence").strip().lower()
-    TTS_IDLE_VOLUME_DB = float(os.getenv("TTS_IDLE_VOLUME_DB", "-60"))
-    TTS_STREAM_TAIL_MS = int(os.getenv("TTS_STREAM_TAIL_MS", "200"))
-    TTS_MAX_CONTINUOUS_IDLE_SECONDS = int(os.getenv("TTS_MAX_CONTINUOUS_IDLE_SECONDS", "900"))
-    IDLE_DISCONNECT_SECONDS = int(os.getenv("TTS_IDLE_DISCONNECT_SECONDS", "60"))
+    TTS_IDLE_VOLUME_DB = _number("TTS_IDLE_VOLUME_DB", -60.0, float)
+    TTS_STREAM_TAIL_MS = _number("TTS_STREAM_TAIL_MS", 200, int)
+    TTS_MAX_CONTINUOUS_IDLE_SECONDS = _number("TTS_MAX_CONTINUOUS_IDLE_SECONDS", 900, int)
+    IDLE_DISCONNECT_SECONDS = _number("TTS_IDLE_DISCONNECT_SECONDS", 60, int)
     TTS_AUTO_CONNECT_ENABLED = _flag("TTS_AUTO_CONNECT_ENABLED", "1")
-    AUTO_CONNECT_SUPPRESS_SECONDS = int(os.getenv("TTS_AUTO_CONNECT_SUPPRESS_SECONDS", "30"))
+    AUTO_CONNECT_SUPPRESS_SECONDS = _number("TTS_AUTO_CONNECT_SUPPRESS_SECONDS", 30, int)
     TTS_TRIM_SILENCE = _flag("TTS_TRIM_SILENCE", "1")
-    TTS_QUEUE_PUT_TIMEOUT_MS = int(os.getenv("TTS_QUEUE_PUT_TIMEOUT_MS", "500"))
+    TTS_QUEUE_PUT_TIMEOUT_MS = _number("TTS_QUEUE_PUT_TIMEOUT_MS", 500, int)
     # Playback length guard: MiniMax occasionally "stutters" and streams one
     # sound forever. We cap playback at a rough estimate of how long the text
     # SHOULD take to speak: chars / chars-per-second (at voice speed 1.0),
@@ -157,9 +158,9 @@ def reload() -> None:
     # very short texts. Anything past the cap is cut off and the stream is
     # treated as truncated (never cached).
     TTS_AUDIO_LIMIT_ENABLED = _flag("TTS_AUDIO_LIMIT_ENABLED", "1")
-    TTS_AUDIO_CHARS_PER_SECOND = float(os.getenv("TTS_AUDIO_CHARS_PER_SECOND", "12"))
-    TTS_AUDIO_LIMIT_SAFETY = float(os.getenv("TTS_AUDIO_LIMIT_SAFETY", "2.0"))
-    TTS_AUDIO_LIMIT_MIN_SECONDS = float(os.getenv("TTS_AUDIO_LIMIT_MIN_SECONDS", "5"))
+    TTS_AUDIO_CHARS_PER_SECOND = _number("TTS_AUDIO_CHARS_PER_SECOND", 12.0, float)
+    TTS_AUDIO_LIMIT_SAFETY = _number("TTS_AUDIO_LIMIT_SAFETY", 2.0, float)
+    TTS_AUDIO_LIMIT_MIN_SECONDS = _number("TTS_AUDIO_LIMIT_MIN_SECONDS", 5.0, float)
 
     # Voice recording (ttsbot/recording): off by default. When on, the bot
     # joins voice undeafened and writes every non-bot speaker to Ogg files
@@ -171,20 +172,20 @@ def reload() -> None:
     # the first live test. Longer gaps become RECORDING_PAUSE_MS of silence.
     RECORDING_ENABLED = _flag("RECORDING_ENABLED", "0")
     RECORDING_DIR = Path(os.getenv("RECORDING_DIR", str(BOT_CONFIG_PATH.parent / "recordings")))
-    RECORDING_CHUNK_SECONDS = max(10.0, float(os.getenv("RECORDING_CHUNK_SECONDS", "600")))
+    RECORDING_CHUNK_SECONDS = _number("RECORDING_CHUNK_SECONDS", 600.0, float, 10.0)
     # 15 min: Groq bills every file for at least 10 s, and a 60 s close
     # produced 0.5 s files from a single word.
-    RECORDING_IDLE_CLOSE_SECONDS = max(5.0, float(os.getenv("RECORDING_IDLE_CLOSE_SECONDS", "900")))
-    RECORDING_PAUSE_MS = max(0, int(os.getenv("RECORDING_PAUSE_MS", "500")))
-    RECORDING_VAD_AGGRESSIVENESS = min(3, max(-1, int(os.getenv("RECORDING_VAD_AGGRESSIVENESS", "3"))))
+    RECORDING_IDLE_CLOSE_SECONDS = _number("RECORDING_IDLE_CLOSE_SECONDS", 900.0, float, 5.0)
+    RECORDING_PAUSE_MS = _number("RECORDING_PAUSE_MS", 500, int, 0)
+    RECORDING_VAD_AGGRESSIVENESS = _number("RECORDING_VAD_AGGRESSIVENESS", 3, int, -1, 3)
     # Retention, run by the STT worker (so it needs the worker) as it starts
     # and then every RECORDING_PRUNE_INTERVAL_HOURS (0 = only at start):
     # transcribed Ogg files older than RECORDING_AUDIO_KEEP_DAYS are deleted,
     # transcripts stay; finished sessions (transcripts and all) older than
     # RECORDING_TRANSCRIPT_KEEP_DAYS are deleted. 0 = keep forever.
-    RECORDING_AUDIO_KEEP_DAYS = max(0, int(os.getenv("RECORDING_AUDIO_KEEP_DAYS", "90")))
-    RECORDING_TRANSCRIPT_KEEP_DAYS = max(0, int(os.getenv("RECORDING_TRANSCRIPT_KEEP_DAYS", "0")))
-    RECORDING_PRUNE_INTERVAL_HOURS = max(0.0, float(os.getenv("RECORDING_PRUNE_INTERVAL_HOURS", "24")))
+    RECORDING_AUDIO_KEEP_DAYS = _number("RECORDING_AUDIO_KEEP_DAYS", 90, int, 0)
+    RECORDING_TRANSCRIPT_KEEP_DAYS = _number("RECORDING_TRANSCRIPT_KEEP_DAYS", 0, int, 0)
+    RECORDING_PRUNE_INTERVAL_HOURS = _number("RECORDING_PRUNE_INTERVAL_HOURS", 24.0, float, 0.0)
     # Transcription of recorded chunks with Groq Whisper (ttsbot/recording/
     # worker.py); runs while recording is on and GROQ_API_KEY is set. The
     # limits are Groq's free plan; results stay on disk next to the audio.
@@ -193,10 +194,10 @@ def reload() -> None:
     STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3").strip()
     STT_LANGUAGE = os.getenv("STT_LANGUAGE", "ru").strip()
     STT_PROMPT = os.getenv("STT_PROMPT", "").strip()
-    STT_AUDIO_SECONDS_PER_HOUR = max(60.0, float(os.getenv("STT_AUDIO_SECONDS_PER_HOUR", "7200")))
-    STT_AUDIO_SECONDS_PER_DAY = max(60.0, float(os.getenv("STT_AUDIO_SECONDS_PER_DAY", "28800")))
-    STT_MIN_BILLED_SECONDS = max(0.0, float(os.getenv("STT_MIN_BILLED_SECONDS", "10")))
-    STT_REQUESTS_PER_MINUTE = max(1, int(os.getenv("STT_REQUESTS_PER_MINUTE", "20")))
+    STT_AUDIO_SECONDS_PER_HOUR = _number("STT_AUDIO_SECONDS_PER_HOUR", 7200.0, float, 60.0)
+    STT_AUDIO_SECONDS_PER_DAY = _number("STT_AUDIO_SECONDS_PER_DAY", 28800.0, float, 60.0)
+    STT_MIN_BILLED_SECONDS = _number("STT_MIN_BILLED_SECONDS", 10.0, float, 0.0)
+    STT_REQUESTS_PER_MINUTE = _number("STT_REQUESTS_PER_MINUTE", 20, int, 1)
     TRANSCRIPT_TIMEZONE = os.getenv("TRANSCRIPT_TIMEZONE", "UTC").strip() or "UTC"
 
     # Recordings website (python -m ttsbot.web, docs/RECORDINGS_WEB.md): a
@@ -220,7 +221,7 @@ def reload() -> None:
     WEB_MAINTENANCE_SECONDS = _number("WEB_MAINTENANCE_SECONDS", 300.0, float, 30.0)
     WEB_PREBUILD_RECENT = _number("WEB_PREBUILD_RECENT", 3, int, 0)
 
-    VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
+    VOICE_CONNECT_COOLDOWN_SECONDS = _number("VOICE_CONNECT_COOLDOWN_SECONDS", 60, int)
     # One knob for bare-metal runs: point PIPER_MODELS_DIR at ./models and
     # the per-voice defaults follow. Explicit *_PATH values still win.
     PIPER_MODELS_DIR = os.getenv("PIPER_MODELS_DIR", "/app/models").strip().rstrip("/") or "/app/models"
@@ -228,13 +229,12 @@ def reload() -> None:
         "PIPER_MODEL_PATH", f"{PIPER_MODELS_DIR}/ru_RU-ruslan-medium.onnx"
     ).strip()
     PIPER_CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH", f"{PIPER_MODEL_PATH}.json").strip()
-    PIPER_SPEAKER = int(os.getenv("PIPER_SPEAKER", "-1"))
-    PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.0"))
-
+    PIPER_SPEAKER = _number("PIPER_SPEAKER", -1, int)
+    PIPER_LENGTH_SCALE = _number("PIPER_LENGTH_SCALE", 1.0, float)
 
     if TTS_IDLE_FRAME_MODE not in {"comfort_noise", "silence"}:
-        log.warning("Unknown TTS_IDLE_FRAME_MODE=%s; using comfort_noise", TTS_IDLE_FRAME_MODE)
-        TTS_IDLE_FRAME_MODE = "comfort_noise"
+        log.warning("Unknown TTS_IDLE_FRAME_MODE=%s; using silence", TTS_IDLE_FRAME_MODE)
+        TTS_IDLE_FRAME_MODE = "silence"
 
     WHITELIST_USERS = parse_user_ids(os.getenv("WHITELIST_USERS", DEFAULT_WHITELIST))
     # Who may change settings shared by every guild; the Discord

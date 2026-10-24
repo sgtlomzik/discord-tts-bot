@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 
 from support import load_bot_module  # noqa: E402,F401  (re-exported for other tests)
+from support import state_from
 
 
 bot = load_bot_module()
@@ -114,11 +115,11 @@ class ConfigStoreEmojiAliasTests(unittest.TestCase):
     def test_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            store = bot.BotConfigStore(path, set())
+            store = bot.BotConfigStore(state_from(path), set())
             store.set_emoji_alias("1035", "Kekis", "кекис")
             store.set_emoji_alias("2046", "Pepe", "пепе")
 
-            loaded = bot.BotConfigStore(path, set())
+            loaded = bot.BotConfigStore(state_from(path), set())
             self.assertEqual(
                 loaded.emoji_aliases,
                 {
@@ -131,20 +132,20 @@ class ConfigStoreEmojiAliasTests(unittest.TestCase):
     def test_remove(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            store = bot.BotConfigStore(path, set())
+            store = bot.BotConfigStore(state_from(path), set())
             store.set_emoji_alias("1", "K", "кек")
             self.assertTrue(store.remove_emoji_alias("1"))
             self.assertFalse(store.remove_emoji_alias("1"))
-            self.assertEqual(bot.BotConfigStore(path, set()).emoji_aliases, {})
+            self.assertEqual(bot.BotConfigStore(state_from(path), set()).emoji_aliases, {})
 
     def test_update_overwrites(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            store = bot.BotConfigStore(path, set())
+            store = bot.BotConfigStore(state_from(path), set())
             store.set_emoji_alias("1", "K", "кек")
             store.set_emoji_alias("1", "K", "лол")
             self.assertEqual(
-                bot.BotConfigStore(path, set()).emoji_aliases["1"]["say"], "лол"
+                bot.BotConfigStore(state_from(path), set()).emoji_aliases["1"]["say"], "лол"
             )
 
     def test_malformed_entries_skipped(self):
@@ -166,16 +167,16 @@ class ConfigStoreEmojiAliasTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            store = bot.BotConfigStore(path, set())
+            store = bot.BotConfigStore(state_from(path), set())
             self.assertEqual(store.emoji_aliases, {"1": {"name": "Ok", "say": "норм"}})
 
     def test_does_not_disturb_guild_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            store = bot.BotConfigStore(path, {111})
+            store = bot.BotConfigStore(state_from(path), {111})
             store.add_user(10, 222)
             store.set_emoji_alias("1", "K", "кек")
-            loaded = bot.BotConfigStore(path, set())
+            loaded = bot.BotConfigStore(state_from(path), set())
             self.assertEqual(loaded.get_guild(10).allowed_users, {222})
             self.assertEqual(loaded.emoji_aliases, {"1": {"name": "K", "say": "кек"}})
 
@@ -309,7 +310,7 @@ class EmojiAliasCommandTests(unittest.IsolatedAsyncioTestCase):
     def _setup(self):
         bot_mod = load_bot_module()
         tmp = tempfile.TemporaryDirectory()
-        store = bot_mod.BotConfigStore(Path(tmp.name) / "config.json", set())
+        store = bot_mod.BotConfigStore(state_from(Path(tmp.name) / "config.json"), set())
         store._tmp_dir = tmp
         bot_mod.bot.config_store = store
         return bot_mod, store
