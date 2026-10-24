@@ -27,9 +27,6 @@ failures fall back to Piper.
   Cloud connections stay open for 120 s and are warmed while an allowed
   user is typing, so a message after a pause skips the TLS handshake. The
   next message is synthesized while the previous plays.
-- **Smart message merging** — short bursts of messages from one user are
-  merged into a single natural phrase (`selective_hold_v2`), while reactions,
-  emoji and questions play immediately.
 - **Speech-friendly text handling** — URLs and markup are stripped, unicode
   emoji are spoken by their Russian names, mentions are read as display
   names, custom server emoji get configurable pronunciations (each server
@@ -109,7 +106,7 @@ Everything is configured through environment variables — see
 | `OPENROUTER_API_KEY` | Enables Gemini voices through OpenRouter (optional) |
 | `TTS_QUOTA_COOLDOWN_SECONDS` | Pause a cloud provider after a balance/plan error (default 1800) |
 | `TTS_PRIMARY_PROVIDER` | `local`, `minimax`, `fish`, `gemini` or `elevenlabs` |
-| `TTS_MERGE_ALGORITHM` | `selective_hold_v2`, `legacy` or `off` |
+| `OWNER_IDS` | Users who may change settings shared by every server (the bot's application owner always may) |
 
 For Fish, put `FISH_API_KEY` and `FISH_REFERENCE_ID` in `.env`, then select
 `/voicebot voice-set voice:fish-default`, or set
@@ -228,11 +225,11 @@ the user has no log lines, `--log-file` instead of stdin, `--json`.
 ```bash
 python3.11 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -p 'test_*.py'  # ~360 tests, no network needed
+python -m unittest discover -s tests -p 'test_*.py'  # ~650 tests, no network needed
 ```
 
 The application lives in the `ttsbot/` package; `bot.py` is the entrypoint
-and composition root. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for
+and `ttsbot/app.py` the composition root. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for
 the module map and runtime flow. Historical design notes are under
 [docs/internal/](docs/internal/).
 

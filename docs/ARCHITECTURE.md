@@ -9,65 +9,64 @@ The bot is a single-process Discord service that:
 
 1. listens for Discord messages and voice state changes;
 2. checks whether the author is allowed to use TTS;
-3. normalizes and classifies message text;
-4. optionally merges short messages into a buffer;
-5. queues TTS jobs;
-6. synthesizes speech with the selected Fish, ElevenLabs, MiniMax, Gemini
-   or Piper voice;
-7. turns the result into 20 ms frames: Fish and ElevenLabs Opus packets
+3. turns the message into speakable text (markup, links, emoji, mentions);
+4. queues a TTS job per message, in arrival order;
+5. synthesizes speech with the selected Fish, ElevenLabs, MiniMax, Gemini
+   or Piper voice, falling back along the voice's chain;
+6. turns the result into 20 ms frames: Fish and ElevenLabs Opus packets
    pass through as-is, everything else is decoded to PCM;
-8. plays the frames into a Discord voice channel through one continuous
+7. plays the frames into a Discord voice channel through one continuous
    Opus player;
+8. records and transcribes the voice channel when recording is on;
 9. disconnects when the voice channel goes idle.
-
-The current production runtime is intentionally small:
-
-- one Python package (`ttsbot/`) plus a thin `bot.py` entrypoint;
-- a unittest suite (`tests/`) for coverage;
-- one container image;
-- one local Piper voice model;
-- one JSON config file for guild state.
 
 ## 2. Runtime Layout
 
 The active runtime pieces are:
 
-- `bot.py` - composition root and entrypoint: reloads config, creates the
-  bot, attaches events and slash commands, re-exports the public API
-  (the tests exec this file per test case).
+- `bot.py` - the entrypoint (`python -u bot.py`), three lines.
 - `ttsbot/` - the application package:
+  - `app.py` - composition root: `create_bot()` re-reads the environment,
+    builds a `TTSBot` and attaches the slash commands and event handlers
+    bound to it; `main()` checks the essentials and runs it. Nothing
+    happens on import.
   - `config.py` - every env-derived tunable as a module global, with
     `reload()`; runtime code reads `config.NAME` at call time.
   - `textnorm.py` - Discord markup stripping, emoji aliases, mention
     resolution, `normalize_for_tts`.
-  - `messages.py` - `ParsedMessage` / `MergeBufferState` and
-    `analyze_message_for_merge` for the merge layer.
+  - `messages.py` - `speakable_text()`: the part of a message that is
+    spoken (empty for a bare link).
   - `models.py` - `VoiceProfile`, `GuildConfig`, `TTSJob`,
     `PreparedAudio` and the hardcoded Piper `VOICE_PROFILES`.
-  - `store.py` - `BotConfigStore` (data/config.json persistence).
+  - `store.py` - `BotConfigStore` (data/config.json persistence; a failed
+    save rolls memory back to what is on disk).
+  - `statefile.py` - reading JSON state files: a damaged file raises
+    `StateFileError` and stops startup instead of being replaced.
+  - `supervisor.py` - `TaskSupervisor`: the long-running workers are
+    restarted when they crash; `/voicebot status` lists them.
   - `audio.py` - PCM constants and framing, ffmpeg command builders
     (including the Fish pitch filter), Opus loading,
     `ContinuousTTSAudioSource`.
-  - `errors.py` - `QuotaExhaustedError`, shared by the Fish and MiniMax
-    "balance or plan used up" errors.
   - `ogg_opus.py` - incremental Ogg/Opus demuxer that turns Fish HTTP
     chunks into 20 ms Discord packets, plus the `.dopus` frame-cache format.
   - `core.py` - the `TTSBot` class: construction and task lifecycle,
     composed from the four concern mixins below.
   - `voice_lifecycle.py` - connect/move locks, cooldowns, stale-client
     recovery, idle disconnect, auto-connect policy.
+  - `intake.py` - the enqueue boundary: `queue_message`, `enqueue_tts`,
+    `clear_queue_for_guild`.
+  - `pipeline.py` - Piper/MiniMax/Fish/Gemini/ElevenLabs synthesis, the
+    streaming paths and the prefetch generation worker.
+  - `playback.py` - PCM preparation and the continuous Opus player feed.
+  - `commands.py` - `build_commands(bot)` creates the /voicebot and
+    /fallback groups bound to a bot instance; `events.py` -
+    `register_events(bot)`.
   - `recording/` - voice receive (off unless `RECORDING_ENABLED=1`):
     `client.py` (a `VoiceClient` subclass), `rtp.py` (transport
-    decryption), `recorder.py` (per-user chunk files), `ogg.py` (Ogg
-    Opus writer), `vad.py` (speech filter); transcription: `groq.py`
-    (client and audio budget), `worker.py` (queue), `transcript.py`.
-  - `merge.py` - the enqueue boundary and legacy/selective-hold merge
-    decisions.
-  - `pipeline.py` - Piper/MiniMax/Fish synthesis, the streaming fast path,
-    the prefetch generation worker and the legacy single worker.
-  - `playback.py` - PCM preparation and the continuous Opus player feed.
-  - `commands.py` - `build_commands(bot)` creates the /voicebot group
-    bound to a bot instance; `events.py` - `register_events(bot)`.
+    decryption), `recorder.py` (per-stream chunk files with a reorder
+    window), `ogg.py` (Ogg Opus writer), `vad.py` (speech filter);
+    transcription: `groq.py` (client and audio budget), `worker.py`
+    (queue), `transcript.py`.
 - `ttsbot/providers.py` - provider abstraction: dispatcher (fallback chain,
   health checks), MiniMax client and its error classes, phrase cache.
 - `ttsbot/health.py` - failure kinds, the circuit breaker with its backoff
@@ -86,197 +85,68 @@ The active runtime pieces are:
 - `scripts/` - operator tools: model download, MiniMax voice cloning,
   `migrate_fish_default.py` (moves every guild to `fish-default`),
   `usage_stats.py` (per-user generated characters from logs + Discord history).
-- `tests/` - unit and async integration-style tests.
-- `docker-compose.yml` - container wiring and bind mounts.
+- `tests/` - unit and async integration-style tests; `tests/support.py`
+  builds a fresh bot and a namespace of the package's names for them.
+- `docker-compose.yml` - container wiring and bind mounts; both services
+  use the image tag `TTS_IMAGE_TAG`.
 - `Dockerfile` - image build and system packages.
 - `requirements.txt` - Python dependencies.
 - `.env.example` - runtime flag reference.
-- `models/ru_RU-ruslan-medium.onnx` and `.json` - Piper voice model files.
-- `data/config.json` - persisted guild/user settings.
 
 At runtime, the container mounts only state:
 
 - `/app/models` (read-only voice models)
-- `/app/data` (guild config, voice catalog, phrase cache)
+- `/app/data` (guild config, voice catalog, phrase cache, recordings)
 
 Code ships inside the image (built by CI and published to GHCR), so a
-deployment is `docker compose pull && docker compose up -d`. For hot-reload
-development, bind-mount `./bot.py` and `./ttsbot` via a local
-`docker-compose.override.yml`.
+deployment is setting `TTS_IMAGE_TAG` and `docker compose pull && docker
+compose up -d`. For hot-reload development, bind-mount `./bot.py` and
+`./ttsbot` via a local `docker-compose.override.yml`.
 
 ## 3. Execution Flow
 
 ### 3.1 Startup
 
-On boot, the bot:
-
-1. loads environment variables;
-2. checks token and whitelist state;
-3. loads the Opus library;
-4. starts the Discord bot;
-5. registers slash commands;
-6. launches the background TTS worker;
-7. performs a warmup synthesis pass.
-
-Representative startup flow:
-
-```text
-bot.run()
-  -> on_ready()
-  -> tree.sync()
-  -> create tts_worker task
-  -> warmup_tts()
-```
+`bot.py` calls `ttsbot.app.main()`, which builds the bot, checks the
+token, whitelist and Opus library and runs it. `TTSBot.setup_hook` syncs
+the slash commands and starts the workers under the supervisor:
+`tts-generation` (warms up Piper first), `tts-playback`, and when
+configured `tts-connection-keepalive`, `tts-provider-health` and
+`stt-worker`.
 
 ### 3.2 Message Intake
 
-Message handling lives in `on_message()`:
-
-```python
-@bot.event
-async def on_message(message: discord.Message) -> None:
-    if message.author.bot:
-        return
-
-    if (
-        message.guild is not None
-        and bot.config_store.is_enabled(message.guild.id)
-        and bot.config_store.is_allowed(message.guild.id, message.author.id)
-        and message.author.voice
-        and isinstance(message.author.voice.channel, discord.VoiceChannel)
-    ):
-        await bot.queue_or_merge_message(
-            message.content,
-            message.author.voice.channel,
-            message.author.id,
-            message.channel.id,
-        )
-
-    await bot.process_commands(message)
-```
-
-This is the gate that decides whether a Discord message can enter the TTS pipeline at all.
+`on_message()` lets a message in when the guild has TTS on, the author is
+allowed (the guild's list or `WHITELIST_USERS`) and is in a voice
+channel. `queue_message()` takes its speakable text (`speakable_text`)
+and `enqueue_tts()` normalizes it once, applies the length cap and queues
+a `TTSJob`. Every message is queued as it arrives; nothing is held back
+or merged.
 
 ### 3.3 Voice Updates
 
-`on_voice_state_update()` handles:
+`on_voice_state_update()` auto-connects when an allowed member joins or
+switches a channel (not on mute, deafen or stream toggles) and schedules
+the idle disconnect when no allowed member remains with the bot.
 
-- auto-connect for allowed users who join voice;
-- idle disconnect when no allowed users remain in the voice channel.
+## 4. Queue and Worker Model
 
-This keeps the bot responsive without requiring a manual join command every time.
-
-## 4. Message Normalization
-
-The text layer is split into two functions:
-
-- `process_text()` - removes URLs, replaces known custom emoji aliases, normalizes whitespace and newlines;
-- `analyze_message_for_merge()` - classifies the message for merge decisions.
-
-Example shape:
-
-```python
-text = process_text(raw_text)
-parsed = analyze_message_for_merge(raw_text)
-```
-
-The parser is intentionally lightweight. It recognizes:
-
-- custom emoji markup;
-- mentions;
-- URLs;
-- Unicode emoji;
-- single-digit and single-symbol replies;
-- caps shout;
-- keyboard-smash style text;
-- question/terminal punctuation.
-
-This parser exists so the merge layer can make a cheap decision before the bot spends time on synthesis.
-
-## 5. Merge and Hold Logic
-
-The current bot has two merge regimes:
-
-- legacy short-message batching;
-- `selective_hold_v2`.
-
-The active decision code is in `queue_or_merge_message()`.
-
-### 5.1 Legacy Path
-
-When selective hold is disabled, short messages can be buffered for a fixed window and later flushed as one phrase.
-That path still exists for rollback and compatibility.
-
-### 5.2 Selective Hold Path
-
-`selective_hold_v2` is the more nuanced pre-TTS decision layer. It distinguishes:
-
-- no active buffer;
-- already active buffer.
-
-That matters because a short standalone message can be an isolated reaction, while the same short message inside an active cluster can be a meaningful continuation.
-
-The buffer state tracks:
-
-- author and voice channel key;
-- first and last timestamps;
-- deadline timestamp;
-- generation id;
-- current items;
-- join separator.
-
-Representative flow:
+The jobs go through two queues:
 
 ```text
-incoming message
-  -> analyze_message_for_merge()
-  -> no buffer?
-       -> immediate_long / immediate_special / hold_start / immediate_default
-  -> buffer exists?
-       -> hard_break / append_soft / flush_before_reclassify
+message_queue (TTSJob) -> _generation_worker -> ready_queue (PreparedAudio, lookahead 1)
+                                                      -> _playback_worker -> player
 ```
 
-Order preservation is a core requirement. If an older buffered message must be flushed first, the new message is not allowed to jump ahead of it.
+The generation worker puts each `PreparedAudio` into `ready_queue` first
+(order and backpressure) and then generates its audio into the item's
+channel as batches of frames; the playback worker drains the channels in
+order into the guild's continuous player, so message N+1 is generated
+while N plays. `queue-clear`, `/voicebot off` and a disconnect mark the
+guild's items cancelled. The drain wait after a message is bounded, and a
+player stopped under the worker (`!tts stop`, a kick) never holds it.
 
-## 6. Queue and Worker Model
-
-### 6.1 TTS Queue
-
-The bot uses an `asyncio.Queue` for TTS jobs.
-
-Each job contains:
-
-- final text to speak;
-- target voice channel;
-- queued timestamp;
-- author id;
-- guild id;
-- text channel id;
-- selected voice profile;
-- original message timestamp.
-
-This is the boundary between message handling and synthesis/playback.
-
-### 6.2 Worker
-
-`tts_worker()` is the background pipeline runner.
-
-It does three big things:
-
-1. waits for a job;
-2. connects to voice and synthesizes in parallel;
-3. prepares playback and streams the result.
-
-Important behavior:
-
-- voice connect and TTS generation are started concurrently;
-- if TTS generation fails, the bot keeps the voice session;
-- if voice connect fails, the bot cleans up the voice state;
-- playback is followed by idle disconnect scheduling.
-
-This is the part to preserve if a new TTS engine is introduced. The engine can change, but the worker contract should stay stable.
-
-## 7. Synthesis Paths
+## 5. Synthesis Paths
 
 The Fish cache-miss path starts playback before the HTTP response completes.
 With pitch 0 (the default) no ffmpeg is involved:
@@ -400,7 +270,7 @@ The local fallback path is:
 
 ```text
 text
-  -> generate_tts_file()
+  -> _generate_file_into() -> TTSDispatcher.synthesize_chain()
   -> generate_piper_file()
   -> WAV file in tmp storage
   -> ffmpeg PCM conversion
@@ -417,16 +287,11 @@ Every engine ends up as 20 ms frames in the same player: Fish as Opus
 packets, Piper and MiniMax as PCM. The Discord playback source and voice
 lifecycle are shared.
 
-## 8. Playback Path
+## 6. Playback Path
 
 After synthesis, the bot converts audio into Discord-friendly output.
 
-There are two playback modes:
-
-- continuous Opus stream (default, `TTS_CONTINUOUS_STREAM=1`);
-- fallback FFmpeg playback file path.
-
-The continuous source is always in Opus mode:
+Every message plays through the guild's continuous Opus source:
 
 ```text
 Fish Opus packets ---------------------------\
@@ -446,13 +311,10 @@ Why this matters:
 - one player serves every engine, so alternating Fish and Piper/MiniMax
   voices never stops and restarts it.
 
-The code also applies optional ffmpeg tuning:
+Decoded files (Piper, MiniMax, cache) get their leading and trailing
+silence trimmed by ffmpeg (`TTS_TRIM_SILENCE`).
 
-- silence trimming;
-- low-delay playback flags;
-- preroll and tail padding.
-
-## 9. Voice Connection and Idle Handling
+## 7. Voice Connection and Idle Handling
 
 The bot manages voice state separately from synthesis:
 
@@ -463,7 +325,7 @@ The bot manages voice state separately from synthesis:
 
 This is a good separation to preserve when adding a new engine, because the TTS backend should not be responsible for voice lifecycle policy.
 
-### 9.1 Voice recording
+### 7.1 Voice recording
 
 With `RECORDING_ENABLED=1` the bot joins voice undeafened (a deafened
 member receives nothing) as `recording.client.RecordingVoiceClient`.
@@ -510,7 +372,7 @@ restart is recovered (`recorder.recover_session`) with exact timestamps.
 Text the bot speaks for someone is logged to `tts.jsonl`, and each
 speaker's display name to `names.json` (kept if they leave the server).
 
-### 9.2 Transcription
+### 7.2 Transcription
 
 With `GROQ_API_KEY` set, `recording.worker.TranscriptionWorker` (task
 `stt-worker`) sends closed files to Groq Whisper (`STT_MODEL`,
@@ -565,7 +427,7 @@ off.
 Both run inside the worker, so nothing is pruned while `GROQ_API_KEY` is
 unset or `STT_ENABLED=0`.
 
-### 9.3 Recordings website
+### 7.3 Recordings website
 
 `python -m ttsbot.web` (the `tts_web` service) serves the sessions, their
 transcripts with clickable times and one joined audio track per session
@@ -575,7 +437,7 @@ retention, service), `ttsbot/web` the HTTP layer. The bot's only part in
 it: `session.json` also keeps `guild_name` / `channel_name`, written
 atomically. See [RECORDINGS_WEB.md](RECORDINGS_WEB.md).
 
-## 10. Persistence and Guild State
+## 8. Persistence and Guild State
 
 Persistent bot settings live in `data/config.json` and are managed by `BotConfigStore`.
 
@@ -591,7 +453,7 @@ The config store is intentionally simple JSON, not a database.
 
 That keeps the runtime easy to reason about and makes tests cheap.
 
-## 11. Commands
+## 9. Commands
 
 The bot exposes the `/voicebot` slash group.
 
@@ -628,12 +490,12 @@ holds the fallback chain and provider health:
 - `queue-clear` - clear queued work;
 - `test` - enqueue a test phrase, optionally to a specific voice channel.
 
-There are also a couple of legacy text commands for manual control:
+There are also two text commands for manual control:
 
 - `!tts stop`
 - `!tts join`
 
-## 12. Relevant Configuration
+## 10. Relevant Configuration
 
 The active runtime flags are defined in `.env.example` and loaded from `.env` in production.
 
@@ -641,11 +503,8 @@ Main groups:
 
 - Discord access and whitelist;
 - queue sizing;
-- preroll and tail tuning;
-- continuous-stream control;
+- continuous-stream idle tuning;
 - idle disconnect timings;
-- merge policy;
-- selective hold settings;
 - Piper model path and tuning;
 - voice recording and transcription (`RECORDING_*`, `STT_*`,
   `TRANSCRIPT_TIMEZONE`), including `RECORDING_AUDIO_KEEP_DAYS` and
@@ -668,19 +527,18 @@ The important current engine-specific values are:
 - `PIPER_MODEL_PATH=/app/models/ru_RU-ruslan-medium.onnx`
 - `PIPER_CONFIG_PATH=/app/models/ru_RU-ruslan-medium.onnx.json`
 
-## 13. Tests
+## 11. Tests
 
 `tests/test_bot.py` is the main safety net.
 
 It covers:
 
 - text normalization;
-- token parsing and message classification;
+- speakable text of a message;
 - config persistence;
 - voice-channel resolution;
 - audio helper commands;
-- queue/merge behavior;
-- selective hold edge cases;
+- queue behavior;
 - voice connect cooldowns;
 - worker success and failure paths.
 
@@ -691,16 +549,13 @@ first-audio timeout), `test_gemini.py` and `test_pcm.py` (the PCM path),
 `test_elevenlabs.py` (both ElevenLabs paths, error mapping, the key ring)
 and the `test_providers*.py` files.
 
-The current test suite is important because it pins the public surface of the package: the tests exec `bot.py` per test case, mutate `ttsbot.config` for tuning, and exercise the pipeline through the facade — so a module can be reworked internally while the suite guards the observable behavior.
+Each test builds a fresh bot through `tests/support.py` (`ttsbot.app.create_bot()` re-reads the environment), mutates `ttsbot.config` for tuning and exercises the pipeline through the bot's methods.
 
-## 14. File Responsibility Map
+## 12. File Responsibility Map
 
 ### `bot.py`
 
-Composition root: config reload, bot construction, command/event
-registration, `main()`. Also the backward-compatibility facade — it
-re-exports the package API so tests (and any external callers) can keep
-using `bot.<name>`.
+The entrypoint; it calls `ttsbot.app.main()`.
 
 ### `ttsbot/`
 
@@ -736,12 +591,12 @@ Stores live guild settings.
 
 Stores the active Piper voice model files.
 
-## 15. What Matters for a New Voice Engine
+## 13. What Matters for a New Voice Engine
 
 If the goal is to add a new voice engine, the architecture points that matter most are:
 
-1. keep `on_message()` and `queue_or_merge_message()` mostly stable;
-2. introduce a real engine boundary near `generate_tts_file()`;
+1. keep `on_message()` and `queue_message()` mostly stable;
+2. add the engine at the provider boundary (`TTSDispatcher`, `_stream_voice_into`);
 3. preserve `TTSJob`, queueing, and worker flow;
 4. make engine selection a profile-level concern, not a scattered global `if`;
 5. keep playback and voice lifecycle unchanged unless the new engine genuinely needs a different artifact format;
