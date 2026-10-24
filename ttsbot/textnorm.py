@@ -182,10 +182,60 @@ def speak_unicode_emoji(text: str) -> str:
     return "".join(out)
 
 
-# Single source of truth for the cleanup applied just before handing
-# text to either TTS provider. Returns None when there is nothing
-# speakable left, so the caller can drop the message entirely
-# (matches the spec: 186/3358 messages were empty after cleanup).
+# Punctuation that already ends a clause: a line break after it needs no
+# extra period.
+_CLAUSE_END = ".!?…,;:"
+
+
+def _clean_for_speech(
+    raw: str,
+    aliases: dict[str, str] | None = None,
+    mentions: dict[str, str] | None = None,
+) -> str:
+    """The spoken form of a Discord message, or "" when nothing is left to say.
+
+    Links go first, so an emoji inside one leaves with it. Custom emoji
+    become their alias (by id), then the legacy name in EMOJI_MAP, else
+    silence; mentions become the resolved name, else silence; Unicode emoji
+    are spoken by name; invisible and control characters are dropped. Each
+    line break ends a sentence unless the line already ends one. A result
+    without a single letter or digit ("...", a row of unaliased emoji) is
+    nothing to say, so it is never synthesized.
+    """
+    if not raw:
+        return ""
+    aliases = aliases or {}
+
+    def _emoji(match: re.Match[str]) -> str:
+        return f" {aliases.get(match.group(2)) or EMOJI_MAP.get(match.group(1), '')} "
+
+    text = URL_RE.sub(" ", raw)
+    text = CUSTOM_EMOJI_RE.sub(_emoji, text)
+    if mentions:
+        text = resolve_mentions(text, mentions)
+    text = MENTION_RE.sub(" ", text)
+    text = speak_unicode_emoji(text)
+    text = "".join(ch for ch in text if ch.isspace() or unicodedata.category(ch) not in ("Cc", "Cf"))
+    spoken = ""
+    for line in text.splitlines():
+        line = " ".join(line.split())
+        if not line:
+            continue
+        if spoken:
+            spoken += " " if spoken[-1] in _CLAUSE_END else ". "
+        spoken += line
+    return spoken if any(ch.isalnum() for ch in spoken) else ""
+
+
+def speakable_text(
+    raw_text: str,
+    aliases: dict[str, str] | None = None,
+    mentions: dict[str, str] | None = None,
+) -> str:
+    """The spoken form of a message ("" when there is nothing to say)."""
+    return _clean_for_speech(raw_text, aliases, mentions)
+
+
 def normalize_for_tts(
     raw: str,
     *,
@@ -193,98 +243,16 @@ def normalize_for_tts(
     emoji_aliases: dict[str, str] | None = None,
     mentions: dict[str, str] | None = None,
 ) -> str | None:
-    """Strip Discord markup from a message and prepare it for synthesis.
-
-    Removes:
-      - custom emoji markup ``<:name:id>`` and ``<a:name:id>``
-      - user/role mentions ``<@id>``, ``<@!id>``, ``<@&id>``
-      - channel mentions ``<#id>``
-      - URLs ``https?://...``
-
-    Also normalizes whitespace (``\\n`` -> ``". "``, multiple spaces
-    collapsed) and enforces an upper bound on the resulting length.
-    Returns ``None`` if the cleaned string is empty (caller should
-    drop the message — do not waste an API call or queue slot).
-    """
-    if not raw:
-        return None
-    text = raw
-
-    # Emoji aliases first: turn aliased custom emoji into their spoken word
-    # *before* the strip regex removes the rest. Unaliased emoji stay silent.
-    if emoji_aliases:
-        text = substitute_emoji_aliases(text, emoji_aliases)
-    # Custom emoji: <:name:id> and <a:name:id>
-    text = re.sub(r"<a?:\w+:\d+>", " ", text)
-    # Standard Unicode emoji -> spoken Russian names
-    text = speak_unicode_emoji(text)
-    # Mentions -> spoken name; unresolved tokens fall through to stripping
-    if mentions:
-        text = resolve_mentions(text, mentions)
-    # User/role mentions
-    text = re.sub(r"<@!?\d+>", " ", text)
-    text = re.sub(r"<@&\d+>", " ", text)
-    # Channel mentions
-    text = re.sub(r"<#\d+>", " ", text)
-    # URLs
-    text = re.sub(r"https?://\S+", " ", text)
-
-    # Newlines -> period for more natural speech rhythm
-    text = text.replace("\n", ". ")
-    # Collapse whitespace
-    text = " ".join(text.split())
-    text = text.strip()
-
+    """The text to synthesize: the spoken form, capped at ``max_chars``
+    (MAX_TEXT_LENGTH by default) between words. None when nothing is left
+    to say: the caller drops the message instead of spending a request."""
+    text = _clean_for_speech(raw, emoji_aliases, mentions)
     if not text:
         return None
-
     limit = max_chars if max_chars is not None else config.MAX_TEXT_LENGTH
     if limit and len(text) > limit:
-        text = text[:limit].rstrip()
-        if not text:
-            return None
-    return text
-
-
-def _is_emoji_char(ch: str) -> bool:
-    if not ch:
-        return False
-    if "\u2600" <= ch <= "\u27BF":
-        return True
-    if "\U0001F300" <= ch <= "\U0001FAFF":
-        return True
-    return unicodedata.category(ch) == "So"
-
-
-def _is_keyboard_smash_word(word: str) -> bool:
-    cleaned = re.sub(r"[^A-Za-zА-Яа-яЁё]", "", word)
-    if len(cleaned) < 4:
-        return False
-    unique_chars = len(set(cleaned.lower()))
-    return unique_chars <= 3 and len(cleaned) >= 5
-
-
-def _strip_discord_tokens_for_speech(
-    raw_text: str,
-    aliases: dict[str, str] | None = None,
-    mentions: dict[str, str] | None = None,
-) -> str:
-    aliases = aliases or {}
-
-    def _emoji_repl(m: re.Match[str]) -> str:
-        # id-keyed alias wins over the legacy name-keyed EMOJI_MAP fallback;
-        # an emoji with neither becomes silence, as before.
-        say = aliases.get(m.group(2))
-        if say:
-            return f" {say} "
-        return f" {EMOJI_MAP.get(m.group(1), '')} "
-
-    text = CUSTOM_EMOJI_RE.sub(_emoji_repl, raw_text)
-    text = speak_unicode_emoji(text)
-    if mentions:
-        text = resolve_mentions(text, mentions)
-    text = MENTION_RE.sub(" ", text)
-    text = URL_RE.sub(" ", text)
-    text = text.replace("\n", ". ")
-    text = " ".join(text.split())
-    return text.strip()
+        cut = text[:limit]
+        if not text[limit].isspace() and " " in cut:
+            cut = cut[:cut.rfind(" ")]  # do not end on half a word
+        text = cut.rstrip()
+    return text or None

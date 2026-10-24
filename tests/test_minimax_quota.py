@@ -14,18 +14,11 @@ import httpx
 from ttsbot.voice_registry import FishParams, MiniMaxParams, VoiceRecord
 from ttsbot.models import PreparedAudio, TTSJob
 from ttsbot.pipeline import SynthesisPipelineMixin
-from ttsbot.providers import (
-    CircuitBreaker,
-    CircuitBreakerConfig,
-    CircuitState,
-    DispatcherConfig,
-    MiniMaxConfig,
-    MiniMaxError,
-    MiniMaxProvider,
-    MiniMaxQuotaError,
-    MiniMaxQuotaExhaustedError,
-    TTSDispatcher,
-)
+from ttsbot.providers import (CircuitBreaker, CircuitBreakerConfig, CircuitState, DispatcherConfig, TTSDispatcher)
+from ttsbot.minimax import (MiniMaxConfig, MiniMaxError, MiniMaxProvider, MiniMaxQuotaError, MiniMaxQuotaExhaustedError)
+from ttsbot.streams import StreamSpec
+from ttsbot.minimax import (MiniMaxProvider)
+from support import with_spec
 
 QUOTA_BODY = (
     b'{"base_resp":{"status_code":2056,"status_msg":"Token Plan usage limit reached"}}'
@@ -86,10 +79,7 @@ class QuotaBreakerTests(unittest.TestCase):
 
     def test_dispatcher_trips_on_quota_error(self):
         cb = CircuitBreaker(CircuitBreakerConfig(failure_threshold=3, cooldown_seconds=60))
-        dispatcher = TTSDispatcher(
-            local=MagicMock(), circuit_breaker=cb,
-            config=DispatcherConfig(quota_cooldown_seconds=900),
-        )
+        dispatcher = TTSDispatcher(local=MagicMock(), config=DispatcherConfig(quota_cooldown_seconds=900), breakers={"minimax": cb})
         dispatcher.record_failure(cb, MiniMaxQuotaError("HTTP 429"))
         self.assertIs(cb.state, CircuitState.CLOSED)  # rate limit: ordinary failure
         dispatcher.record_failure(cb, MiniMaxQuotaExhaustedError("2056"))
@@ -115,7 +105,7 @@ class FishTtfaTests(unittest.IsolatedAsyncioTestCase):
 
         fish = SimpleNamespace(stream_audio=slow_stream)
         pipeline = SynthesisPipelineMixin()
-        pipeline.tts_dispatcher = SimpleNamespace(fish=fish, cache=None)
+        pipeline.tts_dispatcher = TTSDispatcher(local=MagicMock(), providers={"fish": fish}, cache=None)
         job = TTSJob(
             text="проверка", voice_channel=None, queued_at=0, author_id=1,
             guild_id=1, text_channel_id=1, voice_profile="fish-default",
@@ -126,9 +116,10 @@ class FishTtfaTests(unittest.IsolatedAsyncioTestCase):
         config.TTS_STREAM_TTFA_TIMEOUT, config.FISH_TTFA_TIMEOUT = 5.0, 0.05
         try:
             with self.assertLogs("tts_bot", "WARNING") as logs:
-                status, frames = await pipeline._stream_fish_opus_to_channel(
-                    prepared, voice, "key",
-                )
+                status, frames = await pipeline._run_stream(prepared, voice, StreamSpec(
+                    kind="opus", cache_key="key", ttfa=config.FISH_TTFA_TIMEOUT, label="Fish",
+                    open=lambda: slow_stream(),
+                ))
         finally:
             config.TTS_STREAM_TTFA_TIMEOUT, config.FISH_TTFA_TIMEOUT = saved
         self.assertEqual((status, frames), ("pre_audio", 0))
@@ -175,18 +166,16 @@ class PrefetchQuotaTests(unittest.IsolatedAsyncioTestCase):
             raise MiniMaxQuotaExhaustedError("2056")
             yield b""
 
-        cloud = SimpleNamespace(stream_audio=exhausted)
+        cloud = with_spec(SimpleNamespace(stream_audio=exhausted), MiniMaxProvider)
         pipeline = SynthesisPipelineMixin()
-        pipeline.tts_dispatcher = TTSDispatcher(
-            local=MagicMock(), cloud=cloud, config=DispatcherConfig(quota_cooldown_seconds=900),
-        )
+        pipeline.tts_dispatcher = TTSDispatcher(local=MagicMock(), config=DispatcherConfig(quota_cooldown_seconds=900), providers={"minimax": cloud})
         voice = VoiceRecord(name="mm", label="MM", description="", provider="minimax",
                             minimax=MiniMaxParams(voice_id="mm-voice"))
         job = TTSJob(text="проверка", voice_channel=None, queued_at=0, author_id=1,
                      guild_id=1, text_channel_id=1, voice_profile="mm")
         prepared = PreparedAudio(job=job, channel=asyncio.Queue())
-        self.assertEqual(await pipeline._generate_stream_into(prepared, voice), "pre_audio")
-        cb = pipeline.tts_dispatcher.circuit_breaker
+        self.assertEqual(await pipeline._stream_voice_into(prepared, voice), "pre_audio")
+        cb = pipeline.tts_dispatcher.breaker_for("minimax")
         self.assertIs(cb.state, CircuitState.OPEN)
         self.assertGreater(cb.cooldown_remaining, 800)
 

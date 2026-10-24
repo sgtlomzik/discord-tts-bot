@@ -1,6 +1,5 @@
 """Connection keep-alive, per-request HTTP log, job ids and cache logs."""
 
-import importlib.util
 import logging
 import tempfile
 import types
@@ -19,12 +18,7 @@ from ttsbot.providers import TTSCacheConfig, TTSPhraseCache
 from ttsbot.voice_registry import ElevenLabsParams, FishParams, VoiceRecord, VoiceRegistry
 
 
-def load_bot_module():
-    path = Path(__file__).resolve().parent.parent / "bot.py"
-    spec = importlib.util.spec_from_file_location("tts_bot_module_obs", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from support import load_bot_module  # noqa: E402,F401  (re-exported for other tests)
 
 
 def ok(request):

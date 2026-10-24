@@ -15,12 +15,7 @@ import unittest
 
 import httpx
 
-from ttsbot.providers import (
-    MiniMaxConfig,
-    MiniMaxError,
-    MiniMaxProvider,
-    MiniMaxVoiceNotFoundError,
-)
+from ttsbot.minimax import (MiniMaxConfig, MiniMaxError, MiniMaxProvider, MiniMaxVoiceNotFoundError)
 
 
 def _run(coro):

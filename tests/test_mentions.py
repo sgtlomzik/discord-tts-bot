@@ -7,19 +7,12 @@ substituted before the stripping step, mirroring the emoji-alias design.
 
 from __future__ import annotations
 
-import importlib.util
 import types
 import unittest
 from pathlib import Path
 
 
-def load_bot_module():
-    module_path = Path(__file__).resolve().parent.parent / "bot.py"
-    spec = importlib.util.spec_from_file_location("tts_bot_module_mentions", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+from support import load_bot_module  # noqa: E402,F401  (re-exported for other tests)
 
 
 bot = load_bot_module()
@@ -102,18 +95,14 @@ class NormalizeIntegrationTests(unittest.TestCase):
         self.assertEqual(bot.normalize_for_tts("<@1> привет"), "привет")
 
     def test_strip_for_speech_resolves(self):
-        out = bot._strip_discord_tokens_for_speech("<@1> ку", None, {"1": "Вася"})
+        out = bot.speakable_text("<@1> ку", None, {"1": "Вася"})
         self.assertEqual(out, "Вася ку")
 
     def test_mention_only_message_is_spoken(self):
-        parsed = bot.analyze_message_for_merge("<@1>", None, {"1": "Вася"})
-        self.assertEqual(parsed.spoken_text, "Вася")
-        self.assertTrue(parsed.is_mention_only)
+        self.assertEqual(bot.speakable_text("<@1>", None, {"1": "Вася"}), "Вася")
 
     def test_unresolved_mention_only_stays_empty(self):
-        parsed = bot.analyze_message_for_merge("<@1>", None, {})
-        self.assertEqual(parsed.spoken_text, "")
-        self.assertTrue(parsed.is_mention_only)
+        self.assertEqual(bot.speakable_text("<@1>", None, {}), "")
 
 
 if __name__ == "__main__":

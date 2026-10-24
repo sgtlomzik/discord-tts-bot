@@ -8,26 +8,24 @@ import json
 import logging
 import os
 from mimetypes import guess_type
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
 
+from ttsbot import config as bot_config
 from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
-from ttsbot.httpclient import attach_warmer, provider_limits
+from ttsbot.httpclient import attach_warmer, env_setting, provider_limits, retry_after_seconds
+from ttsbot.streams import StreamSpec
+from ttsbot import voice_registry
 
 log = logging.getLogger("tts_bot")
 
 
-def _env(name: str, default: str) -> str:
-    """Env value with an empty string treated as unset (as in .env.example)."""
-    return os.getenv(name, "").strip() or default
-
-
 @dataclass(frozen=True)
 class FishConfig:
-    api_key: str
+    api_key: str = field(repr=False)  # never in logs or tracebacks
     reference_id: str = ""
     model: str = "s2.1-pro-free"
     format: str = "opus"
@@ -41,14 +39,14 @@ class FishConfig:
     @classmethod
     def from_env(cls) -> "FishConfig":
         cfg = cls(
-            api_key=_env("FISH_API_KEY", ""),
-            reference_id=_env("FISH_REFERENCE_ID", ""),
-            model=_env("FISH_MODEL", "s2.1-pro-free"),
-            format=_env("FISH_FORMAT", "opus").lower(),
-            latency=_env("FISH_LATENCY", "low").lower(),
-            chunk_length=int(_env("FISH_CHUNK_LENGTH", "150")),
-            opus_bitrate=int(_env("FISH_OPUS_BITRATE", "48000")),
-            base_url=_env("FISH_BASE_URL", "https://api.fish.audio"),
+            api_key=env_setting("FISH_API_KEY", ""),
+            reference_id=env_setting("FISH_REFERENCE_ID", ""),
+            model=env_setting("FISH_MODEL", "s2.1-pro-free"),
+            format=env_setting("FISH_FORMAT", "opus").lower(),
+            latency=env_setting("FISH_LATENCY", "low").lower(),
+            chunk_length=int(env_setting("FISH_CHUNK_LENGTH", "150")),
+            opus_bitrate=int(env_setting("FISH_OPUS_BITRATE", "48000")),
+            base_url=env_setting("FISH_BASE_URL", "https://api.fish.audio"),
         )
         if cfg.format != "opus" or cfg.latency not in {"low", "balanced", "normal"}:
             raise ValueError("Fish requires opus format and a supported latency mode")
@@ -105,14 +103,6 @@ class FishRequestError(FishError, RequestError):
     """HTTP 400/404/422: this voice or text was rejected; Fish itself works."""
 
 
-def _retry_after(value: str | None) -> float | None:
-    try:
-        seconds = float(value) if value else None
-    except ValueError:
-        return None
-    return seconds if seconds is not None and seconds > 0 else None
-
-
 def _http_error(what: str, status_code: int, detail: str, retry_after: str | None = None) -> FishError:
     message = f"{what} HTTP {status_code}: {detail}"
     if status_code == 402:
@@ -120,7 +110,7 @@ def _http_error(what: str, status_code: int, detail: str, retry_after: str | Non
     if status_code in (401, 403):
         return FishAuthError(message, status_code)
     if status_code == 429:
-        return FishRateLimitError(message, status_code, _retry_after(retry_after))
+        return FishRateLimitError(message, status_code, retry_after_seconds(retry_after))
     if status_code in (400, 404, 422):
         return FishRequestError(message, status_code)
     return FishError(message, status_code)
@@ -241,6 +231,22 @@ class FishProvider:
                 flight.done = True
                 flight.condition.notify_all()
 
+    def stream_spec(self, text: str, voice) -> StreamSpec:
+        """Ogg/Opus: played as-is at pitch 0, else decoded with the pitch shift.
+
+        The cache key leaves the pitch out (ffmpeg applies it afterwards),
+        so a re-pitched voice replays its cached Ogg.
+        """
+        params = voice.fish
+        cfg = self.config
+        return StreamSpec(
+            kind="opus" if params.pitch == 0 else "ogg",
+            cache_key=cfg.cache_key(params.reference_id, params),
+            ttfa=bot_config.FISH_TTFA_TIMEOUT, label="Fish", pitch=params.pitch,
+            open=lambda: self.stream_audio(text, reference_id=params.reference_id, params=params,
+                                           request_config=cfg),
+        )
+
     async def stream_audio(
         self, text: str, *, reference_id: str = "", params: object | None = None,
         request_config: FishConfig | None = None,
@@ -346,3 +352,48 @@ class FishProvider:
             except (ValueError, KeyError, TypeError) as exc:
                 raise FishError(f"Fish clone {reference_id} state response is invalid") from exc
         raise FishError(f"Fish clone {reference_id} is still {state} after 60 seconds")
+
+
+NAME = "fish"
+
+
+def _config_from_env() -> "FishConfig":
+    """FISH_* settings; invalid ones disable Fish unless FISH_API_KEY asks for it."""
+    try:
+        return FishConfig.from_env()
+    except ValueError as exc:
+        if os.getenv("FISH_API_KEY", "").strip():
+            raise  # Fish is wanted, so a bad setting must stop startup
+        log.warning("Ignoring invalid FISH_* settings; Fish is disabled: %s", exc)
+        return FishConfig(api_key="")
+
+
+def seed_voices(registry) -> bool:
+    """Point fish-default at FISH_REFERENCE_ID; True when the catalog changed."""
+    reference_id = _config_from_env().reference_id
+    if not reference_id:
+        return False
+    current = registry.get("fish-default")
+    if current is not None and current.is_fish and current.fish is not None:
+        record = replace(current, fish=replace(current.fish, reference_id=reference_id))
+    else:
+        record = voice_registry.VoiceRecord(
+            name="fish-default", label="Fish Audio", description="Fish Audio reference voice",
+            provider=voice_registry.PROVIDER_FISH,
+            fish=voice_registry.FishParams(reference_id=reference_id),
+        )
+    if current == record:
+        return False
+    registry.add(record)
+    return True
+
+
+def create(store) -> "FishProvider | None":
+    """The Fish provider with the saved global latency, or None without FISH_API_KEY."""
+    cfg = _config_from_env()
+    if not cfg.api_key:
+        return None
+    saved = store.settings.get("fish_latency")
+    if isinstance(saved, str):
+        cfg = replace(cfg, latency=saved)
+    return FishProvider(cfg)

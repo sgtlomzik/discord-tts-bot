@@ -2,7 +2,6 @@
 
 import asyncio
 import datetime as dt
-import importlib.util
 import types
 import unittest
 from pathlib import Path
@@ -16,16 +15,12 @@ from ttsbot.elevenlabs import ElevenLabsConfig, ElevenLabsProvider
 from ttsbot.fish import FishConfig, FishProvider
 from ttsbot.gemini import GeminiConfig, GeminiProvider
 from ttsbot.httpclient import ConnectionWarmer, attach_warmer
-from ttsbot.providers import MiniMaxConfig, MiniMaxProvider, TTSDispatcher
+from ttsbot.providers import (TTSDispatcher)
+from ttsbot.minimax import (MiniMaxConfig, MiniMaxProvider)
 from ttsbot.voice_registry import ElevenLabsParams, VoiceRecord, VoiceRegistry
 
 
-def load_bot_module():
-    path = Path(__file__).resolve().parent.parent / "bot.py"
-    spec = importlib.util.spec_from_file_location("tts_bot_module_warm", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from support import load_bot_module  # noqa: E402,F401  (re-exported for other tests)
 
 
 class WarmerTests(unittest.IsolatedAsyncioTestCase):
@@ -67,10 +62,7 @@ class WarmerTests(unittest.IsolatedAsyncioTestCase):
             "gemini": GeminiProvider(GeminiConfig(api_key="k")),
             "minimax": MiniMaxProvider(MiniMaxConfig(api_key="k", base_url="https://api.minimax.io")),
         }
-        dispatcher = TTSDispatcher(
-            local=MagicMock(), cloud=providers["minimax"], fish=providers["fish"],
-            gemini=providers["gemini"], elevenlabs=providers["elevenlabs"],
-        )
+        dispatcher = TTSDispatcher(local=MagicMock(), providers={"minimax": providers["minimax"], "fish": providers["fish"], "gemini": providers["gemini"], "elevenlabs": providers["elevenlabs"]})
         hosts = {
             "elevenlabs": "api.elevenlabs.io", "fish": "api.fish.audio",
             "gemini": "openrouter.ai", "minimax": "api.minimax.io",
@@ -152,7 +144,7 @@ class DeliveryLogTests(unittest.IsolatedAsyncioTestCase):
         async def noop(*args, **kwargs):
             return None
 
-        bot.queue_or_merge_message = noop
+        bot.queue_message = noop
         bot.process_commands = noop
         created = discord.utils.utcnow() - dt.timedelta(milliseconds=120)
         message = types.SimpleNamespace(

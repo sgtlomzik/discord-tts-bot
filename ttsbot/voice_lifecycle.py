@@ -178,7 +178,7 @@ class VoiceLifecycleMixin:
             log.exception("Idle disconnect task failed guild=%s", guild.id)
 
     def schedule_continuous_idle_stop(self, guild: discord.Guild) -> None:
-        if not config.TTS_CONTINUOUS_STREAM or config.TTS_MAX_CONTINUOUS_IDLE_SECONDS <= 0:
+        if config.TTS_MAX_CONTINUOUS_IDLE_SECONDS <= 0:
             return
 
         self.cancel_continuous_idle_stop(guild.id)

@@ -13,16 +13,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
 
-from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError
-from ttsbot.httpclient import attach_warmer, provider_limits
+from ttsbot import config as bot_config
+from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
+from ttsbot.httpclient import attach_warmer, env_setting, provider_limits, retry_after_seconds
+from ttsbot.streams import StreamSpec
 
 log = logging.getLogger("tts_bot")
 
@@ -53,14 +54,9 @@ GEMINI_VOICE_STYLES = {
 GEMINI_VOICES = tuple(sorted(GEMINI_VOICE_STYLES))
 
 
-def _env(name: str, default: str) -> str:
-    """Env value with an empty string treated as unset (as in .env.example)."""
-    return os.getenv(name, "").strip() or default
-
-
 @dataclass(frozen=True)
 class GeminiConfig:
-    api_key: str
+    api_key: str = field(repr=False)  # never in logs or tracebacks
     model: str = DEFAULT_MODEL
     voice: str = DEFAULT_VOICE
     base_url: str = DEFAULT_BASE_URL
@@ -70,12 +66,12 @@ class GeminiConfig:
     @classmethod
     def from_env(cls) -> "GeminiConfig":
         return cls(
-            api_key=_env("OPENROUTER_API_KEY", ""),
-            model=_env("GEMINI_TTS_MODEL", DEFAULT_MODEL),
-            voice=_env("GEMINI_TTS_VOICE", DEFAULT_VOICE),
-            base_url=_env("OPENROUTER_BASE_URL", DEFAULT_BASE_URL),
-            app_title=_env("OPENROUTER_APP_TITLE", ""),
-            referer=_env("OPENROUTER_REFERER", ""),
+            api_key=env_setting("OPENROUTER_API_KEY", ""),
+            model=env_setting("GEMINI_TTS_MODEL", DEFAULT_MODEL),
+            voice=env_setting("GEMINI_TTS_VOICE", DEFAULT_VOICE),
+            base_url=env_setting("OPENROUTER_BASE_URL", DEFAULT_BASE_URL),
+            app_title=env_setting("OPENROUTER_APP_TITLE", ""),
+            referer=env_setting("OPENROUTER_REFERER", ""),
         )
 
     def cache_key(self, params: object | None = None) -> str:
@@ -103,6 +99,11 @@ class GeminiAuthError(GeminiError, AuthError):
     """HTTP 401/403: the OpenRouter key is invalid or not allowed."""
 
 
+class GeminiRequestError(GeminiError, RequestError):
+    """HTTP 400/404/413/422: OpenRouter rejected this request (input,
+    voice, length), not the provider: other messages still work."""
+
+
 class GeminiQuotaExhaustedError(GeminiError, QuotaExhaustedError):
     """HTTP 402: the OpenRouter credits are used up."""
 
@@ -116,14 +117,6 @@ class GeminiRateLimitError(GeminiError, RateLimitError):
         self.retry_after = retry_after
 
 
-def _retry_after(value: str | None) -> float | None:
-    try:
-        seconds = float(value) if value else None
-    except ValueError:
-        return None  # HTTP-date form: treat as an ordinary failure
-    return seconds if seconds is not None and seconds > 0 else None
-
-
 def _http_error(response: httpx.Response, detail: str) -> GeminiError:
     status = response.status_code
     message = f"OpenRouter HTTP {status}: {detail}"
@@ -132,7 +125,9 @@ def _http_error(response: httpx.Response, detail: str) -> GeminiError:
     if status == 402:
         return GeminiQuotaExhaustedError(message, status)
     if status == 429:
-        return GeminiRateLimitError(message, status, _retry_after(response.headers.get("retry-after")))
+        return GeminiRateLimitError(message, status, retry_after_seconds(response.headers.get("retry-after")))
+    if status in (400, 404, 413, 422):
+        return GeminiRequestError(message, status)
     return GeminiError(message, status)
 
 
@@ -224,6 +219,17 @@ class GeminiProvider:
             headers["HTTP-Referer"] = self.config.referer
         return headers
 
+    def stream_spec(self, text: str, voice) -> StreamSpec:
+        """Raw PCM. OpenRouter sends nothing until the whole clip is
+        generated, so the first-audio budget grows with the text."""
+        params = voice.gemini
+        return StreamSpec(
+            kind="pcm", cache_key=self.config.cache_key(params),
+            ttfa=bot_config.GEMINI_TTFA_TIMEOUT + bot_config.GEMINI_TTFA_PER_CHAR * len(text),
+            label="Gemini", volume_db=params.volume_db,
+            open=lambda: self.open_stream(text, params),
+        )
+
     async def open_stream(self, text: str, params: object | None = None) -> GeminiAudioStream:
         """Send the request and return once the response headers are in.
 
@@ -273,3 +279,13 @@ def write_wav(filename: Path, rate: int, channels: int, pcm: bytes) -> None:
         out.setsampwidth(2)
         out.setframerate(rate)
         out.writeframes(pcm)
+
+
+NAME = "gemini"
+
+
+def create(store=None) -> "GeminiProvider | None":
+    """Gemini TTS through OpenRouter, enabled by OPENROUTER_API_KEY alone;
+    voices are added with /voicebot voice-add provider:gemini."""
+    cfg = GeminiConfig.from_env()
+    return GeminiProvider(cfg) if cfg.api_key else None

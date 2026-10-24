@@ -192,6 +192,23 @@ class TTSCacheByteEvictionTests(unittest.TestCase):
         self.assertEqual(hit.read_bytes(), b"HELLO_AUDIO")
         self.assertEqual(c2.total_bytes, len(b"HELLO_AUDIO"))
 
+    def test_a_used_entry_outlives_unused_ones_across_a_restart(self):
+        import os
+        import time
+
+        config = TTSCacheConfig(enabled=True, max_entries=2, cache_dir=self.cache_dir)
+        cache = TTSPhraseCache(config)
+        for text in ("a", "b"):
+            cache.store(text, self._src(f"{text}.mp3", text.encode()), "v")
+        now = time.time()
+        os.utime(cache.lookup("a", "v"), (now - 100, now - 100))  # a: stored long ago
+        os.utime(cache.lookup("b", "v"), (now - 50, now - 50))
+        self.assertIsNotNone(cache.lookup("a", "v"))  # ...but just used
+        restarted = TTSPhraseCache(config)
+        restarted.store("c", self._src("c.mp3", b"c"), "v")
+        self.assertIsNotNone(restarted.lookup("a", "v"))
+        self.assertIsNone(restarted.lookup("b", "v"))
+
     def test_commit_file_registers_streaming_output(self):
         cache = self._cache(max_bytes=10_000)
         target = cache.cache_path_for("да", "bussshy01")
@@ -206,82 +223,6 @@ class TTSCacheByteEvictionTests(unittest.TestCase):
     def test_commit_file_missing_returns_none(self):
         cache = self._cache(max_bytes=10_000)
         self.assertIsNone(cache.commit_file("x", self.cache_dir / "nope.mp3", "v"))
-
-
-class DispatcherCacheIntegrationTests(unittest.TestCase):
-    """End-to-end: dispatcher consults cache before invoking providers."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def _run(self, coro):
-        import asyncio
-        return asyncio.new_event_loop().run_until_complete(coro)
-
-    def _write_bytes_provider(self, payload):
-        async def fake_piper(text, filename, voice_profile):
-            filename.write_bytes(payload)
-        return fake_piper
-
-    def test_second_call_for_same_text_hits_cache_and_skips_provider(self):
-        from ttsbot.providers import (
-            DispatcherConfig, LocalProvider, PrimaryProvider, TTSDispatcher,
-        )
-        calls = {"n": 0}
-
-        async def fake_piper(text, filename, voice_profile):
-            calls["n"] += 1
-            filename.write_bytes(b"PIPER_OUT")
-
-        local = LocalProvider(fake_piper)
-        cache_dir = Path(self.tmp.name) / "cache"
-        cache = TTSPhraseCache(TTSCacheConfig(
-            enabled=True, max_entries=8, cache_dir=cache_dir,
-        ))
-        d = TTSDispatcher(
-            local=local, config=DispatcherConfig(primary=PrimaryProvider.LOCAL),
-            cache=cache,
-        )
-        # First call: misses cache, invokes Piper, stores result.
-        target_a = Path(self.tmp.name) / "out_a.mp3"
-        used_a = self._run(d.synthesize("бб", target_a))
-        self.assertEqual(used_a, "local")
-        self.assertEqual(calls["n"], 1)
-        # Second call for the same text: hits cache, does NOT invoke Piper.
-        target_b = Path(self.tmp.name) / "out_b.mp3"
-        used_b = self._run(d.synthesize("бб", target_b))
-        self.assertEqual(used_b, "cache")
-        self.assertEqual(calls["n"], 1)
-        # Both targets have the same payload.
-        self.assertEqual(target_a.read_bytes(), b"PIPER_OUT")
-        self.assertEqual(target_b.read_bytes(), b"PIPER_OUT")
-
-    def test_cache_disabled_does_not_short_circuit(self):
-        from ttsbot.providers import (
-            DispatcherConfig, LocalProvider, PrimaryProvider, TTSDispatcher,
-        )
-        calls = {"n": 0}
-
-        async def fake_piper(text, filename, voice_profile):
-            calls["n"] += 1
-            filename.write_bytes(b"X")
-
-        local = LocalProvider(fake_piper)
-        # Cache object exists but is disabled.
-        cache = TTSPhraseCache(TTSCacheConfig(
-            enabled=False, max_entries=8, cache_dir=Path(self.tmp.name),
-        ))
-        d = TTSDispatcher(
-            local=local, config=DispatcherConfig(primary=PrimaryProvider.LOCAL),
-            cache=cache,
-        )
-        self._run(d.synthesize("hello", Path(self.tmp.name) / "x1.mp3"))
-        self._run(d.synthesize("hello", Path(self.tmp.name) / "x2.mp3"))
-        # Provider called twice because cache is disabled.
-        self.assertEqual(calls["n"], 2)
 
 
 if __name__ == "__main__":

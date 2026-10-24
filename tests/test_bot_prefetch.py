@@ -15,9 +15,12 @@ from test_bot_streaming import (
     FakeSource,
     _MP3,
     _chunks,
+    _chunks_then_raise,
     _minimax_voice,
 )
 from ttsbot.providers import TTSCacheConfig, TTSPhraseCache, voice_cache_key
+from ttsbot.minimax import (MiniMaxProvider)
+from types import MethodType
 
 
 def _job(bot_mod, text="привет", gid=1):
@@ -55,26 +58,43 @@ class StreamToChannelTests(unittest.IsolatedAsyncioTestCase):
         tts_bot.tts_dispatcher._cache = cache
         cloud = MagicMock()
         cloud.stream_audio = lambda *a, **k: _chunks(_MP3)
-        tts_bot.tts_dispatcher._cloud = cloud
+        cloud.stream_spec = MethodType(MiniMaxProvider.stream_spec, cloud)
+        tts_bot.tts_dispatcher.register("minimax", cloud)
 
         job = _job(bot_mod)
         prepared = bot_mod.PreparedAudio(job=job, channel=asyncio.Queue())
-        status, frames = await tts_bot._stream_to_channel(prepared, _minimax_voice())
-        batches = _drain_nowait(prepared)  # _stream_to_channel emits no sentinel
+        status, frames = await tts_bot._run_stream(prepared, _minimax_voice(), cloud.stream_spec(prepared.job.text, _minimax_voice()))
+        batches = _drain_nowait(prepared)  # _run_stream emits no sentinel
         self.assertEqual(status, "ok")
         self.assertGreater(frames, 0)
         self.assertEqual(sum(len(b) for b in batches), frames)
         self.assertIsNotNone(cache.lookup(job.text, voice_cache_key(_minimax_voice())))  # committed
+
+    async def test_a_decoded_stream_broken_after_audio_counts_against_the_provider(self):
+        bot_mod = load_bot_module()
+        tts_bot = bot_mod.TTSBot()
+        cloud = MagicMock()
+        cloud.stream_audio = lambda *a, **k: _chunks_then_raise(_MP3)
+        cloud.stream_spec = MethodType(MiniMaxProvider.stream_spec, cloud)
+        tts_bot.tts_dispatcher.register("minimax", cloud)
+        tts_bot.voice_registry.add(_minimax_voice())
+        prepared = bot_mod.PreparedAudio(job=_job(bot_mod), channel=asyncio.Queue())
+        status = await tts_bot._stream_voice_into(prepared, _minimax_voice())
+        _drain_nowait(prepared)
+        self.assertEqual(status, "truncated")
+        self.assertIsInstance(prepared.error, RuntimeError)
+        self.assertEqual(tts_bot.tts_dispatcher.breaker_for("minimax").consecutive_failures, 1)
 
     async def test_cancelled_before_audio_yields_no_frames(self):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
         cloud = MagicMock()
         cloud.stream_audio = lambda *a, **k: _chunks(_MP3)
-        tts_bot.tts_dispatcher._cloud = cloud
+        cloud.stream_spec = MethodType(MiniMaxProvider.stream_spec, cloud)
+        tts_bot.tts_dispatcher.register("minimax", cloud)
         prepared = bot_mod.PreparedAudio(job=_job(bot_mod), channel=asyncio.Queue())
         prepared.cancelled = True
-        status, frames = await tts_bot._stream_to_channel(prepared, _minimax_voice())
+        status, frames = await tts_bot._run_stream(prepared, _minimax_voice(), cloud.stream_spec(prepared.job.text, _minimax_voice()))
         _drain_nowait(prepared)
         self.assertEqual(status, "cancelled")
         self.assertEqual(frames, 0)
@@ -98,7 +118,8 @@ class PrepareIntoTests(unittest.IsolatedAsyncioTestCase):
 
         cloud = MagicMock()
         cloud.stream_audio = MagicMock(side_effect=AssertionError("API on cache hit!"))
-        tts_bot.tts_dispatcher._cloud = cloud
+        cloud.stream_spec = MethodType(MiniMaxProvider.stream_spec, cloud)
+        tts_bot.tts_dispatcher.register("minimax", cloud)
 
         prepared = bot_mod.PreparedAudio(job=job, channel=asyncio.Queue())
         await tts_bot._prepare_into(prepared)
@@ -111,11 +132,11 @@ class PrepareIntoTests(unittest.IsolatedAsyncioTestCase):
         bot_mod = load_bot_module()
         tts_bot = bot_mod.TTSBot()
 
-        async def fake_synth(text, filename, voice=None, fallbacks=None):
+        async def fake_synth(text, filename, voice=None):
             Path(filename).write_bytes(_MP3)
-            return "local", voice
+            return "local"
 
-        tts_bot.tts_dispatcher.synthesize_chain = AsyncMock(side_effect=fake_synth)
+        tts_bot.tts_dispatcher.synthesize_piper = AsyncMock(side_effect=fake_synth)
         prepared = bot_mod.PreparedAudio(job=_job(bot_mod), channel=asyncio.Queue())
         await tts_bot._prepare_into(prepared)
         batches = await _drain(prepared)
@@ -130,7 +151,8 @@ class PipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         tts_bot = bot_mod.TTSBot()
         cloud = MagicMock()
         cloud.stream_audio = lambda *a, **k: _chunks(_MP3)
-        tts_bot.tts_dispatcher._cloud = cloud
+        cloud.stream_spec = MethodType(MiniMaxProvider.stream_spec, cloud)
+        tts_bot.tts_dispatcher.register("minimax", cloud)
         tts_bot.voice_registry.add(_minimax_voice())  # jobs resolve to streaming
 
         played: list[int] = []

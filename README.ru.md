@@ -29,9 +29,6 @@ OpenRouter). При сбое облачного движка бот перекл
   Соединения с облачными провайдерами держатся открытыми 120 с и
   прогреваются, пока пользователь печатает, поэтому сообщение после паузы
   не ждёт TLS-рукопожатия.
-- **Умная склейка сообщений** — серия коротких сообщений одного человека
-  объединяется в одну естественную фразу (`selective_hold_v2`), а реакции,
-  эмодзи и вопросы озвучиваются сразу.
 - **Текст готовится к речи** — ссылки и разметка вырезаются, unicode-эмодзи
   проговариваются русскими названиями, упоминания читаются как ники,
   кастомным эмодзи сервера можно задать произношение (каждый сервер —
@@ -110,8 +107,7 @@ python bot.py
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEYS` | Включает ElevenLabs; несколько ключей образуют кольцо (см. ниже) |
 | `OPENROUTER_API_KEY` | Включает голоса Gemini через OpenRouter (опционально) |
 | `TTS_QUOTA_COOLDOWN_SECONDS` | Пауза для облачного сервиса, когда закончился баланс или лимит тарифа (по умолчанию 1800) |
-| `TTS_PRIMARY_PROVIDER` | `local`, `minimax`, `fish`, `gemini` или `elevenlabs` |
-| `TTS_MERGE_ALGORITHM` | `selective_hold_v2`, `legacy` или `off` |
+| `OWNER_IDS` | Кто может менять общие для всех серверов настройки (владелец приложения бота может всегда) |
 
 Для Fish укажите в `.env` `FISH_API_KEY` и `FISH_REFERENCE_ID`, затем
 выберите `/voicebot voice-set voice:fish-default` или задайте
@@ -245,11 +241,11 @@ docker logs discord_tts_bot 2>&1 | docker run --rm -i --env-file .env   -v "$PWD
 ```bash
 python3.11 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -p 'test_*.py'  # ~360 тестов, сеть не нужна
+python -m unittest discover -s tests -p 'test_*.py'  # ~650 тестов, сеть не нужна
 ```
 
-Код приложения — в пакете `ttsbot/`; `bot.py` — точка входа и composition
-root. Карта модулей и поток выполнения — в
+Код приложения — в пакете `ttsbot/`; `bot.py` — точка входа, сборка бота
+(composition root) — в `ttsbot/app.py`. Карта модулей и поток выполнения — в
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Исторические заметки — в
 [docs/internal/](docs/internal/).
 

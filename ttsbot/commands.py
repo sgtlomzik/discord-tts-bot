@@ -251,7 +251,7 @@ def build_commands(bot):
         provider = getattr(interaction.namespace, "provider", None)
         current = current.lower()
         if provider == "elevenlabs":
-            elevenlabs = bot.tts_dispatcher.elevenlabs
+            elevenlabs = bot.tts_dispatcher.provider_for("elevenlabs")
             voices = await elevenlabs.list_voices() if elevenlabs is not None else []
             return [
                 app_commands.Choice(name=f"{title} ({voice_id})"[:100], value=voice_id)
@@ -280,7 +280,6 @@ def build_commands(bot):
         guild = interaction.guild
         assert guild is not None
         bot.config_store.set_enabled(guild.id, False)
-        bot.clear_merge_buffers(guild.id)
         cleared = bot.clear_queue_for_guild(guild.id)
         await bot.disconnect_guild_voice(guild)
         await interaction.response.send_message(f"TTS отключен. Очередь очищена: {cleared}.", ephemeral=True)
@@ -457,7 +456,7 @@ def build_commands(bot):
             await interaction.response.send_message("Укажите voice_id.", ephemeral=True)
             return
         if provider is not None and provider.value == "elevenlabs":
-            if bot.tts_dispatcher.elevenlabs is None:
+            if bot.tts_dispatcher.provider_for("elevenlabs") is None:
                 await interaction.response.send_message(
                     "ElevenLabs не настроен (нет ELEVENLABS_API_KEY).", ephemeral=True,
                 )
@@ -468,7 +467,7 @@ def build_commands(bot):
                 )
                 return
             await interaction.response.defer(ephemeral=True, thinking=True)
-            titles = dict(await bot.tts_dispatcher.elevenlabs.list_voices())
+            titles = dict(await bot.tts_dispatcher.provider_for("elevenlabs").list_voices())
             title = titles.get(voice_id, "").split(" - ")[0] or voice_id
             error = await bot.register_elevenlabs_voice(
                 name=name, voice_id=voice_id,
@@ -484,7 +483,7 @@ def build_commands(bot):
             )
             return
         if provider is not None and provider.value == "gemini":
-            if bot.tts_dispatcher.gemini is None:
+            if bot.tts_dispatcher.provider_for("gemini") is None:
                 await interaction.response.send_message(
                     "Gemini не настроен (нет OPENROUTER_API_KEY).", ephemeral=True,
                 )
@@ -571,7 +570,7 @@ def build_commands(bot):
                 "Укажите Fish reference_id из библиотеки.", ephemeral=True,
             )
             return
-        fish = bot.tts_dispatcher.fish
+        fish = bot.tts_dispatcher.provider_for("fish")
         if fish is None:
             await interaction.response.send_message(
                 "Fish Audio не настроен (нет FISH_API_KEY).", ephemeral=True,
@@ -632,7 +631,7 @@ def build_commands(bot):
                 "Нужен аудиофайл (mp3/m4a/wav/ogg/opus/flac).", ephemeral=True
             )
             return
-        if bot.tts_dispatcher.fish is None:
+        if bot.tts_dispatcher.provider_for("fish") is None:
             await interaction.response.send_message(
                 "Fish Audio не настроен (нет FISH_API_KEY) — клонирование недоступно.",
                 ephemeral=True,
@@ -753,7 +752,7 @@ def build_commands(bot):
         await interaction.response.send_message(
             f"Fish-голос `{name}` настроен: эмоция `{tuned.emotion or 'без метки'}`, "
             f"скорость `{tuned.speed}`, тон `{tuned.pitch}`, громкость `{tuned.volume_db} dB`, "
-            f"модель `{tuned.model or (bot.tts_dispatcher.fish.config.model if bot.tts_dispatcher.fish else 's2.1-pro-free')}`, "
+            f"модель `{tuned.model or (bot.tts_dispatcher.provider_for('fish').config.model if bot.tts_dispatcher.provider_for('fish') else 's2.1-pro-free')}`, "
             f"temperature `{tuned.temperature}`, top_p `{tuned.top_p}`.",
             ephemeral=True,
         )
@@ -926,7 +925,7 @@ def build_commands(bot):
         def shown(value) -> str:
             return "как у голоса" if value is None else f"{value:g}"
 
-        elevenlabs = bot.tts_dispatcher.elevenlabs
+        elevenlabs = bot.tts_dispatcher.provider_for("elevenlabs")
         configured = elevenlabs.config.model if elevenlabs is not None else "eleven_v4_turbo"
         await interaction.response.send_message(
             f"Голос `{name}` настроен: stability `{shown(tuned.stability)}`, "
@@ -1193,11 +1192,9 @@ def build_commands(bot):
     def _build_stats_embed() -> discord.Embed:
         disp = bot.tts_dispatcher
         cache = getattr(disp, "cache", None)
-        cb = getattr(disp, "circuit_breaker", None)
-        cloud = getattr(disp, "cloud", None)
-        fish = getattr(disp, "fish", None)
-        gemini = getattr(disp, "gemini", None)
-        elevenlabs = getattr(disp, "elevenlabs", None)
+        fish = disp.provider_for("fish")
+        gemini = disp.provider_for("gemini")
+        elevenlabs = disp.provider_for("elevenlabs")
         embed = discord.Embed(title="📊 TTS • Статистика", color=0x5865F2)
         if cache is not None:
             hits, misses = cache.hits, cache.misses
@@ -1219,18 +1216,11 @@ def build_commands(bot):
             kind = f" {breaker.kind.value}" if getattr(breaker, "kind", None) else ""
             return f"`{breaker.state.value}`{kind}" + (f" ({left:.0f} с)" if left else "")
 
-        breakers = []
-        if fish is not None:
-            breakers.append(f"Fish {_cb_state(getattr(disp, 'fish_circuit_breaker', None))}")
-        if gemini is not None:
-            breakers.append(f"Gemini {_cb_state(getattr(disp, 'gemini_circuit_breaker', None))}")
-        if elevenlabs is not None:
-            breakers.append(
-                f"ElevenLabs {_cb_state(getattr(disp, 'elevenlabs_circuit_breaker', None))}"
-            )
-        if cloud is not None or (fish is None and gemini is None and elevenlabs is None):
-            breakers.append(f"MiniMax {_cb_state(cb)}")
-        embed.add_field(name="Circuit breaker", value=" · ".join(breakers), inline=True)
+        breakers = [
+            f"{disp.breaker_for(name).name} {_cb_state(disp.breaker_for(name))}"
+            for name in disp.provider_names()
+        ]
+        embed.add_field(name="Circuit breaker", value=" · ".join(breakers) or "—", inline=True)
         if fish is not None:
             embed.add_field(
                 name="Fish запросы / символы (сессия)",
@@ -1261,12 +1251,14 @@ def build_commands(bot):
                 ),
                 inline=True,
             )
-        chars = getattr(cloud, "session_chars", None)
-        embed.add_field(
-            name="MiniMax символы (сессия)",
-            value=_fmt_int(chars) if chars is not None else "—",
-            inline=True,
-        )
+        minimax = disp.provider_for("minimax")
+        if minimax is not None:
+            chars = getattr(minimax, "session_chars", None)
+            embed.add_field(
+                name="MiniMax символы (сессия)",
+                value=_fmt_int(chars) if chars is not None else "—",
+                inline=True,
+            )
         embed.add_field(
             name="Аптайм", value=_fmt_uptime(time.time() - bot.started_at), inline=True
         )
@@ -1276,15 +1268,7 @@ def build_commands(bot):
     def _build_settings_embed() -> discord.Embed:
         cache_on = getattr(bot.tts_dispatcher, "cache", None) is not None
         embed = discord.Embed(title="⚙️ TTS • Настройки", color=0x57F287)
-        embed.add_field(name="Склейка сообщений", value=f"`{config.TTS_MERGE_ALGORITHM}`", inline=True)
         embed.add_field(name="Кэш", value="вкл" if cache_on else "выкл", inline=True)
-        embed.add_field(name="Стриминг", value="вкл" if config.TTS_STREAMING_ENABLED else "выкл", inline=True)
-        embed.add_field(name="Префетч", value="вкл" if config.TTS_PREFETCH_ENABLED else "выкл", inline=True)
-        embed.add_field(
-            name="Непрерывный поток",
-            value="вкл" if config.TTS_CONTINUOUS_STREAM else "выкл",
-            inline=True,
-        )
         embed.add_field(name="Лимит символов", value=str(config.TTS_MAX_CHARS), inline=True)
         embed.add_field(name="Fish latency", value=f"`{bot.fish_latency}`", inline=True)
         if config.TTS_AUDIO_LIMIT_ENABLED:
@@ -1326,7 +1310,7 @@ def build_commands(bot):
                 if rec.minimax.emotion:
                     extra += f" · {rec.minimax.emotion}"
             elif rec.is_fish and rec.fish is not None:
-                configured = bot.tts_dispatcher.fish.config.model if bot.tts_dispatcher.fish else "s2.1-pro-free"
+                configured = bot.tts_dispatcher.provider_for("fish").config.model if bot.tts_dispatcher.provider_for("fish") else "s2.1-pro-free"
                 extra = f" · {rec.fish.model or configured}"
                 if rec.fish.emotion:
                     extra += f" · {rec.fish.emotion}"
@@ -1334,8 +1318,8 @@ def build_commands(bot):
                 extra = f" · {rec.gemini.voice}"
             elif rec.is_elevenlabs and rec.elevenlabs is not None:
                 configured = (
-                    bot.tts_dispatcher.elevenlabs.config.model
-                    if bot.tts_dispatcher.elevenlabs else "eleven_v4_turbo"
+                    bot.tts_dispatcher.provider_for("elevenlabs").config.model
+                    if bot.tts_dispatcher.provider_for("elevenlabs") else "eleven_v4_turbo"
                 )
                 extra = f" · {rec.elevenlabs.model or configured}"
             lines.append(f"`{name}` [{tag}]{extra}")
@@ -1412,7 +1396,6 @@ def build_commands(bot):
                     f"Queue: `{bot.message_queue.qsize()}`",
                     f"Default voice: `{guild_config.default_voice}`",
                     f"Allowed users: `{len(guild_config.allowed_users)}`",
-                    f"Merge: `{config.TTS_MERGE_SHORT_MESSAGES}`",
                     "Workers: " + (", ".join(
                         f"`{name}` {'ok' if st.running else 'stopped'}"
                         + (f" (restarts {st.restarts}: {st.last_error})" if st.restarts else "")
@@ -1492,7 +1475,6 @@ def build_commands(bot):
             return
         guild = interaction.guild
         assert guild is not None
-        bot.clear_merge_buffers(guild.id)
         cleared = bot.clear_queue_for_guild(guild.id)
         await interaction.response.send_message(f"Очередь очищена: {cleared}.", ephemeral=True)
 

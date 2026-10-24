@@ -212,6 +212,11 @@ class CircuitBreaker:
         """When the current pause ends (clock time), None unless OPEN."""
         if self._state is not CircuitState.OPEN or self._opened_at is None:
             return None
+        now = self._clock()
+        if self._opened_at > now:
+            # The wall clock stepped back (or a saved pause is dated in the
+            # future): restart the pause now so it never outlasts its length.
+            self._opened_at = now
         return self._opened_at + self._cooldown
 
     @property

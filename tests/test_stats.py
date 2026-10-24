@@ -7,7 +7,6 @@ not raise; the view must expose the three tab buttons.
 
 from __future__ import annotations
 
-import importlib.util
 import types
 import unittest
 from pathlib import Path
@@ -15,13 +14,7 @@ from pathlib import Path
 import discord
 
 
-def load_bot_module():
-    module_path = Path(__file__).resolve().parent.parent / "bot.py"
-    spec = importlib.util.spec_from_file_location("tts_bot_module_stats", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+from support import load_bot_module  # noqa: E402,F401  (re-exported for other tests)
 
 
 bot = load_bot_module()
@@ -51,7 +44,7 @@ class EmbedBuilderTests(unittest.TestCase):
         embed = bot._build_settings_embed()
         self.assertIsInstance(embed, discord.Embed)
         names = [f.name for f in embed.fields]
-        self.assertIn("Склейка сообщений", names)
+        self.assertIn("Кэш", names)
         self.assertIn("Лимит символов", names)
 
     def test_voices_embed_without_guild(self):

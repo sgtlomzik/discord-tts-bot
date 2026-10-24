@@ -8,7 +8,6 @@ are attached from the outside by the composition root (bot.py).
 
 import asyncio
 import logging
-import os
 import time
 import zoneinfo
 from dataclasses import replace
@@ -18,23 +17,20 @@ import discord
 from discord.ext import commands
 
 from ttsbot import voice_registry
-from ttsbot.elevenlabs import ElevenLabsConfig, ElevenLabsProvider
-from ttsbot.fish import FishConfig, FishProvider
-from ttsbot.gemini import GeminiConfig, GeminiProvider
+from ttsbot import plugins
+from ttsbot.fish import FishConfig
 from ttsbot.health import HealthStore
 from ttsbot.providers import (
     LocalProvider,
     TTSDispatcher,
     TTSPhraseCache,
     load_cache_config_from_env,
-    load_circuit_breaker_from_env,
     load_dispatcher_config_from_env,
-    load_minimax_config_from_env,
 )
+from ttsbot.minimax import load_minimax_config_from_env
 from ttsbot import config
 from ttsbot.audio import ContinuousTTSAudioSource
-from ttsbot.merge import MergeQueueMixin
-from ttsbot.messages import MergeBufferState
+from ttsbot.intake import MessageQueueMixin
 from ttsbot.models import PreparedAudio, TTSJob, VOICE_PROFILES
 from ttsbot.pipeline import SynthesisPipelineMixin
 from ttsbot.playback import PlaybackMixin
@@ -54,7 +50,7 @@ intents.guilds = True
 
 class TTSBot(
     VoiceLifecycleMixin,
-    MergeQueueMixin,
+    MessageQueueMixin,
     SynthesisPipelineMixin,
     PlaybackMixin,
     commands.Bot,
@@ -83,10 +79,10 @@ class TTSBot(
         self.voice_connect_locks: dict[int, asyncio.Lock] = {}
         self.voice_connect_cooldown_until: dict[int, float] = {}
         self.suppress_auto_connect_until: dict[int, float] = {}
-        # Unified voice catalog (Piper + MiniMax). Seeded on first start
-        # from the hardcoded VOICE_PROFILES + MINIMAX_VOICE_ID; thereafter
-        # loaded from data/voices.json. Selection state stays separate in
-        # BotConfigStore.
+        # Unified voice catalog: data/voices.json, seeded on first start
+        # from the Piper profiles (and MINIMAX_VOICE_ID); then each plugin
+        # points its default voice at its env setting (fish-default, ...).
+        # Selection state stays separate in BotConfigStore.
         _mm_seed = load_minimax_config_from_env()
         self.voice_registry = voice_registry.load_or_seed(
             config.VOICES_REGISTRY_PATH,
@@ -96,68 +92,16 @@ class TTSBot(
             minimax_model=_mm_seed.model,
             minimax_language_boost=_mm_seed.language_boost,
         )
-        try:
-            fish_cfg = FishConfig.from_env()
-        except ValueError as exc:
-            if os.getenv("FISH_API_KEY", "").strip():
-                raise  # Fish is wanted, so a bad setting must stop startup
-            log.warning("Ignoring invalid FISH_* settings; Fish is disabled: %s", exc)
-            fish_cfg = FishConfig(api_key="")
-        self.fish_provider = FishProvider(fish_cfg) if fish_cfg.api_key else None
-        if fish_cfg.reference_id:
-            current = self.voice_registry.get("fish-default")
-            if current is not None and current.is_fish and current.fish is not None:
-                fish_record = replace(current, fish=replace(current.fish, reference_id=fish_cfg.reference_id))
-            else:
-                fish_record = voice_registry.VoiceRecord(
-                    name="fish-default", label="Fish Audio", description="Fish Audio reference voice",
-                    provider=voice_registry.PROVIDER_FISH,
-                    fish=voice_registry.FishParams(reference_id=fish_cfg.reference_id),
-                )
-            if current != fish_record:
-                self.voice_registry.add(fish_record)
-                try:
-                    voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
-                except OSError:
-                    log.exception("Could not save fish-default to %s; keeping it in memory",
-                                  config.VOICES_REGISTRY_PATH)
+        if plugins.seed_voices(self.voice_registry):
+            try:
+                voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
+            except OSError:
+                log.exception("Could not save the seeded voices to %s; keeping them in memory",
+                              config.VOICES_REGISTRY_PATH)
         self.config_store = BotConfigStore(
             config.BOT_CONFIG_PATH, config.WHITELIST_USERS, voice_registry=self.voice_registry
         )
-        saved_latency = self.config_store.settings.get("fish_latency")
-        self.fish_config = replace(fish_cfg, latency=saved_latency) if isinstance(saved_latency, str) else fish_cfg
-        if self.fish_provider is not None:
-            self.fish_provider.config = self.fish_config
-        # Gemini TTS through OpenRouter: enabled by OPENROUTER_API_KEY alone;
-        # voices are added with /voicebot voice-add provider:gemini.
-        gemini_cfg = GeminiConfig.from_env()
-        self.gemini_provider = GeminiProvider(gemini_cfg) if gemini_cfg.api_key else None
-        # ElevenLabs: enabled by ELEVENLABS_API_KEY; ELEVENLABS_VOICE_ID seeds
-        # the eleven-default voice, others come from voice-add provider:elevenlabs.
-        try:
-            eleven_cfg = ElevenLabsConfig.from_env()
-        except ValueError as exc:
-            if os.getenv("ELEVENLABS_API_KEY", "").strip():
-                raise  # ElevenLabs is wanted, so a bad setting must stop startup
-            log.warning("Ignoring invalid ELEVENLABS_* settings; ElevenLabs is disabled: %s", exc)
-            eleven_cfg = ElevenLabsConfig(api_key="")
-        saved_key = self.config_store.settings.get("elevenlabs_key")
-        self.elevenlabs_provider = ElevenLabsProvider(
-            eleven_cfg,
-            active_key=saved_key if isinstance(saved_key, str) else "",
-            on_key_switch=self.config_store.set_elevenlabs_key,
-        ) if eleven_cfg.api_key else None
-        if self.elevenlabs_provider is not None:
-            log.info("ElevenLabs enabled keys=%d active=#%d format=%s model=%s",
-                     len(eleven_cfg.keys), self.elevenlabs_provider.active_key_index + 1,
-                     eleven_cfg.format, eleven_cfg.model)
-        if self.elevenlabs_provider is not None and eleven_cfg.voice_id:
-            self._seed_elevenlabs_default(eleven_cfg.voice_id)
         self.piper_voices: dict[tuple[str, str], object] = {}
-        # TTS provider abstraction (see ttsbot/providers.py). Skeleton
-        # behavior in this commit: dispatcher always routes to local.
-        # Cloud provider (MiniMax) and full CB logic land in commits 3+
-        # and 6 respectively.
         cache_cfg = load_cache_config_from_env()
         self.tts_cache = TTSPhraseCache(cache_cfg) if cache_cfg.enabled else None
         # Wrap generate_piper_file so the dispatcher's piper callback
@@ -169,61 +113,32 @@ class TTSBot(
             )
         self.tts_dispatcher = TTSDispatcher(
             local=LocalProvider(_piper_synthesize),
-            cloud=self._build_cloud_provider(),
-            fish=self.fish_provider,
-            gemini=self.gemini_provider,
-            elevenlabs=self.elevenlabs_provider,
+            providers=plugins.create_providers(self.config_store),
             config=load_dispatcher_config_from_env(),
-            circuit_breaker=load_circuit_breaker_from_env(),
             cache=self.tts_cache,
-            fallback_profile=self.voice_registry.fallback_profile,
         )
         # Provider pauses survive restarts: a provider out of quota stays
         # paused until its check, instead of failing the first messages.
         if config.PROVIDER_HEALTH_PATH.parent.exists():
             self.tts_dispatcher.attach_health_store(HealthStore(config.PROVIDER_HEALTH_PATH))
         self.continuous_sources: dict[int, ContinuousTTSAudioSource] = {}
-        self.merge_buffers: dict[tuple[int, int], MergeBufferState] = {}
-        self.merge_locks: dict[tuple[int, int], asyncio.Lock] = {}
-        self.merge_generations: dict[tuple[int, int], int] = {}
-        self.last_user_message_ts: dict[tuple[int, int], float] = {}
         # The catalog as saved; persist_voice_registry() rolls back to it.
         self._saved_registry = self.voice_registry.snapshot()
 
-    def _seed_elevenlabs_default(self, voice_id: str) -> None:
-        """Point eleven-default at ELEVENLABS_VOICE_ID, keeping its tuning."""
-        current = self.voice_registry.get("eleven-default")
-        if current is not None and not current.is_elevenlabs:
-            log.warning("Voice eleven-default is a %s voice; not seeding ELEVENLABS_VOICE_ID",
-                        current.provider)
-            return
-        if current is not None and current.elevenlabs is not None:
-            record = replace(current, elevenlabs=replace(current.elevenlabs, voice_id=voice_id))
-        else:
-            record = voice_registry.VoiceRecord(
-                name="eleven-default", label="ElevenLabs", description="ElevenLabs voice from .env",
-                provider=voice_registry.PROVIDER_ELEVENLABS,
-                elevenlabs=voice_registry.ElevenLabsParams(voice_id=voice_id),
-            )
-        if current == record:
-            return
-        self.voice_registry.add(record)
-        try:
-            voice_registry.save_registry(config.VOICES_REGISTRY_PATH, self.voice_registry)
-        except OSError:
-            log.exception("Could not save eleven-default to %s; keeping it in memory",
-                          config.VOICES_REGISTRY_PATH)
-
     @property
     def fish_latency(self) -> str:
-        return self.fish_config.latency
+        fish = self.tts_dispatcher.provider_for("fish")
+        if fish is not None:
+            return fish.config.latency
+        saved = self.config_store.settings.get("fish_latency")
+        return saved if isinstance(saved, str) else FishConfig(api_key="").latency
 
     def set_fish_latency(self, mode: str) -> None:
         """Persist the global Fish mode and apply it to future requests."""
         self.config_store.set_fish_latency(mode)
-        self.fish_config = replace(self.fish_config, latency=mode)
-        if self.fish_provider is not None:
-            self.fish_provider.config = self.fish_config
+        fish = self.tts_dispatcher.provider_for("fish")
+        if fish is not None:
+            fish.config = replace(fish.config, latency=mode)
 
     async def setup_hook(self) -> None:
         if self.tts_group is not None:
@@ -240,11 +155,8 @@ class TTSBot(
         except Exception:
             log.exception("Failed to sync slash commands")
         sup = self.supervisor
-        if config.TTS_PREFETCH_ENABLED:
-            sup.start("tts-generation", self._generation_worker)
-            sup.start("tts-playback", self._playback_worker)
-        else:
-            sup.start("tts-worker", self.tts_worker)
+        sup.start("tts-generation", self._generation_worker)
+        sup.start("tts-playback", self._playback_worker)
         if config.TTS_CONNECTION_KEEPALIVE_SECONDS > 0:
             sup.start("tts-connection-keepalive", self._connection_keepalive_worker)
         if self.tts_dispatcher.provider_names():
@@ -302,26 +214,17 @@ class TTSBot(
             task.cancel()
         for task in self.continuous_idle_stop_tasks.values():
             task.cancel()
-        for state in self.merge_buffers.values():
-            if state.timer_task and not state.timer_task.done():
-                state.timer_task.cancel()
         for source in self.continuous_sources.values():
             source.stop()
 
-        # Gracefully close the cloud provider's HTTP keep-alive pool.
-        # Local Piper has no async resources to release.
-        cloud = getattr(self.tts_dispatcher, "cloud", None)
-        if cloud is not None and hasattr(cloud, "aclose"):
+        # Close every provider's HTTP keep-alive pool.
+        for name in self.tts_dispatcher.provider_names():
+            aclose = getattr(self.tts_dispatcher.provider_for(name), "aclose", None)
+            if aclose is None:
+                continue
             try:
-                await cloud.aclose()
+                await aclose()
             except Exception:
-                log.exception("Failed to close cloud TTS provider cleanly")
-
-        if self.fish_provider is not None:
-            await self.fish_provider.aclose()
-        if self.gemini_provider is not None:
-            await self.gemini_provider.aclose()
-        if self.elevenlabs_provider is not None:
-            await self.elevenlabs_provider.aclose()
+                log.exception("Failed to close the %s provider cleanly", name)
 
         await super().close()

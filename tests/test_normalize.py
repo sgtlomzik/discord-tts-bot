@@ -6,15 +6,7 @@ from __future__ import annotations
 import unittest
 
 
-def load_bot_module():
-    import importlib.util
-    from pathlib import Path
-    module_path = Path(__file__).resolve().parent.parent / "bot.py"
-    spec = importlib.util.spec_from_file_location("tts_bot_module", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+from support import load_bot_module  # noqa: E402,F401  (re-exported for other tests)
 
 
 class NormalizeForTTSTests(unittest.TestCase):
@@ -68,13 +60,13 @@ class NormalizeForTTSTests(unittest.TestCase):
 
     def test_strips_custom_emoji(self):
         self.assertEqual(
-            self.bot.normalize_for_tts("hello <:kekw:123> world"),
+            self.bot.normalize_for_tts("hello <:smile:123> world"),
             "hello world",
         )
 
     def test_strips_animated_custom_emoji(self):
         self.assertEqual(
-            self.bot.normalize_for_tts("hello <a:pepe_sad:456> world"),
+            self.bot.normalize_for_tts("hello <a:dance:456> world"),
             "hello world",
         )
 

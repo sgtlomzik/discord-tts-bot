@@ -31,16 +31,19 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import AsyncIterator, Callable
 
 import httpx
 
+from ttsbot import config as bot_config
 from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
 from ttsbot.gemini import write_wav
 from ttsbot.health import QuotaReport, fingerprint
-from ttsbot.httpclient import attach_warmer, provider_limits
+from ttsbot.httpclient import attach_warmer, env_setting, provider_limits, retry_after_seconds
+from ttsbot.streams import StreamSpec
+from ttsbot import voice_registry
 
 log = logging.getLogger("tts_bot")
 
@@ -57,11 +60,6 @@ EMPTY_KEY_CREDITS = 50
 _REMAINING_RE = re.compile(r"([\d,]+)\s+credits?\s+remaining", re.IGNORECASE)
 # 401/403 reasons that are about the key or its account, not the request.
 _KEY_REASONS = ("invalid_api_key", "missing_permissions", "detected_unusual_activity")
-
-
-def _env(name: str, default: str) -> str:
-    """Env value with an empty string treated as unset (as in .env.example)."""
-    return os.getenv(name, "").strip() or default
 
 
 def key_fingerprint(key: str) -> str:
@@ -88,9 +86,9 @@ def format_kind(output_format: str) -> tuple[str, int]:
 
 @dataclass(frozen=True)
 class ElevenLabsConfig:
-    api_key: str
+    api_key: str = field(repr=False)  # never in logs or tracebacks
     # More keys for the ring, tried after api_key in this order.
-    api_keys: tuple[str, ...] = ()
+    api_keys: tuple[str, ...] = field(default=(), repr=False)
     model: str = DEFAULT_MODEL
     format: str = DEFAULT_FORMAT
     voice_id: str = ""
@@ -99,16 +97,16 @@ class ElevenLabsConfig:
 
     @classmethod
     def from_env(cls) -> "ElevenLabsConfig":
-        ring = tuple(k for k in _env("ELEVENLABS_API_KEYS", "").replace(",", " ").split() if k)
-        single = _env("ELEVENLABS_API_KEY", "")
+        ring = tuple(k for k in env_setting("ELEVENLABS_API_KEYS", "").replace(",", " ").split() if k)
+        single = env_setting("ELEVENLABS_API_KEY", "")
         cfg = cls(
             api_key=single or (ring[0] if ring else ""),
             api_keys=ring,
-            model=_env("ELEVENLABS_MODEL", DEFAULT_MODEL),
-            format=_env("ELEVENLABS_FORMAT", DEFAULT_FORMAT).lower(),
-            voice_id=_env("ELEVENLABS_VOICE_ID", ""),
-            language_code=_env("ELEVENLABS_LANGUAGE_CODE", "").lower(),
-            base_url=_env("ELEVENLABS_BASE_URL", DEFAULT_BASE_URL),
+            model=env_setting("ELEVENLABS_MODEL", DEFAULT_MODEL),
+            format=env_setting("ELEVENLABS_FORMAT", DEFAULT_FORMAT).lower(),
+            voice_id=env_setting("ELEVENLABS_VOICE_ID", ""),
+            language_code=env_setting("ELEVENLABS_LANGUAGE_CODE", "").lower(),
+            base_url=env_setting("ELEVENLABS_BASE_URL", DEFAULT_BASE_URL),
         )
         format_kind(cfg.format)
         return cfg
@@ -222,12 +220,9 @@ class ElevenLabsRateLimitError(ElevenLabsError, RateLimitError):
         self.retry_after = retry_after
 
 
-def _retry_after(value: str | None) -> float | None:
-    try:
-        seconds = float(value) if value else None
-    except ValueError:
-        return None
-    return seconds if seconds is not None and seconds > 0 else None
+class ElevenLabsKeyRateLimitError(ElevenLabsRateLimitError):
+    """HTTP 429 of one account (too many concurrent requests): another key
+    may take the message; ``system_busy`` is the whole service instead."""
 
 
 def _http_error(response: httpx.Response, body: bytes) -> ElevenLabsError:
@@ -254,7 +249,8 @@ def _http_error(response: httpx.Response, body: bytes) -> ElevenLabsError:
     if reason == "voice_not_found":
         return ElevenLabsVoiceNotFoundError(text, status)
     if status == 429:
-        return ElevenLabsRateLimitError(text, status, _retry_after(response.headers.get("retry-after")))
+        error = ElevenLabsRateLimitError if reason == "system_busy" else ElevenLabsKeyRateLimitError
+        return error(text, status, retry_after_seconds(response.headers.get("retry-after")))
     if reason.startswith(_KEY_REASONS) or (status == 401 and not reason):
         return ElevenLabsAuthError(text, status)
     return ElevenLabsError(text, status)
@@ -492,6 +488,7 @@ class ElevenLabsProvider:
             raise ElevenLabsVoiceNotFoundError("No ElevenLabs voice_id")
         output_format = output_format or self.config.format
         failures: list[ElevenLabsKeyError] = []
+        limited: list[ElevenLabsKeyRateLimitError] = []
         start = self._active
         moved = False
         try:
@@ -499,6 +496,10 @@ class ElevenLabsProvider:
                 index = (start + step) % len(keys)
                 try:
                     return await self._open_with_key(index, voice_id, text, params, output_format)
+                except ElevenLabsKeyRateLimitError as exc:
+                    limited.append(exc)
+                    log.info("ElevenLabs key %s is rate limited; trying the next key for this message only",
+                             self._key_label(index))
                 except ElevenLabsKeyError as exc:
                     failures.append(exc)
                     if isinstance(exc, ElevenLabsPlanError):
@@ -517,6 +518,14 @@ class ElevenLabsProvider:
         finally:
             if moved and self._active != start:
                 self._save_active()  # once per request, not per step
+        if limited:
+            # A busy key frees up soon: pause until the first one does,
+            # not for the long quota pause another key's state might call for.
+            waits = [exc.retry_after for exc in limited]
+            raise ElevenLabsRateLimitError(
+                f"Every usable ElevenLabs key is rate limited: {limited[-1]}", 429,
+                min(waits) if None not in waits else None,
+            )
         last = failures[-1]
         if any(isinstance(exc, ElevenLabsPlanError) for exc in failures):
             raise ElevenLabsPaidPlanRequiredError(
@@ -555,6 +564,17 @@ class ElevenLabsProvider:
         # the caller stops early (length limit, cancel, mid-stream error).
         self._count(text, response.headers.get("character-cost"), index)
         return ElevenLabsAudioStream(self, response, text, output_format)
+
+    def stream_spec(self, text: str, voice) -> StreamSpec:
+        """``opus_48000_*``: Ogg/Opus with 20 ms packets, played as-is;
+        ``pcm_*``: raw PCM framed in-process. Neither needs ffmpeg."""
+        params = voice.elevenlabs
+        opus = self.config.kind == "opus"
+        return StreamSpec(
+            kind="opus" if opus else "pcm", cache_key=self.config.cache_key(params),
+            ttfa=bot_config.ELEVENLABS_TTFA_TIMEOUT, label="ElevenLabs",
+            open=(lambda: self.stream_audio(text, params)) if opus else (lambda: self.open_stream(text, params)),
+        )
 
     async def stream_audio(self, text: str, params: object | None = None) -> AsyncIterator[bytes]:
         """Audio bytes as they arrive, in the configured format."""
@@ -622,3 +642,57 @@ class ElevenLabsProvider:
             return self._voices
         self._voices, self._voices_at = voices, time.monotonic()
         return voices
+
+
+NAME = "elevenlabs"
+
+
+def _config_from_env() -> "ElevenLabsConfig":
+    """ELEVENLABS_* settings; invalid ones disable it unless a key asks for it."""
+    try:
+        return ElevenLabsConfig.from_env()
+    except ValueError as exc:
+        if os.getenv("ELEVENLABS_API_KEY", "").strip():
+            raise  # ElevenLabs is wanted, so a bad setting must stop startup
+        log.warning("Ignoring invalid ELEVENLABS_* settings; ElevenLabs is disabled: %s", exc)
+        return ElevenLabsConfig(api_key="")
+
+
+def seed_voices(registry) -> bool:
+    """Point eleven-default at ELEVENLABS_VOICE_ID, keeping its tuning;
+    True when the catalog changed."""
+    cfg = _config_from_env()
+    if not cfg.api_key or not cfg.voice_id:
+        return False
+    current = registry.get("eleven-default")
+    if current is not None and not current.is_elevenlabs:
+        log.warning("Voice eleven-default is a %s voice; not seeding ELEVENLABS_VOICE_ID", current.provider)
+        return False
+    if current is not None and current.elevenlabs is not None:
+        record = replace(current, elevenlabs=replace(current.elevenlabs, voice_id=cfg.voice_id))
+    else:
+        record = voice_registry.VoiceRecord(
+            name="eleven-default", label="ElevenLabs", description="ElevenLabs voice from .env",
+            provider=voice_registry.PROVIDER_ELEVENLABS,
+            elevenlabs=voice_registry.ElevenLabsParams(voice_id=cfg.voice_id),
+        )
+    if current == record:
+        return False
+    registry.add(record)
+    return True
+
+
+def create(store) -> "ElevenLabsProvider | None":
+    """ElevenLabs with its key ring, resuming at the saved active key;
+    None without ELEVENLABS_API_KEY(S)."""
+    cfg = _config_from_env()
+    if not cfg.api_key:
+        return None
+    saved_key = store.settings.get("elevenlabs_key")
+    provider = ElevenLabsProvider(
+        cfg, active_key=saved_key if isinstance(saved_key, str) else "",
+        on_key_switch=store.set_elevenlabs_key,
+    )
+    log.info("ElevenLabs enabled keys=%d active=#%d format=%s model=%s",
+             len(cfg.keys), provider.active_key_index + 1, cfg.format, cfg.model)
+    return provider

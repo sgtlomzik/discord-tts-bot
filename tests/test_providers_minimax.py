@@ -14,15 +14,7 @@ from pathlib import Path
 
 import httpx
 
-from ttsbot.providers import (
-    MiniMaxAuthError,
-    MiniMaxConfig,
-    MiniMaxError,
-    MiniMaxProvider,
-    MiniMaxQuotaError,
-    MiniMaxTimeoutError,
-    MiniMaxVoiceNotFoundError,
-)
+from ttsbot.minimax import (MiniMaxAuthError, MiniMaxConfig, MiniMaxError, MiniMaxProvider, MiniMaxQuotaError, MiniMaxTimeoutError, MiniMaxVoiceNotFoundError)
 
 
 def _run(coro):

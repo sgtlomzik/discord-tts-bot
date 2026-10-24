@@ -8,11 +8,7 @@ import unittest
 
 import httpx
 
-from ttsbot.providers import (
-    MiniMaxConfig,
-    MiniMaxProvider,
-    MiniMaxVoiceNotFoundError,
-)
+from ttsbot.minimax import (MiniMaxConfig, MiniMaxProvider, MiniMaxVoiceNotFoundError)
 
 
 def _run(coro):
@@ -92,7 +88,7 @@ class StreamAudioTests(unittest.TestCase):
             _run(_collect(provider, voice_id="ghost"))
 
     def test_http_error_status_raises_before_streaming(self):
-        from ttsbot.providers import MiniMaxError
+        from ttsbot.minimax import (MiniMaxError)
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(500, content=b"upstream boom")

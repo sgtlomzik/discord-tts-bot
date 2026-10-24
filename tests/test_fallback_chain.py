@@ -16,20 +16,20 @@ from ttsbot.elevenlabs import (
     ElevenLabsAuthError, ElevenLabsConfig, ElevenLabsError, ElevenLabsProvider, ElevenLabsQuotaExhaustedError,
     ElevenLabsRateLimitError, ElevenLabsVoiceNotFoundError,
 )
-from ttsbot.fish import FishConfig, FishError, _http_error as fish_http_error
+from ttsbot.fish import FishConfig, FishError, FishProvider, _http_error as fish_http_error
 from ttsbot.health import (
     CircuitBreaker, CircuitBreakerConfig, CircuitState, FailureKind, HealthStore, QuotaReport,
     classify_failure,
 )
 from ttsbot.models import PreparedAudio, TTSJob
 from ttsbot.pipeline import SynthesisPipelineMixin
-from ttsbot.providers import (
-    DispatcherConfig, MiniMaxAuthError, MiniMaxQuotaError, MiniMaxQuotaExhaustedError,
-    MiniMaxVoiceNotFoundError, NoVoiceAvailableError, TTSDispatcher,
-)
+from ttsbot.providers import (DispatcherConfig, TTSDispatcher)
+from ttsbot.minimax import (MiniMaxAuthError, MiniMaxQuotaError, MiniMaxQuotaExhaustedError, MiniMaxVoiceNotFoundError)
 from ttsbot.voice_registry import (
     ElevenLabsParams, FishParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict,
 )
+
+from support import with_spec  # noqa: E402
 
 
 class Clock:
@@ -202,8 +202,8 @@ class ReviewFixTests(unittest.IsolatedAsyncioTestCase):
     async def test_auth_pause_is_not_closed_by_a_quota_report(self):
         provider = SimpleNamespace(config=ElevenLabsConfig(api_key="xk"),
                                    check_quota=AsyncMock(return_value=QuotaReport(True, None, "ok")))
-        dispatcher = TTSDispatcher(local=MagicMock(), elevenlabs=provider)
-        cb = dispatcher.elevenlabs_circuit_breaker
+        dispatcher = TTSDispatcher(local=MagicMock(), providers={"elevenlabs": provider})
+        cb = dispatcher.breaker_for("elevenlabs")
         clock = Clock()
         cb._clock = clock
         dispatcher.record_failure(cb, ElevenLabsAuthError("401 invalid_api_key", 401))
@@ -217,9 +217,8 @@ class ReviewFixTests(unittest.IsolatedAsyncioTestCase):
     async def test_check_that_was_wrong_is_not_trusted_again(self):
         provider = SimpleNamespace(config=ElevenLabsConfig(api_key="xk"),
                                    check_quota=AsyncMock(return_value=QuotaReport(True, None, "ok")))
-        dispatcher = TTSDispatcher(local=MagicMock(), elevenlabs=provider,
-                                   config=DispatcherConfig(quota_cooldown_seconds=1800))
-        cb = dispatcher.elevenlabs_circuit_breaker
+        dispatcher = TTSDispatcher(local=MagicMock(), config=DispatcherConfig(quota_cooldown_seconds=1800), providers={"elevenlabs": provider})
+        cb = dispatcher.breaker_for("elevenlabs")
         clock = Clock()
         cb._clock = clock
         quota = ElevenLabsQuotaExhaustedError("402 billing", 402)
@@ -237,8 +236,8 @@ class ReviewFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cb.await_check)
 
     async def test_request_error_on_the_probe_releases_it(self):
-        dispatcher = TTSDispatcher(local=MagicMock(), elevenlabs=SimpleNamespace(config=ElevenLabsConfig(api_key="xk")))
-        cb = dispatcher.elevenlabs_circuit_breaker
+        dispatcher = TTSDispatcher(local=MagicMock(), providers={"elevenlabs": SimpleNamespace(config=ElevenLabsConfig(api_key="xk"))})
+        cb = dispatcher.breaker_for("elevenlabs")
         clock = Clock()
         cb._clock = clock
         cb.trip(60, FailureKind.TRANSIENT)
@@ -249,8 +248,8 @@ class ReviewFixTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_check_while_waiting_for_a_real_probe(self):
         provider = SimpleNamespace(config=ElevenLabsConfig(api_key="xk"), check_quota=AsyncMock(return_value=None))
-        dispatcher = TTSDispatcher(local=MagicMock(), elevenlabs=provider)
-        cb = dispatcher.elevenlabs_circuit_breaker
+        dispatcher = TTSDispatcher(local=MagicMock(), providers={"elevenlabs": provider})
+        cb = dispatcher.breaker_for("elevenlabs")
         clock = Clock()
         cb._clock = clock
         dispatcher.record_failure(cb, ElevenLabsQuotaExhaustedError("402", 402))
@@ -359,72 +358,19 @@ def _el_provider(side_effect):
 class DispatcherChainTests(unittest.IsolatedAsyncioTestCase):
     def _dispatcher(self, elevenlabs=None, fish=None):
         local = SimpleNamespace(name="local", synthesize=AsyncMock())
-        return TTSDispatcher(local=local, elevenlabs=elevenlabs, fish=fish,
-                             config=DispatcherConfig(quota_cooldown_seconds=900))
-
-    async def test_quota_moves_to_fish_then_skips_elevenlabs(self):
-        eleven = _el_provider(ElevenLabsQuotaExhaustedError("no credits", 402))
-        dispatcher = self._dispatcher(eleven, _fish_provider())
-        reg = _registry()
-        chain = reg.chain_for(reg.get("eleven-george"))
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp) / "o.wav"
-            used, voice = await dispatcher.synthesize_chain("x", out, chain[0], chain[1:])
-            self.assertEqual((used, voice.name), ("fish", "fish-default"))
-            used, voice = await dispatcher.synthesize_chain("y", out, chain[0], chain[1:])
-            self.assertEqual(used, "fish")
-        self.assertEqual(eleven.fetch.await_count, 1)  # paused: not asked again
-        self.assertEqual(dispatcher.elevenlabs_circuit_breaker.kind, FailureKind.QUOTA)
-        dispatcher._local.synthesize.assert_not_awaited()
-
-    async def test_failed_provider_is_skipped_for_the_rest_of_the_chain(self):
-        fish = _fish_provider(FishError("Fish HTTP 500", 500))
-        dispatcher = self._dispatcher(fish=fish)
-        reg = _registry(("pirat", "fish-default", "piper-ruslan"))
-        chain = reg.chain_for(reg.get("eleven-george"))  # ElevenLabs not configured here
-        with tempfile.TemporaryDirectory() as tmp:
-            used, voice = await dispatcher.synthesize_chain("x", Path(tmp) / "o.wav", chain[0], chain[1:])
-        self.assertEqual((used, voice.name), ("local", "piper-ruslan"))
-        self.assertEqual(fish.synthesize.await_count, 1)  # fish-default was not tried
-        dispatcher._local.synthesize.assert_awaited_once()
-        self.assertEqual(dispatcher._local.synthesize.await_args.args[2], "piper-ruslan")
-
-    async def test_request_error_tries_the_next_voice_of_the_same_provider(self):
-        calls = []
-
-        async def fetch(text, params):
-            calls.append(params.voice_id)
-            if params.voice_id == "el-eleven-bella":
-                raise ElevenLabsVoiceNotFoundError("404")
-            return "opus", 48000, b"OggS"
-
-        dispatcher = self._dispatcher(SimpleNamespace(config=ElevenLabsConfig(api_key="xk"), fetch=fetch))
-        reg = _registry(("eleven-george", "piper-ruslan"), _el("eleven-bella"))
-        chain = reg.chain_for(reg.get("eleven-bella"))
-        with tempfile.TemporaryDirectory() as tmp:
-            used, voice = await dispatcher.synthesize_chain("x", Path(tmp) / "o.wav", chain[0], chain[1:])
-        self.assertEqual((used, voice.name), ("elevenlabs", "eleven-george"))
-        self.assertEqual(calls, ["el-eleven-bella", "el-eleven-george"])
-        self.assertIs(dispatcher.elevenlabs_circuit_breaker.state, CircuitState.CLOSED)
-
-    async def test_empty_chain_raises_when_the_voice_fails(self):
-        dispatcher = self._dispatcher(_el_provider(ElevenLabsError("down", 500)))
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(NoVoiceAvailableError):
-                await dispatcher.synthesize_chain("x", Path(tmp) / "o.wav", _el(), [])
-
+        return TTSDispatcher(local=local, config=DispatcherConfig(quota_cooldown_seconds=900), providers={"fish": fish, "elevenlabs": elevenlabs})
 
 class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
     def _dispatcher(self, provider_name, provider):
         return TTSDispatcher(local=MagicMock(), config=DispatcherConfig(quota_cooldown_seconds=1800),
-                             **{provider_name: provider})
+                             providers={provider_name: provider})
 
     async def test_quota_report_closes_or_waits_for_the_reset(self):
         report = QuotaReport(False, None, "")
         provider = SimpleNamespace(config=ElevenLabsConfig(api_key="xk"),
                                    check_quota=AsyncMock(side_effect=lambda: report))
         dispatcher = self._dispatcher("elevenlabs", provider)
-        cb = dispatcher.elevenlabs_circuit_breaker
+        cb = dispatcher.breaker_for("elevenlabs")
         clock = Clock()
         cb._clock = clock
         dispatcher.record_failure(cb, ElevenLabsQuotaExhaustedError("402", 402))
@@ -447,7 +393,7 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_quota_lets_a_real_request_probe(self):
         provider = SimpleNamespace(config=ElevenLabsConfig(api_key="xk"), check_quota=AsyncMock(return_value=None))
         dispatcher = self._dispatcher("elevenlabs", provider)
-        cb = dispatcher.elevenlabs_circuit_breaker
+        cb = dispatcher.breaker_for("elevenlabs")
         clock = Clock()
         cb._clock = clock
         dispatcher.record_failure(cb, ElevenLabsQuotaExhaustedError("402", 402))
@@ -463,7 +409,7 @@ class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
         warmer = SimpleNamespace(reachable=AsyncMock(return_value=False))
         fish = SimpleNamespace(config=FishConfig(api_key="fk"), warmer=warmer)
         dispatcher = self._dispatcher("fish", fish)
-        cb = dispatcher.fish_circuit_breaker
+        cb = dispatcher.breaker_for("fish")
         clock = Clock()
         cb._clock = clock
         for _ in range(cb.config.failure_threshold):
@@ -526,10 +472,7 @@ class PrefetchChainTests(unittest.IsolatedAsyncioTestCase):
     def _pipeline(self, registry):
         pipeline = SynthesisPipelineMixin()
         pipeline.voice_registry = registry
-        pipeline.tts_dispatcher = TTSDispatcher(
-            local=MagicMock(), elevenlabs=SimpleNamespace(config=ElevenLabsConfig(api_key="xk")),
-            fish=SimpleNamespace(config=FishConfig(api_key="fk")),
-        )
+        pipeline.tts_dispatcher = TTSDispatcher(local=MagicMock(), providers={"fish": with_spec(SimpleNamespace(config=FishConfig(api_key="fk")), FishProvider), "elevenlabs": with_spec(SimpleNamespace(config=ElevenLabsConfig(api_key="xk")), ElevenLabsProvider)})
         pipeline._should_attempt_stream = lambda voice: voice.provider != "piper"
         pipeline._generate_file_into = AsyncMock()
         return pipeline
@@ -537,28 +480,37 @@ class PrefetchChainTests(unittest.IsolatedAsyncioTestCase):
     async def test_elevenlabs_quota_streams_the_fish_fallback(self):
         pipeline = self._pipeline(_registry())
 
-        async def eleven(prepared, voice):
-            prepared.error = ElevenLabsQuotaExhaustedError("402", 402)
-            return "pre_audio"
+        spoken = []
 
-        pipeline._generate_elevenlabs_stream_into = AsyncMock(side_effect=eleven)
-        pipeline._generate_fish_stream_into = AsyncMock(return_value="ok")
+        async def stream(prepared, voice):
+            spoken.append(voice.name)
+            if voice.provider == "elevenlabs":
+                prepared.error = ElevenLabsQuotaExhaustedError("402", 402)
+                return "pre_audio"
+            return "ok"
+
+        pipeline._stream_voice_into = AsyncMock(side_effect=stream)
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         await pipeline._prepare_into(prepared)
-        self.assertEqual(pipeline._generate_fish_stream_into.await_args.args[1].name, "fish-default")
+        self.assertEqual(spoken, ["eleven-george", "fish-default"])
         pipeline._generate_file_into.assert_not_awaited()
         self.assertIsNone(await prepared.channel.get())
 
     async def test_fish_failure_skips_other_fish_voices_and_ends_with_piper(self):
         pipeline = self._pipeline(_registry(("fish-default", "pirat", "piper-ruslan")))
-        pipeline._generate_elevenlabs_stream_into = AsyncMock(return_value="pre_audio")
-        pipeline._generate_fish_stream_into = AsyncMock(return_value="pre_audio")
+        providers = []
+
+        async def stream(prepared, voice):
+            providers.append(voice.provider)
+            return "pre_audio"
+
+        pipeline._stream_voice_into = AsyncMock(side_effect=stream)
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         with self.assertLogs("tts_bot", "WARNING") as logs:
             await pipeline._prepare_into(prepared)
-        self.assertEqual(pipeline._generate_fish_stream_into.await_count, 1)
-        voice, rest = pipeline._generate_file_into.await_args.args[1:]
-        self.assertEqual((voice.name, rest), ("piper-ruslan", []))
+        self.assertEqual(providers.count("fish"), 1)
+        (voice,) = pipeline._generate_file_into.await_args.args[1:]
+        self.assertEqual(voice.name, "piper-ruslan")
         self.assertIn("voice=eleven-george -> fish-default", "\n".join(logs.output))
 
 

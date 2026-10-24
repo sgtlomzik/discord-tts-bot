@@ -11,7 +11,6 @@ Covers three stages, network- and Discord-free:
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import tempfile
 import types
@@ -20,13 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
-def load_bot_module():
-    module_path = Path(__file__).resolve().parent.parent / "bot.py"
-    spec = importlib.util.spec_from_file_location("tts_bot_module_emoji", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+from support import load_bot_module  # noqa: E402,F401  (re-exported for other tests)
 
 
 bot = load_bot_module()
@@ -215,29 +208,25 @@ class NormalizeIntegrationTests(unittest.TestCase):
 class StripForSpeechIntegrationTests(unittest.TestCase):
     def test_alias_wins_over_emoji_map(self):
         # "kekw" is in the legacy EMOJI_MAP -> "Кек"; an id alias overrides it.
-        out = bot._strip_discord_tokens_for_speech("<:kekw:1>", {"1": "кекис"})
+        out = bot.speakable_text("<:kekw:1>", {"1": "кекис"})
         self.assertEqual(out, "кекис")
 
     def test_emoji_map_fallback_when_no_alias(self):
-        out = bot._strip_discord_tokens_for_speech("<:kekw:1>", {})
+        out = bot.speakable_text("<:kekw:1>", {})
         self.assertEqual(out, "Кек")
 
     def test_unknown_unaliased_stripped(self):
-        out = bot._strip_discord_tokens_for_speech("hi <:Nope:1> there", {})
+        out = bot.speakable_text("hi <:Nope:1> there", {})
         self.assertEqual(out, "hi there")
 
 
-class MergeAnalysisTests(unittest.TestCase):
+class SpeakableTextTests(unittest.TestCase):
     def test_aliased_emoji_only_message_is_spoken(self):
-        parsed = bot.analyze_message_for_merge("<:Kekis:1>", {"1": "кекис"})
         # The aliased word survives, so the message is not dropped as empty.
-        self.assertEqual(parsed.spoken_text, "кекис")
-        self.assertTrue(parsed.is_custom_emoji_only)
+        self.assertEqual(bot.speakable_text("<:Kekis:1>", {"1": "кекис"}), "кекис")
 
     def test_unaliased_emoji_only_message_is_empty(self):
-        parsed = bot.analyze_message_for_merge("<:Kekis:1>", {})
-        self.assertEqual(parsed.spoken_text, "")
-        self.assertTrue(parsed.is_custom_emoji_only)
+        self.assertEqual(bot.speakable_text("<:Kekis:1>", {}), "")
 
 
 class UnicodeEmojiTests(unittest.TestCase):
@@ -269,13 +258,11 @@ class UnicodeEmojiTests(unittest.TestCase):
 
     def test_strip_for_speech_speaks_unicode(self):
         self.assertEqual(
-            bot._strip_discord_tokens_for_speech("привет🎉", {}), "привет хлопушка"
+            bot.speakable_text("привет🎉", {}), "привет хлопушка"
         )
 
     def test_unicode_emoji_only_message_is_spoken(self):
-        parsed = bot.analyze_message_for_merge("😎")
-        self.assertEqual(parsed.spoken_text, "лицо в темных очках")
-        self.assertTrue(parsed.is_unicode_emoji_only)
+        self.assertEqual(bot.speakable_text("😎"), "лицо в темных очках")
 
 
 class CacheKeyTests(unittest.TestCase):
