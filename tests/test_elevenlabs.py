@@ -314,6 +314,42 @@ class ElevenLabsKeyRingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ElevenLabsAuthError):
             await only_invalid.fetch("x")
 
+    async def test_a_rate_limited_key_hands_the_message_to_the_next_one(self):
+        used = []
+
+        def handle(request):
+            key = request.headers["xi-api-key"]
+            used.append(key)
+            if key == "k1":
+                return _error(429, "too_many_concurrent_requests", headers={"retry-after": "7"})
+            return _audio(b"OggS-" + key.encode())
+
+        switched = []
+        ring = self._ring(handle, on_key_switch=switched.append)
+        self.assertEqual((await ring.fetch("x"))[2], b"OggS-k2")
+        self.assertEqual(used, ["k1", "k2"])
+        self.assertEqual((ring.active_key_index, switched), (0, []))  # k1 is only busy
+
+    async def test_every_key_rate_limited_pauses_until_the_first_is_free(self):
+        waits = {"k1": "30", "k2": "7", "k3": "12"}
+        ring = self._ring(lambda r: _error(429, "too_many_concurrent_requests",
+                                           headers={"retry-after": waits[r.headers["xi-api-key"]]}))
+        with self.assertRaises(ElevenLabsRateLimitError) as ctx:
+            await ring.fetch("x")
+        self.assertEqual(ctx.exception.retry_after, 7)
+
+    async def test_a_busy_service_is_not_asked_again_with_other_keys(self):
+        used = []
+
+        def handle(request):
+            used.append(request.headers["xi-api-key"])
+            return _error(429, "system_busy", headers={"retry-after": "5"})
+
+        ring = self._ring(handle)
+        with self.assertRaises(ElevenLabsRateLimitError):
+            await ring.fetch("x")
+        self.assertEqual(used, ["k1"])
+
     async def test_long_message_skips_a_key_without_moving_the_ring(self):
         left = {"k1": 150, "k2": 30, "k3": 5000}
         used = []

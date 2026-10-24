@@ -225,6 +225,11 @@ class ElevenLabsRateLimitError(ElevenLabsError, RateLimitError):
         self.retry_after = retry_after
 
 
+class ElevenLabsKeyRateLimitError(ElevenLabsRateLimitError):
+    """HTTP 429 of one account (too many concurrent requests): another key
+    may take the message; ``system_busy`` is the whole service instead."""
+
+
 def _retry_after(value: str | None) -> float | None:
     try:
         seconds = float(value) if value else None
@@ -257,7 +262,8 @@ def _http_error(response: httpx.Response, body: bytes) -> ElevenLabsError:
     if reason == "voice_not_found":
         return ElevenLabsVoiceNotFoundError(text, status)
     if status == 429:
-        return ElevenLabsRateLimitError(text, status, _retry_after(response.headers.get("retry-after")))
+        error = ElevenLabsRateLimitError if reason == "system_busy" else ElevenLabsKeyRateLimitError
+        return error(text, status, _retry_after(response.headers.get("retry-after")))
     if reason.startswith(_KEY_REASONS) or (status == 401 and not reason):
         return ElevenLabsAuthError(text, status)
     return ElevenLabsError(text, status)
@@ -495,6 +501,7 @@ class ElevenLabsProvider:
             raise ElevenLabsVoiceNotFoundError("No ElevenLabs voice_id")
         output_format = output_format or self.config.format
         failures: list[ElevenLabsKeyError] = []
+        limited: list[ElevenLabsKeyRateLimitError] = []
         start = self._active
         moved = False
         try:
@@ -502,6 +509,10 @@ class ElevenLabsProvider:
                 index = (start + step) % len(keys)
                 try:
                     return await self._open_with_key(index, voice_id, text, params, output_format)
+                except ElevenLabsKeyRateLimitError as exc:
+                    limited.append(exc)
+                    log.info("ElevenLabs key %s is rate limited; trying the next key for this message only",
+                             self._key_label(index))
                 except ElevenLabsKeyError as exc:
                     failures.append(exc)
                     if isinstance(exc, ElevenLabsPlanError):
@@ -520,6 +531,14 @@ class ElevenLabsProvider:
         finally:
             if moved and self._active != start:
                 self._save_active()  # once per request, not per step
+        if limited:
+            # A busy key frees up soon: pause until the first one does,
+            # not for the long quota pause another key's state might call for.
+            waits = [exc.retry_after for exc in limited]
+            raise ElevenLabsRateLimitError(
+                f"Every usable ElevenLabs key is rate limited: {limited[-1]}", 429,
+                min(waits) if None not in waits else None,
+            )
         last = failures[-1]
         if any(isinstance(exc, ElevenLabsPlanError) for exc in failures):
             raise ElevenLabsPaidPlanRequiredError(
