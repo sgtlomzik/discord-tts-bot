@@ -192,6 +192,23 @@ class TTSCacheByteEvictionTests(unittest.TestCase):
         self.assertEqual(hit.read_bytes(), b"HELLO_AUDIO")
         self.assertEqual(c2.total_bytes, len(b"HELLO_AUDIO"))
 
+    def test_a_used_entry_outlives_unused_ones_across_a_restart(self):
+        import os
+        import time
+
+        config = TTSCacheConfig(enabled=True, max_entries=2, cache_dir=self.cache_dir)
+        cache = TTSPhraseCache(config)
+        for text in ("a", "b"):
+            cache.store(text, self._src(f"{text}.mp3", text.encode()), "v")
+        now = time.time()
+        os.utime(cache.lookup("a", "v"), (now - 100, now - 100))  # a: stored long ago
+        os.utime(cache.lookup("b", "v"), (now - 50, now - 50))
+        self.assertIsNotNone(cache.lookup("a", "v"))  # ...but just used
+        restarted = TTSPhraseCache(config)
+        restarted.store("c", self._src("c.mp3", b"c"), "v")
+        self.assertIsNotNone(restarted.lookup("a", "v"))
+        self.assertIsNone(restarted.lookup("b", "v"))
+
     def test_commit_file_registers_streaming_output(self):
         cache = self._cache(max_bytes=10_000)
         target = cache.cache_path_for("да", "bussshy01")

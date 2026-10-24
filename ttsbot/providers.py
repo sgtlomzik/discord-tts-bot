@@ -323,8 +323,13 @@ class TTSPhraseCache:
             self._record(False)
             log.info("TTS cache file vanished file=%s; regenerating", cached.name)
             return None
-        # LRU touch: move to the back.
+        # LRU touch: move to the back, and refresh the file's mtime, which
+        # is the order the index is rebuilt in after a restart.
         self._entries.move_to_end(key)
+        try:
+            os.utime(cached)
+        except OSError:
+            pass
         self._record(True)
         log.info(
             "TTS cache hit file=%s bytes=%d chars=%d hits=%d misses=%d",
