@@ -148,7 +148,8 @@ class PlaybackMixin:
         """
         guild_id = vc.guild.id
         self.cancel_continuous_idle_stop(guild_id)
-        source = self.continuous_sources.get(guild_id)
+        session = self.session_for(guild_id)
+        source = session.player
         source_created = False
         if source is None or source.stopped or not source.is_opus():
             if source is not None:
@@ -157,7 +158,7 @@ class PlaybackMixin:
             if not any(idle):
                 idle = OPUS_SILENCE_FRAME  # digital silence needs no encoder
             source = ContinuousTTSAudioSource(idle, opus=True)
-            self.continuous_sources[guild_id] = source
+            session.player = source
             source_created = True
 
         if initial_frames:

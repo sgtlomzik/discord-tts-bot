@@ -56,7 +56,7 @@ class MessageQueueMixin:
                 voice_profile=voice_profile,
                 message_ts=message_ts or now,
             )
-            session = self.session_for(voice_channel.guild.id)
+            session = self.start_session(voice_channel.guild.id)
             await asyncio.wait_for(
                 session.queue.put(job),
                 timeout=max(config.TTS_QUEUE_PUT_TIMEOUT_MS, 1) / 1000.0,

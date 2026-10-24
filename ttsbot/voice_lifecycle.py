@@ -30,27 +30,28 @@ class VoiceLifecycleMixin:
     """Voice connect/disconnect policy; mixed into TTSBot."""
 
     def cancel_idle_disconnect(self, guild_id: int) -> None:
-        task = self.idle_disconnect_tasks.pop(guild_id, None)
-        if task and not task.done():
-            task.cancel()
-            log.debug("Cancelled idle disconnect guild=%s", guild_id)
+        session = self.sessions.get(guild_id)
+        task = session.idle_disconnect_task if session is not None else None
+        if task is not None:
+            session.idle_disconnect_task = None
+            if not task.done():
+                task.cancel()
+                log.debug("Cancelled idle disconnect guild=%s", guild_id)
 
     def cancel_continuous_idle_stop(self, guild_id: int) -> None:
-        task = self.continuous_idle_stop_tasks.pop(guild_id, None)
-        if task and not task.done():
-            task.cancel()
-            log.debug("Cancelled continuous stream idle stop guild=%s", guild_id)
+        session = self.sessions.get(guild_id)
+        task = session.idle_stop_task if session is not None else None
+        if task is not None:
+            session.idle_stop_task = None
+            if not task.done():
+                task.cancel()
+                log.debug("Cancelled continuous stream idle stop guild=%s", guild_id)
 
     def get_voice_connect_lock(self, guild_id: int) -> asyncio.Lock:
-        lock = self.voice_connect_locks.get(guild_id)
-        if not lock:
-            lock = asyncio.Lock()
-            self.voice_connect_locks[guild_id] = lock
-        return lock
+        return self.session_for(guild_id).voice_lock
 
     def set_voice_connect_cooldown(self, guild_id: int, reason: str) -> None:
-        until = time.monotonic() + config.VOICE_CONNECT_COOLDOWN_SECONDS
-        self.voice_connect_cooldown_until[guild_id] = until
+        self.session_for(guild_id).connect_cooldown_until = time.monotonic() + config.VOICE_CONNECT_COOLDOWN_SECONDS
         log.warning(
             "Voice connect cooldown set guild=%s seconds=%s reason=%s",
             guild_id,
@@ -64,21 +65,17 @@ class VoiceLifecycleMixin:
             raise VoiceCooldown(f"Voice connect cooldown active for {remaining:.1f}s")
 
     def voice_connect_cooldown_remaining(self, guild_id: int) -> float:
-        until = self.voice_connect_cooldown_until.get(guild_id)
-        if until is None:
+        session = self.sessions.get(guild_id)
+        if session is None:
             return 0.0
-
-        remaining = until - time.monotonic()
-        if remaining <= 0:
-            self.voice_connect_cooldown_until.pop(guild_id, None)
-            return 0.0
-        return remaining
+        return max(0.0, session.connect_cooldown_until - time.monotonic())
 
     def suppress_auto_connect(self, guild_id: int, reason: str) -> None:
         if config.AUTO_CONNECT_SUPPRESS_SECONDS <= 0:
             return
-        until = time.monotonic() + config.AUTO_CONNECT_SUPPRESS_SECONDS
-        self.suppress_auto_connect_until[guild_id] = until
+        self.session_for(guild_id).auto_connect_suppressed_until = (
+            time.monotonic() + config.AUTO_CONNECT_SUPPRESS_SECONDS
+        )
         log.info(
             "Auto-connect suppressed guild=%s seconds=%s reason=%s",
             guild_id,
@@ -87,27 +84,22 @@ class VoiceLifecycleMixin:
         )
 
     def suppress_auto_connect_remaining(self, guild_id: int) -> float:
-        until = self.suppress_auto_connect_until.get(guild_id)
-        if until is None:
+        session = self.sessions.get(guild_id)
+        if session is None:
             return 0.0
-
-        remaining = until - time.monotonic()
-        if remaining <= 0:
-            self.suppress_auto_connect_until.pop(guild_id, None)
-            return 0.0
-        return remaining
+        return max(0.0, session.auto_connect_suppressed_until - time.monotonic())
 
     def schedule_idle_disconnect(self, guild: discord.Guild) -> None:
         self.cancel_idle_disconnect(guild.id)
-        task = asyncio.create_task(
+        self.session_for(guild.id).idle_disconnect_task = asyncio.create_task(
             self._idle_disconnect_after_timeout(guild),
             name=f"idle-disconnect-{guild.id}",
         )
-        self.idle_disconnect_tasks[guild.id] = task
         log.debug("Scheduled idle disconnect guild=%s timeout=%ss", guild.id, config.IDLE_DISCONNECT_SECONDS)
 
     def has_active_voice_playback(self, guild_id: int, vc: discord.VoiceClient) -> bool:
-        source = self.continuous_sources.get(guild_id)
+        session = self.sessions.get(guild_id)
+        source = session.player if session is not None else None
         if source and not source.stopped:
             return not source.is_drained
         return vc.is_playing() or vc.is_paused()
@@ -163,7 +155,7 @@ class VoiceLifecycleMixin:
                 )
                 return
 
-            source = self.continuous_sources.pop(guild.id, None)
+            source = self.session_for(guild.id).take_player()
             if source:
                 source.stop()
                 if vc.is_playing() or vc.is_paused():
@@ -182,11 +174,10 @@ class VoiceLifecycleMixin:
             return
 
         self.cancel_continuous_idle_stop(guild.id)
-        task = asyncio.create_task(
+        self.session_for(guild.id).idle_stop_task = asyncio.create_task(
             self._continuous_idle_stop_after_timeout(guild),
             name=f"continuous-idle-stop-{guild.id}",
         )
-        self.continuous_idle_stop_tasks[guild.id] = task
         log.debug(
             "Scheduled continuous stream idle stop guild=%s timeout=%ss",
             guild.id,
@@ -197,14 +188,15 @@ class VoiceLifecycleMixin:
         try:
             await asyncio.sleep(config.TTS_MAX_CONTINUOUS_IDLE_SECONDS)
 
-            source = self.continuous_sources.get(guild.id)
+            session = self.session_for(guild.id)
+            source = session.player
             if not source or source.stopped:
                 return
             if not source.is_drained:
                 log.debug("Skip continuous stream idle stop guild=%s reason=speech_pending", guild.id)
                 return
 
-            self.continuous_sources.pop(guild.id, None)
+            session.take_player()
             source.stop()
 
             vc = discord.utils.get(self.voice_clients, guild=guild)
@@ -326,7 +318,7 @@ class VoiceLifecycleMixin:
             prepared.cancelled = True
         self.cancel_idle_disconnect(guild.id)
         self.cancel_continuous_idle_stop(guild.id)
-        source = self.continuous_sources.pop(guild.id, None)
+        source = self.session_for(guild.id).take_player()
         if source:
             source.stop()
         vc = discord.utils.get(self.voice_clients, guild=guild)

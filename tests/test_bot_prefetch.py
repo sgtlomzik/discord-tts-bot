@@ -171,7 +171,7 @@ class PipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         tts_bot.warmup_tts = AsyncMock()
         tts_bot.is_closed = MagicMock(return_value=False)
 
-        session = tts_bot.session_for(1)
+        session = tts_bot.start_session(1)
         for i in range(2):
             await session.queue.put(_job(bot_mod, text=f"msg{i}"))
 

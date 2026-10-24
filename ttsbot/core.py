@@ -6,7 +6,6 @@ The behavior lives in four concern mixins; this module owns construction
 are attached from the outside by the composition root (bot.py).
 """
 
-import asyncio
 import logging
 import time
 import zoneinfo
@@ -30,7 +29,6 @@ from ttsbot.providers import (
 )
 from ttsbot.minimax import load_minimax_config_from_env
 from ttsbot import config
-from ttsbot.audio import ContinuousTTSAudioSource
 from ttsbot.intake import MessageQueueMixin
 from ttsbot.models import VOICE_PROFILES
 from ttsbot.pipeline import SynthesisPipelineMixin
@@ -68,14 +66,9 @@ class TTSBot(
         # Every long-running worker runs under the supervisor: a crash is
         # logged and the worker restarted, and /voicebot status shows it.
         self.supervisor = TaskSupervisor()
-        # One session per guild (its queue, prefetch and player loop),
-        # created with its workers on the guild's first message.
+        # One session per guild: its queue, prefetch, player and voice
+        # state; its workers start with the guild's first message.
         self.sessions: dict[int, GuildSession] = {}
-        self.idle_disconnect_tasks: dict[int, asyncio.Task[None]] = {}
-        self.continuous_idle_stop_tasks: dict[int, asyncio.Task[None]] = {}
-        self.voice_connect_locks: dict[int, asyncio.Lock] = {}
-        self.voice_connect_cooldown_until: dict[int, float] = {}
-        self.suppress_auto_connect_until: dict[int, float] = {}
         # Unified voice catalog: data/voices.json, seeded on first start
         # from the Piper profiles (and MINIMAX_VOICE_ID); then each plugin
         # points its default voice at its env setting (fish-default, ...).
@@ -118,7 +111,6 @@ class TTSBot(
         # paused until its check, instead of failing the first messages.
         if config.PROVIDER_HEALTH_PATH.parent.exists():
             self.tts_dispatcher.attach_health_store(HealthStore(config.PROVIDER_HEALTH_PATH))
-        self.continuous_sources: dict[int, ContinuousTTSAudioSource] = {}
         # The catalog as saved; persist_voice_registry() rolls back to it.
         self._saved_registry = self.voice_registry.snapshot()
 
@@ -161,10 +153,17 @@ class TTSBot(
             sup.start("stt-worker", self._make_transcription_worker().run)
 
     def session_for(self, guild_id: int) -> GuildSession:
-        """The guild's session, created (with its workers) on first use."""
+        """The guild's session (its state), created on first use."""
         session = self.sessions.get(guild_id)
         if session is None:
             session = self.sessions[guild_id] = GuildSession.create(guild_id)
+        return session
+
+    def start_session(self, guild_id: int) -> GuildSession:
+        """The guild's session with its generation and playback workers running."""
+        session = self.session_for(guild_id)
+        if not session.workers_started:
+            session.workers_started = True
             self.supervisor.start(f"tts-generation:{guild_id}", partial(self._generation_worker, session))
             self.supervisor.start(f"tts-playback:{guild_id}", partial(self._playback_worker, session))
         return session
@@ -227,12 +226,13 @@ class TTSBot(
         if transcriber is not None:
             await transcriber.aclose()
 
-        for task in self.idle_disconnect_tasks.values():
-            task.cancel()
-        for task in self.continuous_idle_stop_tasks.values():
-            task.cancel()
-        for source in self.continuous_sources.values():
-            source.stop()
+        for session in self.sessions.values():
+            for task in (session.idle_disconnect_task, session.idle_stop_task):
+                if task is not None:
+                    task.cancel()
+            player = session.take_player()
+            if player is not None:
+                player.stop()
 
         # Close every provider's HTTP keep-alive pool.
         for name in self.tts_dispatcher.provider_names():

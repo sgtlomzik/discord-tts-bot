@@ -26,13 +26,14 @@ from ttsbot.models import PreparedAudio, TTSJob
 from ttsbot.pipeline import DISCORD_OPUS_CACHE_SUFFIX, SynthesisPipelineMixin
 from ttsbot.playback import PlaybackMixin
 from ttsbot.providers import (
-    CircuitBreaker, CircuitState, DispatcherConfig, TTSCacheConfig, TTSDispatcher, TTSPhraseCache,
+    CircuitBreaker, DispatcherConfig, TTSCacheConfig, TTSDispatcher, TTSPhraseCache,
 )
 from ttsbot.store import BotConfigStore
 from ttsbot.voice_registry import (
     FishParams, PiperParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict, save_registry,
 )
 from ttsbot.streams import StreamSpec
+from ttsbot.session import GuildSession
 from support import with_spec
 from scripts.migrate_fish_default import migrate
 from test_bot import load_bot_module
@@ -386,11 +387,17 @@ class FishLatencyCommandTests(unittest.IsolatedAsyncioTestCase):
                 await bot_mod.bot.tts_dispatcher.provider_for("fish").aclose()
 
 
+def _sessions():
+    """A bot's session_for() for the player tests: one GuildSession per guild."""
+    sessions = {}
+    return lambda guild_id: sessions.setdefault(guild_id, GuildSession.create(guild_id))
+
+
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
 class FishDirectOpusTests(unittest.TestCase):
     def test_player_mixes_opus_and_pcm_without_restart(self):
         player = SimpleNamespace(
-            continuous_sources={}, cancel_continuous_idle_stop=MagicMock(),
+            session_for=_sessions(), cancel_continuous_idle_stop=MagicMock(),
         )
         playing = MagicMock(return_value=False)
         vc = SimpleNamespace(
@@ -414,14 +421,14 @@ class FishDirectOpusTests(unittest.TestCase):
 
     def test_player_replaces_legacy_pcm_source(self):
         player = SimpleNamespace(
-            continuous_sources={}, cancel_continuous_idle_stop=MagicMock(),
+            session_for=_sessions(), cancel_continuous_idle_stop=MagicMock(),
         )
         vc = SimpleNamespace(
             guild=SimpleNamespace(id=123), is_playing=MagicMock(return_value=True),
             is_paused=MagicMock(return_value=False), stop=MagicMock(), play=MagicMock(),
         )
         legacy = ContinuousTTSAudioSource(b"\x00" * PCM_FRAME_BYTES)
-        player.continuous_sources[123] = legacy
+        player.session_for(123).player = legacy
         source = PlaybackMixin.ensure_continuous_player(player, vc)
         self.assertTrue(legacy.stopped)
         self.assertTrue(source.is_opus())

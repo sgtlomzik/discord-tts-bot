@@ -1,4 +1,4 @@
-"""One guild's TTS session: its queue, prefetch window and player loop.
+"""One guild's TTS session: its queue, prefetch window, player and voice state.
 
 Each guild gets its own pair of workers (generation and playback, under
 the bot's supervisor), so a long message or a stuck player in one guild
@@ -23,6 +23,19 @@ class GuildSession:
     ready: asyncio.Queue  # PreparedAudio, in play order; bounds the prefetch
     active: set = field(default_factory=set)  # PreparedAudio generated or played now
     generating: set = field(default_factory=set)  # tasks generating audio
+    workers_started: bool = False
+    # Voice state (ttsbot.voice_lifecycle, ttsbot.playback).
+    player: object | None = None  # the guild's ContinuousTTSAudioSource
+    voice_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # connect/move
+    connect_cooldown_until: float = 0.0  # time.monotonic(); after a failed connect
+    auto_connect_suppressed_until: float = 0.0  # after an explicit or idle disconnect
+    idle_disconnect_task: asyncio.Task | None = None
+    idle_stop_task: asyncio.Task | None = None  # stops the idle continuous player
+
+    def take_player(self):
+        """The player, detached from the session (None if there is none)."""
+        player, self.player = self.player, None
+        return player
 
     @classmethod
     def create(cls, guild_id: int) -> "GuildSession":

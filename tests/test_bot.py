@@ -333,7 +333,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         guild = types.SimpleNamespace(id=90)
         member = types.SimpleNamespace(id=441612025286885397)
         channel = types.SimpleNamespace(id=91, guild=guild)
-        tts_bot.voice_connect_cooldown_until[guild.id] = bot_mod.time.monotonic() + 30.0
+        tts_bot.session_for(guild.id).connect_cooldown_until = bot_mod.time.monotonic() + 30.0
 
         await tts_bot.auto_connect_for_member(member, channel)
 
@@ -348,7 +348,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         guild = types.SimpleNamespace(id=90)
         member = types.SimpleNamespace(id=441612025286885397)
         channel = types.SimpleNamespace(id=91, guild=guild)
-        tts_bot.suppress_auto_connect_until[guild.id] = bot_mod.time.monotonic() + 30.0
+        tts_bot.session_for(guild.id).auto_connect_suppressed_until = bot_mod.time.monotonic() + 30.0
 
         await tts_bot.auto_connect_for_member(member, channel)
 
@@ -443,7 +443,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
             is_paused=MagicMock(return_value=False),
         )
         bot_mod.bot.config_store = temp_config_store(bot_mod, {member.id})
-        bot_mod.bot.continuous_sources[guild.id] = bot_mod.ContinuousTTSAudioSource(
+        bot_mod.bot.session_for(guild.id).player = bot_mod.ContinuousTTSAudioSource(
             b"\x00" * bot_mod.PCM_FRAME_BYTES
         )
         bot_mod.bot.schedule_idle_disconnect = MagicMock()
@@ -569,7 +569,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
             stop=MagicMock(),
             channel=None,  # _idle_disconnect_after_timeout reads vc.channel
         )
-        tts_bot.continuous_sources[guild.id] = source
+        tts_bot.session_for(guild.id).player = source
 
         with (
             patch.object(bot_mod.asyncio, "sleep", AsyncMock()),
@@ -578,7 +578,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
             await tts_bot._idle_disconnect_after_timeout(guild)
 
         self.assertTrue(source.stopped)
-        self.assertNotIn(guild.id, tts_bot.continuous_sources)
+        self.assertIsNone(tts_bot.session_for(guild.id).player)
         vc.stop.assert_called_once()
         vc.disconnect.assert_awaited_once_with(force=True)
 
@@ -631,7 +631,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         source = tts_bot.ensure_continuous_player(vc)
 
-        self.assertIs(tts_bot.continuous_sources[123], source)
+        self.assertIs(tts_bot.session_for(123).player, source)
         vc.stop.assert_called_once()
         vc.play.assert_called_once_with(source)
 
@@ -646,7 +646,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
             is_paused=MagicMock(return_value=False),
             stop=MagicMock(),
         )
-        tts_bot.continuous_sources[guild.id] = source
+        tts_bot.session_for(guild.id).player = source
 
         with (
             patch.object(bot_mod.asyncio, "sleep", AsyncMock()),
@@ -655,7 +655,7 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
             await tts_bot._continuous_idle_stop_after_timeout(guild)
 
         self.assertTrue(source.stopped)
-        self.assertNotIn(guild.id, tts_bot.continuous_sources)
+        self.assertIsNone(tts_bot.session_for(guild.id).player)
         vc.stop.assert_called_once()
 
     async def test_continuous_idle_stop_keeps_source_when_speech_pending(self):
@@ -664,13 +664,13 @@ class TTSBotWorkerTests(unittest.IsolatedAsyncioTestCase):
         guild = types.SimpleNamespace(id=123)
         source = bot_mod.ContinuousTTSAudioSource(b"\x00" * bot_mod.PCM_FRAME_BYTES)
         source.enqueue_frames([b"\x01" * bot_mod.PCM_FRAME_BYTES])
-        tts_bot.continuous_sources[guild.id] = source
+        tts_bot.session_for(guild.id).player = source
 
         with patch.object(bot_mod.asyncio, "sleep", AsyncMock()):
             await tts_bot._continuous_idle_stop_after_timeout(guild)
 
         self.assertFalse(source.stopped)
-        self.assertIs(tts_bot.continuous_sources[guild.id], source)
+        self.assertIs(tts_bot.session_for(guild.id).player, source)
 
 
 if __name__ == "__main__":
