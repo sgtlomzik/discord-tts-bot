@@ -195,9 +195,13 @@ Fallback chain:
   the first audio packet or decoded frame, because an Ogg stream's first
   bytes may be only the header pages. A provider that failed for a reason
   other than this one message is skipped for the rest of the chain, so one
-  outage costs one timeout. The first voice that cannot stream (Piper)
-  takes the file path, `TTSDispatcher.synthesize_chain`, with the voices
-  after it. Each voice uses its own cache key.
+  outage costs one timeout. A voice whose provider is not configured is
+  skipped; the first Piper voice is synthesized to a file
+  (`TTSDispatcher.synthesize_piper`) and ends the chain. Each voice uses
+  its own cache key. Every cloud provider takes the same path: it answers
+  `stream_spec(text, voice)` (`ttsbot/streams.py`) with the kind of audio
+  (Opus played as-is, Ogg or MP3 decoded by ffmpeg, raw PCM), its cache
+  key and first-audio budget, and `_stream_voice_into` does the rest.
 
 Provider health (`ttsbot/health.py`):
 
@@ -270,7 +274,7 @@ The local fallback path is:
 
 ```text
 text
-  -> _generate_file_into() -> TTSDispatcher.synthesize_chain()
+  -> _generate_file_into() -> TTSDispatcher.synthesize_piper()
   -> generate_piper_file()
   -> WAV file in tmp storage
   -> ffmpeg PCM conversion

@@ -107,7 +107,6 @@ python bot.py
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEYS` | Включает ElevenLabs; несколько ключей образуют кольцо (см. ниже) |
 | `OPENROUTER_API_KEY` | Включает голоса Gemini через OpenRouter (опционально) |
 | `TTS_QUOTA_COOLDOWN_SECONDS` | Пауза для облачного сервиса, когда закончился баланс или лимит тарифа (по умолчанию 1800) |
-| `TTS_PRIMARY_PROVIDER` | `local`, `minimax`, `fish`, `gemini` или `elevenlabs` |
 | `OWNER_IDS` | Кто может менять общие для всех серверов настройки (владелец приложения бота может всегда) |
 
 Для Fish укажите в `.env` `FISH_API_KEY` и `FISH_REFERENCE_ID`, затем

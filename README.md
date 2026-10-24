@@ -105,7 +105,6 @@ Everything is configured through environment variables — see
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEYS` | Enables ElevenLabs; several keys form a ring (see below) |
 | `OPENROUTER_API_KEY` | Enables Gemini voices through OpenRouter (optional) |
 | `TTS_QUOTA_COOLDOWN_SECONDS` | Pause a cloud provider after a balance/plan error (default 1800) |
-| `TTS_PRIMARY_PROVIDER` | `local`, `minimax`, `fish`, `gemini` or `elevenlabs` |
 | `OWNER_IDS` | Users who may change settings shared by every server (the bot's application owner always may) |
 
 For Fish, put `FISH_API_KEY` and `FISH_REFERENCE_ID` in `.env`, then select

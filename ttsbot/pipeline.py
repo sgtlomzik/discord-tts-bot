@@ -122,12 +122,9 @@ class SynthesisPipelineMixin:
     async def warmup_tts(self) -> None:
         filename = config.TMP_DIR / f"warmup_{uuid.uuid4().hex}.wav"
         try:
-            # Warm Piper ONNX directly, bypassing the dispatcher. The
-            # whole point of warmup is to preload the local model so the
-            # first real request (including a fallback to local) is not
-            # cold. If TTS_PRIMARY_PROVIDER=minimax, warming the cloud
-            # provider is pointless (it is HTTP) and would burn an API
-            # call on every restart.
+            # Preload the Piper ONNX model so the first real request
+            # (including a fallback to Piper) is not cold. Cloud providers
+            # are HTTP: nothing to warm here, and it would cost a request.
             await self.tts_dispatcher.warm_local("Привет", filename)
             log.info("TTS warmup completed")
         except Exception:
@@ -142,9 +139,8 @@ class SynthesisPipelineMixin:
     def _build_cloud_provider(self):
         """Construct the MiniMax provider if the bot has credentials.
 
-        Returns ``None`` when MINIMAX_API_KEY or MINIMAX_VOICE_ID is
-        missing — the dispatcher then silently uses the local provider
-        regardless of TTS_PRIMARY_PROVIDER, and the bot starts cleanly.
+        Returns ``None`` when MINIMAX_API_KEY is missing: MiniMax voices
+        then fall to the next voice of their chain.
         """
         cfg = load_minimax_config_from_env()
         # Only the API key is required now: the per-message voice_id comes
@@ -487,12 +483,8 @@ class SynthesisPipelineMixin:
         return list(self.voice_registry.chain_for(voice))
 
     def _should_attempt_stream(self, voice) -> bool:
-        """True when a job qualifies for the streaming fast path."""
-        return (
-            config.TTS_STREAMING_ENABLED
-            and voice is not None
-            and self.tts_dispatcher.provider_for(getattr(voice, "provider", None)) is not None
-        )
+        """True when the voice's cloud provider is configured (it streams)."""
+        return voice is not None and self.tts_dispatcher.provider_for(getattr(voice, "provider", None)) is not None
 
     # ------------------------------------------------------------------
     # Prefetch pipeline (TTS_PREFETCH_ENABLED): generation_worker produces
@@ -529,12 +521,12 @@ class SynthesisPipelineMixin:
     async def _prepare_into(self, prepared: PreparedAudio) -> None:
         """Generate a job's audio into ``prepared.channel`` (frame batches).
 
-        Walks the voice's fallback chain: each streaming voice is tried in
-        turn until one produces audio; a failure before any audio moves on
-        to the next voice. A provider that failed for a reason other than
-        this one message (or is paused) is skipped for the rest of the
-        chain. The first voice that cannot stream (Piper) takes the file
-        path together with the voices after it.
+        Walks the voice's fallback chain: each cloud voice streams in turn
+        until one produces audio; a failure before any audio moves on to the
+        next voice. A provider that failed for a reason other than this one
+        message (or is paused) is skipped for the rest of the chain, and so
+        is a voice whose provider is not configured. The first Piper voice
+        is synthesized to a file and ends the chain.
         """
         job = prepared.job
         voice = self.voice_registry.get(job.voice_profile) or self.voice_registry.fallback_record()
@@ -548,10 +540,11 @@ class SynthesisPipelineMixin:
                     return
                 if getattr(candidate, "provider", None) in skipped:
                     continue
-                if candidate is None or not self._should_attempt_stream(candidate):
-                    rest = [v for v in chain[index + 1:] if v.provider not in skipped]
-                    await self._generate_file_into(prepared, candidate, rest)
+                if candidate is None or candidate.is_piper:
+                    await self._generate_file_into(prepared, candidate)
                     return
+                if not self._should_attempt_stream(candidate):
+                    continue  # its provider is not configured
                 prepared.error = None
                 status = await self._stream_voice_into(prepared, candidate)
                 if status != "pre_audio":
@@ -786,24 +779,17 @@ class SynthesisPipelineMixin:
                 part_path.unlink(missing_ok=True)
         return status, frames_count
 
-    async def _generate_file_into(self, prepared: PreparedAudio, voice, fallbacks=()) -> None:
-        """Synthesize to a file with ``voice``, or the first of ``fallbacks``
-        that can, and put its frames into the channel."""
+    async def _generate_file_into(self, prepared: PreparedAudio, voice) -> None:
+        """Synthesize the Piper ``voice`` to a file and put its frames into the channel."""
         if prepared.cancelled:
             return
         job = prepared.job
         filename = config.TMP_DIR / f"tts_{uuid.uuid4().hex}.wav"
         try:
-            prepared.provider, used = await self.tts_dispatcher.synthesize_chain(
-                job.text, filename, voice=voice,
-                # No voice at all: the legacy route (primary provider, then Piper).
-                fallbacks=list(fallbacks) if voice is not None or fallbacks else None,
-            )
+            prepared.provider = await self.tts_dispatcher.synthesize_piper(job.text, filename, voice)
             if prepared.cancelled:
                 return
-            voice = used or voice
-            pitch = voice.fish.pitch if getattr(voice, "is_fish", False) and prepared.provider in {"fish", "cache"} else 0
-            frames = limit_pcm_frames(await self._safe_pcm_frames(filename, pitch), job.text, voice)
+            frames = limit_pcm_frames(await self._safe_pcm_frames(filename), job.text, voice)
             if frames:
                 await prepared.channel.put(frames)
         finally:

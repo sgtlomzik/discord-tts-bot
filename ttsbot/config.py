@@ -64,7 +64,7 @@ def reload() -> None:
     """(Re)read every tunable from the environment into module globals."""
     global TMP_DIR, BOT_CONFIG_PATH, VOICES_REGISTRY_PATH, DEFAULT_VOICE_PROFILE
     global TOKEN, MAX_TEXT_LENGTH, TTS_MAX_CHARS, QUEUE_MAXSIZE
-    global TTS_STREAMING_ENABLED, TTS_STREAM_TTFA_TIMEOUT
+    global TTS_STREAM_TTFA_TIMEOUT
     global FISH_TTFA_TIMEOUT, GEMINI_TTFA_TIMEOUT, GEMINI_TTFA_PER_CHAR
     global ELEVENLABS_TTFA_TIMEOUT, TTS_CONNECTION_KEEPALIVE_SECONDS
     global PROVIDER_HEALTH_PATH, TTS_HEALTH_CHECK_INTERVAL
@@ -109,10 +109,6 @@ def reload() -> None:
     # this is unset/zero.
     TTS_MAX_CHARS = int(os.getenv("TTS_MAX_CHARS", "300"))
     QUEUE_MAXSIZE = int(os.getenv("TTS_QUEUE_MAXSIZE", "50"))
-    # Stream MiniMax audio chunk-by-chunk so the bot starts talking before the
-    # whole clip is generated (cuts Time-To-First-Audio). Feature-flagged
-    # for instant revert without a redeploy.
-    TTS_STREAMING_ENABLED = _flag("TTS_STREAMING_ENABLED", "1")
     # Budget for the FIRST audio chunk only. After the first chunk the stream
     # lives as long as it needs (long messages legitimately stream for seconds).
     TTS_STREAM_TTFA_TIMEOUT = float(

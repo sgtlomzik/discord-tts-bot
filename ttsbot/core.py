@@ -152,10 +152,6 @@ class TTSBot(
         if self.elevenlabs_provider is not None and eleven_cfg.voice_id:
             self._seed_elevenlabs_default(eleven_cfg.voice_id)
         self.piper_voices: dict[tuple[str, str], object] = {}
-        # TTS provider abstraction (see ttsbot/providers.py). Skeleton
-        # behavior in this commit: dispatcher always routes to local.
-        # Cloud provider (MiniMax) and full CB logic land in commits 3+
-        # and 6 respectively.
         cache_cfg = load_cache_config_from_env()
         self.tts_cache = TTSPhraseCache(cache_cfg) if cache_cfg.enabled else None
         # Wrap generate_piper_file so the dispatcher's piper callback
@@ -176,7 +172,6 @@ class TTSBot(
             },
             config=load_dispatcher_config_from_env(),
             cache=self.tts_cache,
-            fallback_profile=self.voice_registry.fallback_profile,
         )
         # Provider pauses survive restarts: a provider out of quota stays
         # paused until its check, instead of failing the first messages.

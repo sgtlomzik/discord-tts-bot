@@ -1269,7 +1269,6 @@ def build_commands(bot):
         cache_on = getattr(bot.tts_dispatcher, "cache", None) is not None
         embed = discord.Embed(title="⚙️ TTS • Настройки", color=0x57F287)
         embed.add_field(name="Кэш", value="вкл" if cache_on else "выкл", inline=True)
-        embed.add_field(name="Стриминг", value="вкл" if config.TTS_STREAMING_ENABLED else "выкл", inline=True)
         embed.add_field(name="Лимит символов", value=str(config.TTS_MAX_CHARS), inline=True)
         embed.add_field(name="Fish latency", value=f"`{bot.fish_latency}`", inline=True)
         if config.TTS_AUDIO_LIMIT_ENABLED:

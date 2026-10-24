@@ -20,7 +20,6 @@ from ttsbot.providers import (
     CircuitState,
     DispatcherConfig,
     LocalProvider,
-    PrimaryProvider,
     TTSDispatcher,
     load_circuit_breaker_from_env,
     load_dispatcher_config_from_env,
@@ -87,103 +86,6 @@ class DispatcherSkeletonTests(unittest.TestCase):
     These tests use a fake cloud provider so they can exercise success,
     failure, and fallback paths without any network.
     """
-
-    def _make_dispatcher(self, *, primary, cloud=None, cb=None, local_writes=b"LOCAL"):
-        async def fake_piper(text, filename, voice_profile):
-            filename.write_bytes(local_writes)
-
-        local = LocalProvider(fake_piper)
-        return TTSDispatcher(local=local, config=DispatcherConfig(primary=primary), providers={"minimax": cloud}, breakers={"minimax": cb or CircuitBreaker()})
-
-    def test_primary_local_routes_through_local_even_if_cloud_present(self):
-        async def fake_cloud(text, filename):
-            filename.write_bytes(b"CLOUD")
-
-        cloud = FakeProvider("cloud", fake_cloud)
-        d = self._make_dispatcher(
-            primary=PrimaryProvider.LOCAL, cloud=cloud,
-        )
-        target = Path("/tmp/disp_local.bin")
-        try:
-            used = run(d.synthesize("hi", target))
-            self.assertEqual(used, "local")
-            self.assertEqual(target.read_bytes(), b"LOCAL")
-        finally:
-            if target.exists():
-                target.unlink()
-
-    def test_primary_minimax_with_cloud_uses_cloud_on_success(self):
-        async def fake_cloud(text, filename):
-            filename.write_bytes(b"CLOUD")
-
-        cloud = FakeProvider("cloud", fake_cloud)
-        d = self._make_dispatcher(
-            primary=PrimaryProvider.MINIMAX, cloud=cloud,
-        )
-        target = Path("/tmp/disp_cloud_ok.bin")
-        try:
-            used = run(d.synthesize("hi", target))
-            self.assertEqual(used, "cloud")
-            self.assertEqual(target.read_bytes(), b"CLOUD")
-        finally:
-            if target.exists():
-                target.unlink()
-
-    def test_primary_minimax_falls_back_to_local_when_cloud_fails(self):
-        async def fake_cloud(text, filename):
-            raise RuntimeError("cloud is down")
-
-        cloud = FakeProvider("cloud", fake_cloud)
-        d = self._make_dispatcher(
-            primary=PrimaryProvider.MINIMAX, cloud=cloud,
-        )
-        target = Path("/tmp/disp_fallback.bin")
-        try:
-            used = run(d.synthesize("hi", target))
-            self.assertEqual(used, "local")
-            self.assertEqual(target.read_bytes(), b"LOCAL")
-        finally:
-            if target.exists():
-                target.unlink()
-
-    def test_primary_minimax_records_circuit_breaker_failure_on_cloud_error(self):
-        async def fake_cloud(text, filename):
-            raise RuntimeError("boom")
-
-        cloud = FakeProvider("cloud", fake_cloud)
-        cb = CircuitBreaker()
-        d = self._make_dispatcher(
-            primary=PrimaryProvider.MINIMAX, cloud=cloud, cb=cb,
-        )
-        run(d.synthesize("hi", Path("/tmp/cb1.bin")))
-        self.assertEqual(cb.consecutive_failures, 1)
-        self.assertEqual(cb.state, CircuitState.CLOSED)
-
-    def test_primary_minimax_uses_local_when_cloud_is_none(self):
-        d = self._make_dispatcher(primary=PrimaryProvider.MINIMAX, cloud=None)
-        target = Path("/tmp/disp_no_cloud.bin")
-        try:
-            used = run(d.synthesize("hi", target))
-            self.assertEqual(used, "local")
-        finally:
-            if target.exists():
-                target.unlink()
-
-    def test_warm_local_uses_local_provider_regardless_of_primary(self):
-        async def fake_cloud(text, filename):
-            raise AssertionError("warmup must not call cloud")
-
-        cloud = FakeProvider("cloud", fake_cloud)
-        d = self._make_dispatcher(
-            primary=PrimaryProvider.MINIMAX, cloud=cloud,
-        )
-        target = Path("/tmp/warm_test.bin")
-        try:
-            run(d.warm_local("Привет", target))
-            self.assertTrue(target.exists())
-        finally:
-            if target.exists():
-                target.unlink()
 
     def test_warm_local_does_not_touch_circuit_breaker(self):
         """Critical invariant: warmup must never increment CB failure
@@ -312,50 +214,6 @@ class CircuitBreakerStateMachineTests(unittest.TestCase):
         # No probes again until another cooldown elapses.
         self.assertFalse(cb.allow_request())
 
-    def test_dispatcher_skips_cloud_when_circuit_open(self):
-        """End-to-end: dispatcher honors CB in OPEN state without
-        calling the cloud provider."""
-        async def fake_cloud(text, filename):
-            raise AssertionError("cloud should not be called when CB is open")
-            filename.write_bytes(b"X")  # unreachable
-
-        cloud = FakeProvider("cloud", fake_cloud)
-        cb, clock = self._make(threshold=2, cooldown=60.0)
-        # Two failures trip the breaker.
-        local = LocalProvider(_write_bytes_provider(b"LOCAL"))
-        d = TTSDispatcher(local=local, config=DispatcherConfig(primary=PrimaryProvider.MINIMAX), providers={"minimax": cloud}, breakers={"minimax": cb})
-        async def expect_fallback():
-            # The cloud raises — CB records failure.
-            async def boom(text, filename):
-                raise RuntimeError("boom")
-            cloud._synth = boom
-            return await d.synthesize("hi", Path("/tmp/cb_disp1.bin"))
-        run(expect_fallback())
-        async def expect_fallback2():
-            return await d.synthesize("hi", Path("/tmp/cb_disp2.bin"))
-        run(expect_fallback2())
-        # Now CB should be OPEN.
-        self.assertEqual(cb.state, CircuitState.OPEN)
-        # The fake_cloud callable would raise AssertionError if called.
-        # Reset it to a sentinel so we can detect any future call.
-        called = {"count": 0}
-        async def tracking_cloud(text, filename):
-            called["count"] += 1
-            filename.write_bytes(b"CLOUD")
-        cloud._synth = tracking_cloud
-        # Third call: CB is OPEN, must go straight to local.
-        target = Path("/tmp/cb_disp3.bin")
-        try:
-            used = run(d.synthesize("hi", target))
-            self.assertEqual(used, "local")
-            self.assertEqual(called["count"], 0)
-        finally:
-            for p in ("/tmp/cb_disp1.bin", "/tmp/cb_disp2.bin", "/tmp/cb_disp3.bin"):
-                pp = Path(p)
-                if pp.exists():
-                    pp.unlink()
-
-
 def _write_bytes_provider(payload: bytes):
     async def fake_piper(text, filename, voice_profile):
         filename.write_bytes(payload)
@@ -363,25 +221,6 @@ def _write_bytes_provider(payload: bytes):
 
 
 class EnvConfigTests(unittest.TestCase):
-    def test_dispatcher_config_default_is_local_and_2_5s(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            # Drop any TTS_* overrides so we observe the defaults.
-            for key in ("TTS_PRIMARY_PROVIDER", "TTS_REQUEST_TIMEOUT"):
-                os.environ.pop(key, None)
-            cfg = load_dispatcher_config_from_env()
-        self.assertEqual(cfg.primary, PrimaryProvider.LOCAL)
-        self.assertAlmostEqual(cfg.request_timeout_seconds, 2.5)
-
-    def test_dispatcher_config_reads_primary_provider(self):
-        with mock.patch.dict(os.environ, {"TTS_PRIMARY_PROVIDER": "minimax"}):
-            cfg = load_dispatcher_config_from_env()
-        self.assertEqual(cfg.primary, PrimaryProvider.MINIMAX)
-
-    def test_dispatcher_config_unknown_provider_falls_back_to_local(self):
-        with mock.patch.dict(os.environ, {"TTS_PRIMARY_PROVIDER": "gibberish"}):
-            cfg = load_dispatcher_config_from_env()
-        self.assertEqual(cfg.primary, PrimaryProvider.LOCAL)
-
     def test_circuit_breaker_config_from_env(self):
         with mock.patch.dict(
             os.environ,

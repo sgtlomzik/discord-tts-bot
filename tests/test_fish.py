@@ -696,26 +696,6 @@ class FishQuotaAndConfigTests(unittest.IsolatedAsyncioTestCase):
                 await fish.aclose()
                 await client.aclose()
 
-    async def test_dispatcher_pauses_fish_on_quota_and_logs_open_breaker(self):
-        local = MagicMock()
-        local.name = "local"
-        local.synthesize = AsyncMock()
-        fish = SimpleNamespace(
-            config=FishConfig(api_key="k", reference_id="voice-id"),
-            synthesize=AsyncMock(side_effect=FishQuotaExhaustedError("Fish HTTP 402", 402)),
-        )
-        dispatcher = TTSDispatcher(local=local, config=DispatcherConfig(quota_cooldown_seconds=900), providers={"fish": fish})
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp) / "out.wav"
-            self.assertEqual(await dispatcher.synthesize("x", out, voice=_voice()), "local")
-            cb = dispatcher.breaker_for("fish")
-            self.assertIs(cb.state, CircuitState.OPEN)
-            self.assertGreater(cb.cooldown_remaining, 800)
-            with self.assertLogs("tts_bot.providers", "INFO") as logs:
-                await dispatcher.synthesize("y", out, voice=_voice())
-        self.assertEqual(fish.synthesize.await_count, 1)
-        self.assertIn("Fish circuit breaker open", "\n".join(logs.output))
-
     async def test_prefetch_fish_quota_trips_the_fish_breaker(self):
         async def exhausted(*args, **kwargs):
             raise FishQuotaExhaustedError("Fish HTTP 402", 402)

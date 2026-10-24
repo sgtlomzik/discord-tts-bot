@@ -25,7 +25,7 @@ from ttsbot.models import PreparedAudio, TTSJob
 from ttsbot.pipeline import SynthesisPipelineMixin
 from ttsbot.providers import (
     DispatcherConfig, MiniMaxAuthError, MiniMaxQuotaError, MiniMaxQuotaExhaustedError,
-    MiniMaxVoiceNotFoundError, NoVoiceAvailableError, TTSDispatcher,
+    MiniMaxVoiceNotFoundError, TTSDispatcher,
 )
 from ttsbot.voice_registry import (
     ElevenLabsParams, FishParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict,
@@ -362,58 +362,6 @@ class DispatcherChainTests(unittest.IsolatedAsyncioTestCase):
         local = SimpleNamespace(name="local", synthesize=AsyncMock())
         return TTSDispatcher(local=local, config=DispatcherConfig(quota_cooldown_seconds=900), providers={"fish": fish, "elevenlabs": elevenlabs})
 
-    async def test_quota_moves_to_fish_then_skips_elevenlabs(self):
-        eleven = _el_provider(ElevenLabsQuotaExhaustedError("no credits", 402))
-        dispatcher = self._dispatcher(eleven, _fish_provider())
-        reg = _registry()
-        chain = reg.chain_for(reg.get("eleven-george"))
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp) / "o.wav"
-            used, voice = await dispatcher.synthesize_chain("x", out, chain[0], chain[1:])
-            self.assertEqual((used, voice.name), ("fish", "fish-default"))
-            used, voice = await dispatcher.synthesize_chain("y", out, chain[0], chain[1:])
-            self.assertEqual(used, "fish")
-        self.assertEqual(eleven.fetch.await_count, 1)  # paused: not asked again
-        self.assertEqual(dispatcher.breaker_for("elevenlabs").kind, FailureKind.QUOTA)
-        dispatcher._local.synthesize.assert_not_awaited()
-
-    async def test_failed_provider_is_skipped_for_the_rest_of_the_chain(self):
-        fish = _fish_provider(FishError("Fish HTTP 500", 500))
-        dispatcher = self._dispatcher(fish=fish)
-        reg = _registry(("pirat", "fish-default", "piper-ruslan"))
-        chain = reg.chain_for(reg.get("eleven-george"))  # ElevenLabs not configured here
-        with tempfile.TemporaryDirectory() as tmp:
-            used, voice = await dispatcher.synthesize_chain("x", Path(tmp) / "o.wav", chain[0], chain[1:])
-        self.assertEqual((used, voice.name), ("local", "piper-ruslan"))
-        self.assertEqual(fish.synthesize.await_count, 1)  # fish-default was not tried
-        dispatcher._local.synthesize.assert_awaited_once()
-        self.assertEqual(dispatcher._local.synthesize.await_args.args[2], "piper-ruslan")
-
-    async def test_request_error_tries_the_next_voice_of_the_same_provider(self):
-        calls = []
-
-        async def fetch(text, params):
-            calls.append(params.voice_id)
-            if params.voice_id == "el-eleven-bella":
-                raise ElevenLabsVoiceNotFoundError("404")
-            return "opus", 48000, b"OggS"
-
-        dispatcher = self._dispatcher(SimpleNamespace(config=ElevenLabsConfig(api_key="xk"), fetch=fetch))
-        reg = _registry(("eleven-george", "piper-ruslan"), _el("eleven-bella"))
-        chain = reg.chain_for(reg.get("eleven-bella"))
-        with tempfile.TemporaryDirectory() as tmp:
-            used, voice = await dispatcher.synthesize_chain("x", Path(tmp) / "o.wav", chain[0], chain[1:])
-        self.assertEqual((used, voice.name), ("elevenlabs", "eleven-george"))
-        self.assertEqual(calls, ["el-eleven-bella", "el-eleven-george"])
-        self.assertIs(dispatcher.breaker_for("elevenlabs").state, CircuitState.CLOSED)
-
-    async def test_empty_chain_raises_when_the_voice_fails(self):
-        dispatcher = self._dispatcher(_el_provider(ElevenLabsError("down", 500)))
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(NoVoiceAvailableError):
-                await dispatcher.synthesize_chain("x", Path(tmp) / "o.wav", _el(), [])
-
-
 class HealthCheckTests(unittest.IsolatedAsyncioTestCase):
     def _dispatcher(self, provider_name, provider):
         return TTSDispatcher(local=MagicMock(), config=DispatcherConfig(quota_cooldown_seconds=1800),
@@ -563,8 +511,8 @@ class PrefetchChainTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("tts_bot", "WARNING") as logs:
             await pipeline._prepare_into(prepared)
         self.assertEqual(providers.count("fish"), 1)
-        voice, rest = pipeline._generate_file_into.await_args.args[1:]
-        self.assertEqual((voice.name, rest), ("piper-ruslan", []))
+        (voice,) = pipeline._generate_file_into.await_args.args[1:]
+        self.assertEqual(voice.name, "piper-ruslan")
         self.assertIn("voice=eleven-george -> fish-default", "\n".join(logs.output))
 
 
