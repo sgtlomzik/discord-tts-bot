@@ -987,19 +987,33 @@ class SynthesisPipelineMixin:
                 cache_part = None
                 part_path = None
 
+        def _tee(chunk: bytes) -> None:
+            # A failed cache write (a full disk) only stops caching this
+            # message: the audio keeps going and the provider is not blamed.
+            nonlocal cache_part, cache_final
+            if cache_part is None:
+                return
+            try:
+                cache_part.write(chunk)
+            except OSError as exc:
+                log.warning("TTS cache write failed (%s); not caching this message", exc)
+                try:
+                    cache_part.close()
+                except OSError:
+                    pass
+                cache_part = cache_final = None
+
         async def _feed() -> None:
             try:
                 proc.stdin.write(first_chunk)
                 await proc.stdin.drain()
-                if cache_part is not None:
-                    cache_part.write(first_chunk)
+                _tee(first_chunk)
                 async for chunk in agen:
                     if prepared.cancelled:
                         break
                     proc.stdin.write(chunk)
                     await proc.stdin.drain()
-                    if cache_part is not None:
-                        cache_part.write(chunk)
+                    _tee(chunk)
             except Exception as exc:
                 mid_error.append(exc)
             finally:
@@ -1066,6 +1080,15 @@ class SynthesisPipelineMixin:
                             pass
                         break
                 leftover = buf[n:]
+        except BaseException:
+            # Cancelled (shutdown) or failed: a feeder waiting on a stalled
+            # stream would otherwise keep this task and ffmpeg alive forever.
+            feeder.cancel()
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            raise
         finally:
             await asyncio.gather(feeder, return_exceptions=True)
             if leftover and not prepared.cancelled and not limit_hit and not ttfa_expired:
@@ -1114,4 +1137,6 @@ class SynthesisPipelineMixin:
                 cache.commit_file(job.text, cache_final, cache_key)
             except OSError:
                 _discard()
+        else:
+            _discard()  # caching stopped part-way: drop the partial file
         return ("ok", frames_count)
