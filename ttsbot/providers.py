@@ -152,7 +152,7 @@ class DispatcherConfig:
 _DEFAULT_CACHE_DIR = "/app/data/tts_cache"
 # mp3: MiniMax, opus: Fish/ElevenLabs Ogg, dopus: Discord-ready Opus frames,
 # pcm: Gemini/ElevenLabs raw PCM with a pcm_cache_header.
-CACHE_SUFFIXES = ("mp3", "opus", "dopus", "pcm")
+CACHE_SUFFIXES = ("mp3", "opus", "dopus", "pcm", "wav")
 _DEFAULT_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
 

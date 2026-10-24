@@ -39,6 +39,18 @@ class PiperSynthesisTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(second.read_bytes(), first.read_bytes())
         local._piper_synthesize.assert_awaited_once()
 
+    async def test_cached_piper_audio_survives_a_restart(self):
+        async def piper(text, filename, profile):
+            filename.write_bytes(b"RIFF" + b"\x00" * 40)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = TTSCacheConfig(enabled=True, cache_dir=Path(tmp) / "cache")
+            d = TTSDispatcher(local=LocalProvider(AsyncMock(side_effect=piper)), cache=TTSPhraseCache(config))
+            await d.synthesize_piper("привет", Path(tmp) / "a.wav", PIPER)
+            restarted = TTSPhraseCache(config)  # a new process reads the directory
+            self.assertEqual(restarted.size, 1)
+            self.assertEqual(restarted.lookup("привет", "piper-ruslan").suffix, ".wav")
+
     def test_the_cloud_file_path_and_primary_provider_are_gone(self):
         d = TTSDispatcher(local=MagicMock())
         for name in ("synthesize", "synthesize_chain", "route", "_synthesize_fish", "_synthesize_minimax",
