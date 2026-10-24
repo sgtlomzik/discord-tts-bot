@@ -21,7 +21,6 @@ models/
 # Discord chat exports / metrics (personal data)
 exports/
 # Operator-local working notes
-/supertonic_*.md
 # Voice samples and clone previews (may contain personal recordings)
 scripts/voice_samples/*
 !scripts/voice_samples/.gitkeep

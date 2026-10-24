@@ -1,10 +1,12 @@
 services:
   tts_bot:
     build: .
-    # Prebuilt image published by .github/workflows/docker.yml;
-    # `docker compose pull` fetches it, `docker compose up -d --build`
-    # rebuilds locally instead.
-    image: ghcr.io/sgtlomzik/discord-tts-bot:latest
+    # Prebuilt image published by .github/workflows/docker.yml for every
+    # push to main: `latest` and an immutable `sha-<short sha>` tag. Pin a
+    # deployment with TTS_IMAGE_TAG=sha-... in .env (both services use it,
+    # so the bot and the website always run the same code);
+    # `docker compose up -d --build` rebuilds locally instead.
+    image: ghcr.io/sgtlomzik/discord-tts-bot:${TTS_IMAGE_TAG:-latest}
     container_name: discord_tts_bot
     env_file:
       - path: .env
@@ -24,7 +26,7 @@ services:
   # process. It reads the recordings and gets none of the bot's secrets:
   # only the settings it needs are passed (compose reads them from .env).
   tts_web:
-    image: ghcr.io/sgtlomzik/discord-tts-bot:latest
+    image: ghcr.io/sgtlomzik/discord-tts-bot:${TTS_IMAGE_TAG:-latest}
     container_name: discord_tts_web
     command: ["python", "-u", "-m", "ttsbot.web"]
     restart: unless-stopped
