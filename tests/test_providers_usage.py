@@ -10,10 +10,7 @@ from pathlib import Path
 
 import httpx
 
-from ttsbot.providers import (
-    MiniMaxConfig,
-    MiniMaxProvider,
-)
+from ttsbot.minimax import (MiniMaxConfig, MiniMaxProvider)
 
 
 def _mp3_response(usage: int) -> httpx.Response:

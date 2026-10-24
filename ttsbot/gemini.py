@@ -286,3 +286,13 @@ def write_wav(filename: Path, rate: int, channels: int, pcm: bytes) -> None:
         out.setsampwidth(2)
         out.setframerate(rate)
         out.writeframes(pcm)
+
+
+NAME = "gemini"
+
+
+def create(store=None) -> "GeminiProvider | None":
+    """Gemini TTS through OpenRouter, enabled by OPENROUTER_API_KEY alone;
+    voices are added with /voicebot voice-add provider:gemini."""
+    cfg = GeminiConfig.from_env()
+    return GeminiProvider(cfg) if cfg.api_key else None

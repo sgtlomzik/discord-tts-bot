@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from ttsbot import voice_registry as vr
-from ttsbot.providers import MiniMaxProvider
+from ttsbot.minimax import (MiniMaxProvider)
 from types import MethodType
 from test_bot import load_bot_module, temp_config_store
 

@@ -27,12 +27,7 @@ from ttsbot.fish import FishError
 from ttsbot.gemini import GeminiError
 from ttsbot.health import FailureKind, classify_failure
 from ttsbot.pcm import PcmFramer, pcm_cache_header, pcm_to_frames, read_pcm_cache
-from ttsbot.providers import (
-    MiniMaxError,
-    MiniMaxProvider,
-    MiniMaxVoiceNotFoundError,
-    load_minimax_config_from_env,
-)
+from ttsbot.minimax import MiniMaxError, MiniMaxVoiceNotFoundError
 from ttsbot import config
 from ttsbot.audio import (
     PCM_FRAME_BYTES,
@@ -135,26 +130,6 @@ class SynthesisPipelineMixin:
                     filename.unlink()
                 except OSError:
                     log.exception("Failed to remove warmup file: %s", filename)
-
-    def _build_cloud_provider(self):
-        """Construct the MiniMax provider if the bot has credentials.
-
-        Returns ``None`` when MINIMAX_API_KEY is missing: MiniMax voices
-        then fall to the next voice of their chain.
-        """
-        cfg = load_minimax_config_from_env()
-        # Only the API key is required now: the per-message voice_id comes
-        # from the registry record, so the cloud provider is usable even
-        # when MINIMAX_VOICE_ID is empty (as long as a minimax voice is in
-        # the catalog). MINIMAX_VOICE_ID remains the first-start seed.
-        if not cfg.api_key:
-            log.info("MiniMax provider disabled (api_key MISSING); fall back to local")
-            return None
-        log.info(
-            "MiniMax provider enabled model=%s default_voice_id=%s base_url=%s timeout=%.1fs",
-            cfg.model, cfg.voice_id or "(per-record)", cfg.base_url, cfg.timeout_seconds,
-        )
-        return MiniMaxProvider(cfg)
 
     def _keepalive_warmers(self) -> dict:
         """Warmers of the cloud voices of allowed users in the bot's voice

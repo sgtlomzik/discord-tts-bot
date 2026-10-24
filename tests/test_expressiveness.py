@@ -12,13 +12,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from ttsbot.providers import (
-    MiniMaxConfig,
-    MiniMaxProvider,
-    derive_auto_emotion,
-    resolve_emotion,
-    voice_cache_key,
-)
+from ttsbot.providers import (voice_cache_key)
+from ttsbot.minimax import (MiniMaxConfig, MiniMaxProvider, derive_auto_emotion, resolve_emotion)
 
 
 from support import load_bot_module  # noqa: E402,F401  (re-exported for other tests)

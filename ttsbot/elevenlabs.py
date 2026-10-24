@@ -31,7 +31,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import AsyncIterator, Callable
 
@@ -43,6 +43,7 @@ from ttsbot.gemini import write_wav
 from ttsbot.health import QuotaReport, fingerprint
 from ttsbot.httpclient import attach_warmer, provider_limits
 from ttsbot.streams import StreamSpec
+from ttsbot import voice_registry
 
 log = logging.getLogger("tts_bot")
 
@@ -635,3 +636,57 @@ class ElevenLabsProvider:
             return self._voices
         self._voices, self._voices_at = voices, time.monotonic()
         return voices
+
+
+NAME = "elevenlabs"
+
+
+def _config_from_env() -> "ElevenLabsConfig":
+    """ELEVENLABS_* settings; invalid ones disable it unless a key asks for it."""
+    try:
+        return ElevenLabsConfig.from_env()
+    except ValueError as exc:
+        if os.getenv("ELEVENLABS_API_KEY", "").strip():
+            raise  # ElevenLabs is wanted, so a bad setting must stop startup
+        log.warning("Ignoring invalid ELEVENLABS_* settings; ElevenLabs is disabled: %s", exc)
+        return ElevenLabsConfig(api_key="")
+
+
+def seed_voices(registry) -> bool:
+    """Point eleven-default at ELEVENLABS_VOICE_ID, keeping its tuning;
+    True when the catalog changed."""
+    cfg = _config_from_env()
+    if not cfg.api_key or not cfg.voice_id:
+        return False
+    current = registry.get("eleven-default")
+    if current is not None and not current.is_elevenlabs:
+        log.warning("Voice eleven-default is a %s voice; not seeding ELEVENLABS_VOICE_ID", current.provider)
+        return False
+    if current is not None and current.elevenlabs is not None:
+        record = replace(current, elevenlabs=replace(current.elevenlabs, voice_id=cfg.voice_id))
+    else:
+        record = voice_registry.VoiceRecord(
+            name="eleven-default", label="ElevenLabs", description="ElevenLabs voice from .env",
+            provider=voice_registry.PROVIDER_ELEVENLABS,
+            elevenlabs=voice_registry.ElevenLabsParams(voice_id=cfg.voice_id),
+        )
+    if current == record:
+        return False
+    registry.add(record)
+    return True
+
+
+def create(store) -> "ElevenLabsProvider | None":
+    """ElevenLabs with its key ring, resuming at the saved active key;
+    None without ELEVENLABS_API_KEY(S)."""
+    cfg = _config_from_env()
+    if not cfg.api_key:
+        return None
+    saved_key = store.settings.get("elevenlabs_key")
+    provider = ElevenLabsProvider(
+        cfg, active_key=saved_key if isinstance(saved_key, str) else "",
+        on_key_switch=store.set_elevenlabs_key,
+    )
+    log.info("ElevenLabs enabled keys=%d active=#%d format=%s model=%s",
+             len(cfg.keys), provider.active_key_index + 1, cfg.format, cfg.model)
+    return provider

@@ -66,11 +66,11 @@ class FishProviderTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(second.voice_registry.get("fish-default").fish.speed, 1.4)
                     self.assertEqual(second.voice_registry.get("fish-default").fish.reference_id, "voice-id")
                     self.assertEqual(second.fish_latency, "balanced")
-                    self.assertEqual(second.fish_provider.config.latency, "balanced")
+                    self.assertEqual(second.tts_dispatcher.provider_for("fish").config.latency, "balanced")
                 finally:
-                    await second.fish_provider.aclose()
+                    await second.tts_dispatcher.provider_for("fish").aclose()
             finally:
-                await first.fish_provider.aclose()
+                await first.tts_dispatcher.provider_for("fish").aclose()
 
     async def test_tuned_voice_request_and_cache_identity(self):
         requests = []
@@ -362,7 +362,7 @@ class FishLatencyCommandTests(unittest.IsolatedAsyncioTestCase):
                 )),
             )
             voice = bot_mod.bot.voice_registry.get("fish-default")
-            original_key = bot_mod.bot.fish_provider.config.cache_key(voice.fish.reference_id, voice.fish)
+            original_key = bot_mod.bot.tts_dispatcher.provider_for("fish").config.cache_key(voice.fish.reference_id, voice.fish)
             with patch.object(bot_mod.tts_commands, "is_guild_manager", return_value=True), \
                     patch.object(bot_mod.tts_commands, "is_bot_owner", AsyncMock(return_value=True)), \
                     patch.object(bot_mod.discord, "Member", type(interaction.user)):
@@ -370,11 +370,11 @@ class FishLatencyCommandTests(unittest.IsolatedAsyncioTestCase):
                     interaction, SimpleNamespace(value="balanced"),
                 )
             self.assertEqual(bot_mod.bot.fish_latency, "balanced")
-            self.assertEqual(bot_mod.bot.fish_provider.config.latency, "balanced")
+            self.assertEqual(bot_mod.bot.tts_dispatcher.provider_for("fish").config.latency, "balanced")
             self.assertEqual(bot_mod.bot.voice_registry.get("fish-default"), voice)
             self.assertNotEqual(
                 original_key,
-                bot_mod.bot.fish_provider.config.cache_key(voice.fish.reference_id, voice.fish),
+                bot_mod.bot.tts_dispatcher.provider_for("fish").config.cache_key(voice.fish.reference_id, voice.fish),
             )
             self.assertEqual(json.loads(Path(tmp, "config.json").read_text())["settings"]["fish_latency"], "balanced")
             self.assertIn("balanced", sent[0])
@@ -382,8 +382,8 @@ class FishLatencyCommandTests(unittest.IsolatedAsyncioTestCase):
             try:
                 self.assertEqual(restarted.fish_latency, "balanced")
             finally:
-                await restarted.fish_provider.aclose()
-                await bot_mod.bot.fish_provider.aclose()
+                await restarted.tts_dispatcher.provider_for("fish").aclose()
+                await bot_mod.bot.tts_dispatcher.provider_for("fish").aclose()
 
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
@@ -725,7 +725,7 @@ class FishQuotaAndConfigTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(config, "BOT_CONFIG_PATH", Path(tmp) / "config.json"), \
                 patch.dict(os.environ, {"FISH_API_KEY": "", "FISH_LATENCY": "bogus",
                                         "TTS_CACHE_ENABLED": "0"}):
-            self.assertIsNone(TTSBot().fish_provider)
+            self.assertIsNone(TTSBot().tts_dispatcher.provider_for("fish"))
             with patch.dict(os.environ, {"FISH_API_KEY": "k"}):
                 with self.assertRaises(ValueError):
                     TTSBot()

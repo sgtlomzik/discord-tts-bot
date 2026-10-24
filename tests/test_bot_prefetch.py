@@ -18,7 +18,7 @@ from test_bot_streaming import (
     _minimax_voice,
 )
 from ttsbot.providers import TTSCacheConfig, TTSPhraseCache, voice_cache_key
-from ttsbot.providers import MiniMaxProvider
+from ttsbot.minimax import (MiniMaxProvider)
 from types import MethodType
 
 

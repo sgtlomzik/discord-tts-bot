@@ -23,10 +23,8 @@ from ttsbot.health import (
 )
 from ttsbot.models import PreparedAudio, TTSJob
 from ttsbot.pipeline import SynthesisPipelineMixin
-from ttsbot.providers import (
-    DispatcherConfig, MiniMaxAuthError, MiniMaxQuotaError, MiniMaxQuotaExhaustedError,
-    MiniMaxVoiceNotFoundError, TTSDispatcher,
-)
+from ttsbot.providers import (DispatcherConfig, TTSDispatcher)
+from ttsbot.minimax import (MiniMaxAuthError, MiniMaxQuotaError, MiniMaxQuotaExhaustedError, MiniMaxVoiceNotFoundError)
 from ttsbot.voice_registry import (
     ElevenLabsParams, FishParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict,
 )

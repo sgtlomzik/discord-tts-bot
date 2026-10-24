@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from mimetypes import guess_type
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -18,6 +18,7 @@ from ttsbot import config as bot_config
 from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
 from ttsbot.httpclient import attach_warmer, provider_limits
 from ttsbot.streams import StreamSpec
+from ttsbot import voice_registry
 
 log = logging.getLogger("tts_bot")
 
@@ -364,3 +365,48 @@ class FishProvider:
             except (ValueError, KeyError, TypeError) as exc:
                 raise FishError(f"Fish clone {reference_id} state response is invalid") from exc
         raise FishError(f"Fish clone {reference_id} is still {state} after 60 seconds")
+
+
+NAME = "fish"
+
+
+def _config_from_env() -> "FishConfig":
+    """FISH_* settings; invalid ones disable Fish unless FISH_API_KEY asks for it."""
+    try:
+        return FishConfig.from_env()
+    except ValueError as exc:
+        if os.getenv("FISH_API_KEY", "").strip():
+            raise  # Fish is wanted, so a bad setting must stop startup
+        log.warning("Ignoring invalid FISH_* settings; Fish is disabled: %s", exc)
+        return FishConfig(api_key="")
+
+
+def seed_voices(registry) -> bool:
+    """Point fish-default at FISH_REFERENCE_ID; True when the catalog changed."""
+    reference_id = _config_from_env().reference_id
+    if not reference_id:
+        return False
+    current = registry.get("fish-default")
+    if current is not None and current.is_fish and current.fish is not None:
+        record = replace(current, fish=replace(current.fish, reference_id=reference_id))
+    else:
+        record = voice_registry.VoiceRecord(
+            name="fish-default", label="Fish Audio", description="Fish Audio reference voice",
+            provider=voice_registry.PROVIDER_FISH,
+            fish=voice_registry.FishParams(reference_id=reference_id),
+        )
+    if current == record:
+        return False
+    registry.add(record)
+    return True
+
+
+def create(store) -> "FishProvider | None":
+    """The Fish provider with the saved global latency, or None without FISH_API_KEY."""
+    cfg = _config_from_env()
+    if not cfg.api_key:
+        return None
+    saved = store.settings.get("fish_latency")
+    if isinstance(saved, str):
+        cfg = replace(cfg, latency=saved)
+    return FishProvider(cfg)

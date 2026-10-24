@@ -15,7 +15,8 @@ from ttsbot.elevenlabs import ElevenLabsConfig, ElevenLabsProvider
 from ttsbot.fish import FishConfig, FishProvider
 from ttsbot.gemini import GeminiConfig, GeminiProvider
 from ttsbot.httpclient import ConnectionWarmer, attach_warmer
-from ttsbot.providers import MiniMaxConfig, MiniMaxProvider, TTSDispatcher
+from ttsbot.providers import (TTSDispatcher)
+from ttsbot.minimax import (MiniMaxConfig, MiniMaxProvider)
 from ttsbot.voice_registry import ElevenLabsParams, VoiceRecord, VoiceRegistry
 
 

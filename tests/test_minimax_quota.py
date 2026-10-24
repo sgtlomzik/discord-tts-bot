@@ -14,20 +14,10 @@ import httpx
 from ttsbot.voice_registry import FishParams, MiniMaxParams, VoiceRecord
 from ttsbot.models import PreparedAudio, TTSJob
 from ttsbot.pipeline import SynthesisPipelineMixin
-from ttsbot.providers import (
-    CircuitBreaker,
-    CircuitBreakerConfig,
-    CircuitState,
-    DispatcherConfig,
-    MiniMaxConfig,
-    MiniMaxError,
-    MiniMaxProvider,
-    MiniMaxQuotaError,
-    MiniMaxQuotaExhaustedError,
-    TTSDispatcher,
-)
+from ttsbot.providers import (CircuitBreaker, CircuitBreakerConfig, CircuitState, DispatcherConfig, TTSDispatcher)
+from ttsbot.minimax import (MiniMaxConfig, MiniMaxError, MiniMaxProvider, MiniMaxQuotaError, MiniMaxQuotaExhaustedError)
 from ttsbot.streams import StreamSpec
-from ttsbot.providers import MiniMaxProvider
+from ttsbot.minimax import (MiniMaxProvider)
 from support import with_spec
 
 QUOTA_BODY = (

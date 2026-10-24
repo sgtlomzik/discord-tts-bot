@@ -9,7 +9,7 @@ from ttsbot.elevenlabs import ElevenLabsConfig, ElevenLabsProvider
 from ttsbot.fish import FishConfig, FishProvider
 from ttsbot.gemini import GeminiConfig, GeminiProvider
 from ttsbot.httpclient import KEEPALIVE_EXPIRY, provider_limits
-from ttsbot.providers import MiniMaxConfig, MiniMaxProvider
+from ttsbot.minimax import (MiniMaxConfig, MiniMaxProvider)
 
 
 class KeepAliveTests(unittest.TestCase):
