@@ -353,7 +353,7 @@ class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         with patch.object(config, "TTS_STREAMING_ENABLED", True), patch.object(config, "TTS_CONTINUOUS_STREAM", True):
             await pipeline._prepare_into(prepared)
-        pipeline._generate_file_into.assert_awaited_once_with(prepared, piper)
+        pipeline._generate_file_into.assert_awaited_once_with(prepared, piper, [])
         self.assertIsNone(await prepared.channel.get())
 
     async def test_register_voice_probes_and_saves(self):

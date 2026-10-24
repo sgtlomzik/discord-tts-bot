@@ -110,6 +110,7 @@ bot = TTSBot()
 # re-exported here for tests and backward compatibility.
 _command_ns = tts_commands.build_commands(bot)
 bot.tts_group = _command_ns["tts_group"]
+bot.extra_groups = [_command_ns["fallback_group"]]
 globals().update(_command_ns)
 globals().update(tts_events.register_events(bot))
 

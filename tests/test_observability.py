@@ -12,10 +12,11 @@ import discord
 import httpx
 
 from ttsbot import config
+from ttsbot.health import CircuitBreaker, FailureKind
 from ttsbot.httpclient import attach_warmer
 from ttsbot.models import TTSJob
 from ttsbot.providers import TTSCacheConfig, TTSPhraseCache
-from ttsbot.voice_registry import ElevenLabsParams, VoiceRecord, VoiceRegistry
+from ttsbot.voice_registry import ElevenLabsParams, FishParams, VoiceRecord, VoiceRegistry
 
 
 def load_bot_module():
@@ -76,7 +77,11 @@ class KeepAliveWorkerTests(unittest.TestCase):
         })
         warmer = types.SimpleNamespace(name="ElevenLabs")
         providers = {"elevenlabs": types.SimpleNamespace(warmer=warmer)}
-        bot.tts_dispatcher = types.SimpleNamespace(provider_for=lambda name: providers.get(name or ""))
+        self.breakers = {"elevenlabs": CircuitBreaker()}
+        bot.tts_dispatcher = types.SimpleNamespace(
+            provider_for=lambda name: providers.get(name or ""),
+            breaker_for=lambda name: self.breakers.get(name or ""),
+        )
         bot.config_store = MagicMock()
         bot.config_store.is_enabled.return_value = True
         bot.config_store.is_allowed.side_effect = lambda guild, user: user != 3
@@ -104,6 +109,24 @@ class KeepAliveWorkerTests(unittest.TestCase):
             self.assertEqual(bot._keepalive_warmers(), {})
             clients.return_value = []  # not in a voice channel
             self.assertEqual(bot._keepalive_warmers(), {})
+
+    def test_paused_provider_warms_the_fallback_that_will_speak(self):
+        bot, _ = self._bot()
+        fish_warmer = types.SimpleNamespace(name="Fish")
+        fish = types.SimpleNamespace(warmer=fish_warmer)
+        bot.voice_registry.fallback_chain = ["fish-default", "piper-ruslan"]
+        bot.voice_registry.add(VoiceRecord(name="fish-default", label="F", description="", provider="fish",
+                                           fish=FishParams(reference_id="r")))
+        providers = {"elevenlabs": types.SimpleNamespace(warmer=types.SimpleNamespace(name="ElevenLabs")),
+                     "fish": fish}
+        bot.tts_dispatcher.provider_for = lambda name: providers.get(name or "")
+        self.breakers["elevenlabs"].trip(3600)
+        with patch.object(type(bot), "voice_clients", new_callable=PropertyMock, return_value=[self._vc(1)]):
+            self.assertEqual(bot._keepalive_warmers(), {"Fish": fish_warmer})
+        self.breakers["fish"] = CircuitBreaker()
+        self.breakers["fish"].trip(60, FailureKind.TRANSIENT)
+        with patch.object(type(bot), "voice_clients", new_callable=PropertyMock, return_value=[self._vc(1)]):
+            self.assertEqual(bot._keepalive_warmers(), {})  # Piper speaks: nothing to warm
 
     def test_disabled_guild_is_skipped(self):
         bot, _ = self._bot()

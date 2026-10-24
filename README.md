@@ -122,12 +122,18 @@ the raw Ogg in `.opus`. Cache keys include the text, `reference_id`,
 model, and the settings sent to Fish (pitch is not among them).
 
 If Fish sends no audio packet within `FISH_TTFA_TIMEOUT` seconds (response
-headers alone do not count), that message is spoken by the Piper fallback
-voice and a `Fish first audio exceeded` warning is logged. Repeated Fish or
-MiniMax failures open a circuit breaker for `CB_COOLDOWN_SECONDS`. An
-exhausted balance or plan (Fish HTTP 402, MiniMax status 1008 or 2056)
-pauses that provider for `TTS_QUOTA_COOLDOWN_SECONDS` instead; rate limits
-(HTTP 429, MiniMax status 1039) count as ordinary failures.
+headers alone do not count), that message is spoken by the next voice of
+the fallback chain and a `Fish first audio exceeded` warning is logged.
+
+The fallback chain is a list of voice names in `data/voices.json`, set with
+`/fallback set chain:fish-default,piper-ruslan` (for every voice) or
+with `voice:` for one voice. Without one, the Piper `fallback_profile`
+speaks. Each provider is paused according to why it failed: repeated
+network errors for `CB_COOLDOWN_SECONDS` (growing while it stays down), a
+429 for its Retry-After, an exhausted balance or rejected key until a check
+says it works again (ElevenLabs is checked at its quota reset time, others
+after `TTS_QUOTA_COOLDOWN_SECONDS`, doubling up to a day). Pauses survive
+restarts; `/fallback status` shows them and can reset one.
 
 To move an existing install to Fish in one step, stop the bot and run
 `python scripts/migrate_fish_default.py data/config.json`. It sets every

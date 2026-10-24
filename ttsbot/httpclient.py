@@ -80,6 +80,24 @@ class ConnectionWarmer:
         self._task = asyncio.create_task(self._warm(reason), name=f"warm-{self.name}")
         return self._task
 
+    async def reachable(self, timeout: float = 5.0) -> bool:
+        """Whether the provider host answers at all (any status below 500).
+
+        The health worker asks this before letting a real message probe a
+        provider paused for network errors. Free, like a warm-up.
+        """
+        try:
+            response = await self._client.get(
+                self._url, timeout=timeout, extensions={"ttsbot_purpose": "health"},
+            )
+        except httpx.HTTPError as exc:
+            log.info("%s health ping failed: %s: %s", self.name, type(exc).__name__, exc)
+            return False
+        if response.status_code >= 500:
+            log.info("%s health ping status=%s", self.name, response.status_code)
+            return False
+        return True
+
     async def _warm(self, reason: str) -> None:
         started = time.perf_counter()
         try:

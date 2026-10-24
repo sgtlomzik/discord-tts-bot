@@ -45,6 +45,21 @@ def _flag(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() not in {"0", "false", "no"}
 
 
+def _number(name: str, default, kind, low=None, high=None):
+    """A numeric setting; a malformed one logs a warning and uses ``default``."""
+    raw = os.getenv(name, "").strip()
+    try:
+        value = kind(raw) if raw else default
+    except ValueError:
+        log.warning("Ignoring invalid %s=%r; using %s", name, raw, default)
+        value = default
+    if low is not None:
+        value = max(low, value)
+    if high is not None:
+        value = min(high, value)
+    return value
+
+
 def reload() -> None:
     """(Re)read every tunable from the environment into module globals."""
     global TMP_DIR, BOT_CONFIG_PATH, VOICES_REGISTRY_PATH, DEFAULT_VOICE_PROFILE
@@ -53,6 +68,7 @@ def reload() -> None:
     global TTS_CONTINUOUS_STREAM, TTS_STREAMING_ENABLED, TTS_STREAM_TTFA_TIMEOUT
     global FISH_TTFA_TIMEOUT, GEMINI_TTFA_TIMEOUT, GEMINI_TTFA_PER_CHAR
     global ELEVENLABS_TTFA_TIMEOUT, TTS_CONNECTION_KEEPALIVE_SECONDS
+    global PROVIDER_HEALTH_PATH, TTS_HEALTH_CHECK_INTERVAL
     global TTS_PREFETCH_ENABLED, TTS_PREFETCH_LOOKAHEAD
     global TTS_IDLE_FRAME_MODE, TTS_IDLE_VOLUME_DB, TTS_STREAM_TAIL_MS
     global TTS_MAX_CONTINUOUS_IDLE_SECONDS, IDLE_DISCONNECT_SECONDS
@@ -73,6 +89,15 @@ def reload() -> None:
     global PIPER_MODELS_DIR, PIPER_MODEL_PATH, PIPER_CONFIG_PATH
     global PIPER_SPEAKER, PIPER_LENGTH_SCALE
     global WHITELIST_USERS
+    global RECORDING_ENABLED, RECORDING_DIR, RECORDING_CHUNK_SECONDS
+    global RECORDING_IDLE_CLOSE_SECONDS, RECORDING_PAUSE_MS, RECORDING_VAD_AGGRESSIVENESS
+    global RECORDING_AUDIO_KEEP_DAYS, RECORDING_TRANSCRIPT_KEEP_DAYS, RECORDING_PRUNE_INTERVAL_HOURS
+    global STT_ENABLED, GROQ_API_KEY, STT_MODEL, STT_LANGUAGE, STT_PROMPT
+    global STT_AUDIO_SECONDS_PER_HOUR, STT_AUDIO_SECONDS_PER_DAY, STT_MIN_BILLED_SECONDS
+    global STT_REQUESTS_PER_MINUTE, TRANSCRIPT_TIMEZONE
+    global WEB_HOST, WEB_PORT, WEB_CACHE_DIR, WEB_CACHE_MAX_MB, WEB_STATIC_DIR
+    global WEB_USERNAME, WEB_PASSWORD, WEB_CORS_ORIGINS, WEB_MIX_GAP_MS
+    global WEB_MAINTENANCE_SECONDS, WEB_PREBUILD_RECENT, WEB_ALLOW_ANONYMOUS
 
     TMP_DIR = Path(os.getenv("TTS_TMP_DIR", "/dev/shm"))
     BOT_CONFIG_PATH = Path(os.getenv("BOT_CONFIG_PATH", "/app/data/config.json"))
@@ -123,6 +148,13 @@ def reload() -> None:
     # (a new one costs 0.3-0.5 s through the VPN). ~1 KB per ping, no
     # credits. 0 disables; typing warm-ups still run.
     TTS_CONNECTION_KEEPALIVE_SECONDS = max(0.0, float(os.getenv("TTS_CONNECTION_KEEPALIVE_SECONDS", "60")))
+    # Provider health (ttsbot/health.py): breaker state survives restarts in
+    # this file, and paused providers are checked (quota report, host ping)
+    # every TTS_HEALTH_CHECK_INTERVAL seconds once their pause is over.
+    PROVIDER_HEALTH_PATH = Path(
+        os.getenv("TTS_HEALTH_PATH", str(BOT_CONFIG_PATH.parent / "provider_health.json"))
+    )
+    TTS_HEALTH_CHECK_INTERVAL = max(5.0, float(os.getenv("TTS_HEALTH_CHECK_INTERVAL", "30")))
     # Prefetch: decouple generation from playback so message N+1 is synthesized
     # while N is still playing (cuts queue_wait under bursts). Playback stays
     # strictly sequential FIFO. TTS_PREFETCH_ENABLED=0 reverts to the proven
@@ -183,6 +215,65 @@ def reload() -> None:
     TTS_AUDIO_CHARS_PER_SECOND = float(os.getenv("TTS_AUDIO_CHARS_PER_SECOND", "12"))
     TTS_AUDIO_LIMIT_SAFETY = float(os.getenv("TTS_AUDIO_LIMIT_SAFETY", "2.0"))
     TTS_AUDIO_LIMIT_MIN_SECONDS = float(os.getenv("TTS_AUDIO_LIMIT_MIN_SECONDS", "5"))
+
+    # Voice recording (ttsbot/recording): off by default. When on, the bot
+    # joins voice undeafened and writes every non-bot speaker to Ogg files
+    # under RECORDING_DIR, one folder per channel stay. A file closes after
+    # RECORDING_CHUNK_SECONDS of speech (at an utterance boundary) or
+    # RECORDING_IDLE_CLOSE_SECONDS of that user's silence. WebRTC VAD at
+    # RECORDING_VAD_AGGRESSIVENESS (0-3; -1 keeps everything) drops
+    # breathing and silence; 3 was the one that dropped loud breathing in
+    # the first live test. Longer gaps become RECORDING_PAUSE_MS of silence.
+    RECORDING_ENABLED = _flag("RECORDING_ENABLED", "0")
+    RECORDING_DIR = Path(os.getenv("RECORDING_DIR", str(BOT_CONFIG_PATH.parent / "recordings")))
+    RECORDING_CHUNK_SECONDS = max(10.0, float(os.getenv("RECORDING_CHUNK_SECONDS", "600")))
+    # 15 min: Groq bills every file for at least 10 s, and a 60 s close
+    # produced 0.5 s files from a single word.
+    RECORDING_IDLE_CLOSE_SECONDS = max(5.0, float(os.getenv("RECORDING_IDLE_CLOSE_SECONDS", "900")))
+    RECORDING_PAUSE_MS = max(0, int(os.getenv("RECORDING_PAUSE_MS", "500")))
+    RECORDING_VAD_AGGRESSIVENESS = min(3, max(-1, int(os.getenv("RECORDING_VAD_AGGRESSIVENESS", "3"))))
+    # Retention, run by the STT worker (so it needs the worker) as it starts
+    # and then every RECORDING_PRUNE_INTERVAL_HOURS (0 = only at start):
+    # transcribed Ogg files older than RECORDING_AUDIO_KEEP_DAYS are deleted,
+    # transcripts stay; finished sessions (transcripts and all) older than
+    # RECORDING_TRANSCRIPT_KEEP_DAYS are deleted. 0 = keep forever.
+    RECORDING_AUDIO_KEEP_DAYS = max(0, int(os.getenv("RECORDING_AUDIO_KEEP_DAYS", "90")))
+    RECORDING_TRANSCRIPT_KEEP_DAYS = max(0, int(os.getenv("RECORDING_TRANSCRIPT_KEEP_DAYS", "0")))
+    RECORDING_PRUNE_INTERVAL_HOURS = max(0.0, float(os.getenv("RECORDING_PRUNE_INTERVAL_HOURS", "24")))
+    # Transcription of recorded chunks with Groq Whisper (ttsbot/recording/
+    # worker.py); runs while recording is on and GROQ_API_KEY is set. The
+    # limits are Groq's free plan; results stay on disk next to the audio.
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+    STT_ENABLED = _flag("STT_ENABLED", "1") and bool(GROQ_API_KEY)
+    STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3").strip()
+    STT_LANGUAGE = os.getenv("STT_LANGUAGE", "ru").strip()
+    STT_PROMPT = os.getenv("STT_PROMPT", "").strip()
+    STT_AUDIO_SECONDS_PER_HOUR = max(60.0, float(os.getenv("STT_AUDIO_SECONDS_PER_HOUR", "7200")))
+    STT_AUDIO_SECONDS_PER_DAY = max(60.0, float(os.getenv("STT_AUDIO_SECONDS_PER_DAY", "28800")))
+    STT_MIN_BILLED_SECONDS = max(0.0, float(os.getenv("STT_MIN_BILLED_SECONDS", "10")))
+    STT_REQUESTS_PER_MINUTE = max(1, int(os.getenv("STT_REQUESTS_PER_MINUTE", "20")))
+    TRANSCRIPT_TIMEZONE = os.getenv("TRANSCRIPT_TIMEZONE", "UTC").strip() or "UTC"
+
+    # Recordings website (python -m ttsbot.web, docs/RECORDINGS_WEB.md): a
+    # separate process that only reads RECORDING_DIR. Derived audio (the
+    # joined session mix, MP3) is cached in WEB_CACHE_DIR, least recently
+    # used first out over WEB_CACHE_MAX_MB. WEB_PASSWORD turns on HTTP
+    # Basic auth (required unless WEB_ALLOW_ANONYMOUS=1); WEB_CORS_ORIGINS
+    # (comma-separated) lets a frontend dev server on another origin call
+    # the API. The bot shares this module but never uses these, so a bad
+    # value only logs a warning and falls back to the default.
+    WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    WEB_PORT = _number("WEB_PORT", 8095, int, 1, 65535)
+    WEB_CACHE_DIR = Path(os.getenv("WEB_CACHE_DIR", "/app/cache"))
+    WEB_CACHE_MAX_MB = _number("WEB_CACHE_MAX_MB", 2048, int, 64)
+    WEB_STATIC_DIR = os.getenv("WEB_STATIC_DIR", "").strip()
+    WEB_USERNAME = os.getenv("WEB_USERNAME", "").strip()
+    WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
+    WEB_ALLOW_ANONYMOUS = _flag("WEB_ALLOW_ANONYMOUS", "0")
+    WEB_CORS_ORIGINS = tuple(o.strip().rstrip("/") for o in os.getenv("WEB_CORS_ORIGINS", "").split(",") if o.strip())
+    WEB_MIX_GAP_MS = _number("WEB_MIX_GAP_MS", 500, int, 0, 5000)
+    WEB_MAINTENANCE_SECONDS = _number("WEB_MAINTENANCE_SECONDS", 300.0, float, 30.0)
+    WEB_PREBUILD_RECENT = _number("WEB_PREBUILD_RECENT", 3, int, 0)
 
     VOICE_CONNECT_COOLDOWN_SECONDS = int(os.getenv("VOICE_CONNECT_COOLDOWN_SECONDS", "60"))
     # One knob for bare-metal runs: point PIPER_MODELS_DIR at ./models and

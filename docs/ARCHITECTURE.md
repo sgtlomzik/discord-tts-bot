@@ -56,6 +56,11 @@ The active runtime pieces are:
     composed from the four concern mixins below.
   - `voice_lifecycle.py` - connect/move locks, cooldowns, stale-client
     recovery, idle disconnect, auto-connect policy.
+  - `recording/` - voice receive (off unless `RECORDING_ENABLED=1`):
+    `client.py` (a `VoiceClient` subclass), `rtp.py` (transport
+    decryption), `recorder.py` (per-user chunk files), `ogg.py` (Ogg
+    Opus writer), `vad.py` (speech filter); transcription: `groq.py`
+    (client and audio budget), `worker.py` (queue), `transcript.py`.
   - `merge.py` - the enqueue boundary and legacy/selective-hold merge
     decisions.
   - `pipeline.py` - Piper/MiniMax/Fish synthesis, the streaming fast path,
@@ -63,9 +68,12 @@ The active runtime pieces are:
   - `playback.py` - PCM preparation and the continuous Opus player feed.
   - `commands.py` - `build_commands(bot)` creates the /voicebot group
     bound to a bot instance; `events.py` - `register_events(bot)`.
-- `ttsbot/providers.py` - provider abstraction: dispatcher, MiniMax
-  client and its error classes, phrase cache, circuit breaker (including
-  the long quota trip).
+- `ttsbot/providers.py` - provider abstraction: dispatcher (fallback chain,
+  health checks), MiniMax client and its error classes, phrase cache.
+- `ttsbot/health.py` - failure kinds, the circuit breaker with its backoff
+  and quota pauses, and `HealthStore` (`data/provider_health.json`).
+- `ttsbot/errors.py` - marker classes every provider error inherits:
+  `QuotaExhaustedError`, `AuthError`, `RateLimitError`, `RequestError`.
 - `ttsbot/fish.py` - Fish HTTP client, request configuration and in-flight
   deduplication.
 - `ttsbot/elevenlabs.py` - ElevenLabs streaming client, error mapping and
@@ -299,22 +307,64 @@ share one HTTP stream. MiniMax streaming and file paths share one cache key,
 `voice_cache_key(voice)`, which includes the voice tuning, so re-tuning a
 MiniMax voice never replays old audio.
 
-Fallbacks and breakers:
+Fallback chain:
 
-- No first audio within `FISH_TTFA_TIMEOUT` (default 5 s; MiniMax uses
-  `TTS_STREAM_TTFA_TIMEOUT`), an HTTP error or an open breaker sends the
-  message to the registry's Piper fallback voice. Every case is logged. The
-  budget runs until the first audio packet or decoded frame, because an Ogg
-  stream's first bytes may be only the header pages.
-- Fish and MiniMax each have a `CircuitBreaker` (`CB_FAILURE_THRESHOLD`
-  failures open it for `CB_COOLDOWN_SECONDS`). The generation code does the
-  accounting: a pre-audio exception is stored in `PreparedAudio.error` and
-  passed to `TTSDispatcher.record_failure(breaker, exc)`.
-- An exhausted balance or plan raises a `QuotaExhaustedError` subclass:
-  `FishQuotaExhaustedError` (HTTP 402) or `MiniMaxQuotaExhaustedError`
-  (status 1008/2056). `record_failure` then calls `CircuitBreaker.trip()` for
-  `TTS_QUOTA_COOLDOWN_SECONDS`, which ordinary failures cannot shorten. Rate
-  limits (HTTP 429, MiniMax 1039) count as ordinary failures.
+- `voices.json` holds `fallback_chain`, a list of voice names tried in order
+  when a message's voice cannot speak it, and each voice may have its own
+  `fallback` list instead. `VoiceRegistry.chain_for(voice)` returns the
+  voice followed by those voices (unknown names and repeats skipped). An
+  unset chain means `[fallback_profile]` (the Piper voice), as before
+  chains existed; an empty list means no fallback. Nothing in the code
+  names a provider: a new provider only needs voices. `/fallback set`
+  shows and edits both lists; it warns when a chain does not end in Piper.
+- `_prepare_into` streams the chain's voices in turn. No first audio within
+  the provider's budget (`FISH_TTFA_TIMEOUT`, default 5 s; MiniMax uses
+  `TTS_STREAM_TTFA_TIMEOUT`), an HTTP error or an open breaker moves to the
+  next voice, with one `Fallback ... voice=A -> B reason=...` line (INFO
+  while the provider is paused, WARNING otherwise). The budget runs until
+  the first audio packet or decoded frame, because an Ogg stream's first
+  bytes may be only the header pages. A provider that failed for a reason
+  other than this one message is skipped for the rest of the chain, so one
+  outage costs one timeout. The first voice that cannot stream (Piper)
+  takes the file path, `TTSDispatcher.synthesize_chain`, with the voices
+  after it. Each voice uses its own cache key.
+
+Provider health (`ttsbot/health.py`):
+
+- Every cloud provider has a `CircuitBreaker`. The generation code stores a
+  pre-audio exception in `PreparedAudio.error` and passes it to
+  `TTSDispatcher.record_failure(breaker, exc)`, which sorts it with
+  `classify_failure` by the marker classes in `ttsbot/errors.py`:
+
+  | kind | examples | effect |
+  |---|---|---|
+  | request | missing voice, message too long for the credits left | not counted; next voice speaks this message |
+  | transient | timeout, network error, 5xx, no audio | `CB_FAILURE_THRESHOLD` in a row pause for `CB_COOLDOWN_SECONDS`, x`CB_BACKOFF_FACTOR` per failed probe up to `CB_MAX_COOLDOWN_SECONDS` |
+  | rate_limit | HTTP 429 | the Retry-After; without one, counted as transient |
+  | quota | HTTP 402, MiniMax 1008/2056, all ElevenLabs keys empty | paused until checked (see below) |
+  | auth | HTTP 401/403, MiniMax 1004 | like quota, starting at `TTS_AUTH_RECHECK_SECONDS` |
+
+- The health worker (`_provider_health_worker`, every
+  `TTS_HEALTH_CHECK_INTERVAL` s) runs `TTSDispatcher.check_health()` for
+  paused providers whose pause is over, so a user message is not spent on
+  finding out:
+  - quota/auth: a provider with `check_quota()` is asked 60 s after the
+    failure and then at its reported reset time, at least daily
+    (`TTS_MAX_RECHECK_SECONDS`). ElevenLabs implements it with the free
+    `GET /v1/user/subscription` per key (credits left, monthly reset) and
+    moves the key ring to a key with credits. Without `check_quota`, a real
+    request probes after `TTS_QUOTA_COOLDOWN_SECONDS`, doubling to a day.
+  - transient: the provider's `ConnectionWarmer.reachable()` pings the
+    host; while it does not answer the pause grows, once it answers the
+    next request probes.
+  A breaker waiting for its check (`await_check`) lets a real request probe
+  anyway 5 minutes after the pause, in case the worker is stuck; a probe
+  that never reports back frees the slot after 2 minutes.
+- `HealthStore` keeps every breaker in `data/provider_health.json`
+  (`TTS_HEALTH_PATH`) with a fingerprint of the provider's keys, so a
+  provider out of quota stays paused across restarts, and a changed key
+  starts clean. `/fallback status` shows each provider's state, its live
+  quota where available, and resets a pause by hand.
 - MiniMax reports errors as a plain JSON body, sometimes pretty-printed, even
   on streaming requests. The stream reader collects non-SSE lines and
   classifies them at the end instead of trusting the `Content-Type` header.
@@ -340,9 +390,10 @@ moves the ring and the same request is retried with the next key before
 any audio. A message only too long for a key's balance, or a voice the
 key's plan does not allow (`paid_plan_required`), is retried with the next
 key without moving the ring. When every key is empty the provider raises
-`ElevenLabsQuotaExhaustedError` (the long breaker trip); request-level
-errors (`ElevenLabsRequestError`: missing voice, message too long for every
-key, plan-restricted voice) fall back to Piper without a breaker failure.
+`ElevenLabsQuotaExhaustedError` (a quota pause, checked through
+`check_quota`); request-level errors (`ElevenLabsRequestError`: missing
+voice, message too long for every key, plan-restricted voice) go to the
+next voice of the chain without a breaker failure.
 The active key is persisted as a sha256 fingerprint in `data/config.json`.
 
 The local fallback path is:
@@ -412,6 +463,118 @@ The bot manages voice state separately from synthesis:
 
 This is a good separation to preserve when adding a new engine, because the TTS backend should not be responsible for voice lifecycle policy.
 
+### 9.1 Voice recording
+
+With `RECORDING_ENABLED=1` the bot joins voice undeafened (a deafened
+member receives nothing) as `recording.client.RecordingVoiceClient`.
+discord.py 2.7 has no receive API, so the client uses two internal hooks,
+which is why requirements.txt pins discord.py:
+
+- `VoiceConnectionState.add_socket_listener` gets every UDP packet on the
+  socket reader thread. `rtp.decrypt_transport` removes the
+  `aead_xchacha20_poly1305_rtpsize` layer, then the DAVE session
+  discord.py keeps for sending decrypts the Opus packet for its sender.
+- A voice-websocket hook reads SPEAKING (op 5), which maps each SSRC to a
+  user id; packets from an SSRC not yet mapped wait (up to 1 s of them).
+
+Other bots' audio and Discord's end-of-speech silence frames are dropped.
+A packet DAVE cannot decrypt yet (the sender's key arrives ~0.5 s after
+their audio when someone joins) is held for up to 3 s and retried once a
+later packet from that user decrypts.
+
+`recorder.ChannelRecorder` hands the packets to a writer thread that
+muxes each user into `RECORDING_DIR/<guild>/<UTC start>-<channel>/<user>/NNNN.ogg`
+without re-encoding. Discord keeps transmitting through breathing, room
+noise and long runs of digital silence (25 of 35 s in the first live
+test), so the writer decodes each packet only to classify it with WebRTC
+VAD (`vad.py`, `RECORDING_VAD_AGGRESSIVENESS`, default 3: mode 2 still
+kept loud breathing) and keeps speech runs with 200 ms before and 300 ms
+after. A gap between kept speech longer than `RECORDING_PAUSE_MS` becomes
+that much silence and starts a new "piece". Each closed file adds a line to
+`chunks.jsonl` with its pieces as `[offset in file, wall-clock start]`,
+which maps transcript timestamps back to real time; `session.json` holds
+the channel and start/end times. Log lines: `Recording started`,
+`Recording chunk closed ... audio_s= pieces= reason=full|idle|stop`,
+`Recording stats` every minute and `Recording finished` with counters:
+`packets` and `heard_ms` received, `written_ms` kept (the rest was
+filtered out),
+`filled_ms` short gaps kept as silence, `unknown_ssrc_packets`,
+`dave_errors` (failed first attempts), `dave_recovered` / `dave_lost`,
+`transport_errors`, `late_packets`, `bot_packets`, `vad_errors`.
+
+A file stays open until `RECORDING_CHUNK_SECONDS` of speech or
+`RECORDING_IDLE_CLOSE_SECONDS` (15 min) of that user's silence: Groq
+bills each file for at least 10 s. Pieces are also appended to
+`NNNN.pieces.jsonl` as they start, so a file left open by a crash or a
+restart is recovered (`recorder.recover_session`) with exact timestamps.
+Text the bot speaks for someone is logged to `tts.jsonl`, and each
+speaker's display name to `names.json` (kept if they leave the server).
+
+### 9.2 Transcription
+
+With `GROQ_API_KEY` set, `recording.worker.TranscriptionWorker` (task
+`stt-worker`) sends closed files to Groq Whisper (`STT_MODEL`,
+`STT_LANGUAGE`, `verbose_json` with segments), oldest first, one at a
+time. The disk is the queue: a file in `chunks.jsonl` without a
+`NNNN.json` next to it is pending, so restarts lose nothing.
+
+`groq.AudioBudget` keeps the plan's limits. The hourly audio limit is a
+bucket refilling at 2 s per second (headers
+`x-ratelimit-remaining-audio-seconds` / `-reset-audio-seconds`); the
+budget follows the last response's level and falls back to its ledger
+(`RECORDING_DIR/groq_ledger.jsonl`) after a restart or when a response
+lacks those headers (seen from httpx, HTTP/1.1). The ledger also
+enforces the day limit. A 429, 5xx or network error pauses sending for
+the time Groq asks (or 30-60 s); another 4xx writes `NNNN.error.json`,
+and the file is tried 3 times in all. A file over 25 MB is re-encoded to
+32 kb/s mono first.
+
+`NNNN.json` holds Groq's kept segments with `at`/`until` in wall-clock
+time (through the chunk's pieces) and the dropped ones: known Whisper
+hallucinations ("Субтитры сделал DimaTorzok", "Продолжение следует"),
+no-speech and repetition loops. After each result the session's
+`transcript.md` (`[HH:MM:SS] Name: text` in `TRANSCRIPT_TIMEZONE`, a
+speaker's lines less than 2 s apart merged, TTS lines as `Name (TTS)`)
+and `transcript.jsonl` are rebuilt. Log lines: `Transcription worker
+started`, `Transcription done ... audio_s= took= groq_remaining_s=
+day_used_s= pending=`, `Transcription waiting for Groq budget`,
+`Transcription failed, retry in` and `Transcription rejected`.
+
+Retention: the worker applies two independent limits as it starts and
+then every `RECORDING_PRUNE_INTERVAL_HOURS` (default 24; 0 = only at
+start), transcripts first, then audio. A sweep runs off the event loop; a
+failing one is logged and retried at the next interval. 0 turns a limit
+off.
+
+- `RECORDING_AUDIO_KEEP_DAYS` (default 90) deletes the Ogg file of every
+  chunk older than that; age is the chunk's `ended_at` in `chunks.jsonl`.
+  A file goes only when its `NNNN.json` exists, so audio that was never
+  transcribed (Groq rejected it, STT was off) is kept, and sessions still
+  being recorded are skipped. `NNNN.json`, `chunks.jsonl` and
+  `transcript.*` stay. Log line: `Recording audio pruned files=
+  freed_mb= keep_days=`.
+- `RECORDING_TRANSCRIPT_KEEP_DAYS` (default 0, keep forever) deletes the
+  whole folder of a finished session older than that (`session.json`
+  `ended_at`): transcripts, results, manifest and any audio still in it,
+  so it also overrides the audio limit. It skips sessions being recorded,
+  not yet ended, or with a chunk still waiting for transcription (one
+  given up on after 3 tries does not count), and removes a guild folder
+  it empties. Log line: `Recording sessions pruned sessions= freed_mb=
+  keep_days=`.
+
+Both run inside the worker, so nothing is pruned while `GROQ_API_KEY` is
+unset or `STT_ENABLED=0`.
+
+### 9.3 Recordings website
+
+`python -m ttsbot.web` (the `tts_web` service) serves the sessions, their
+transcripts with clickable times and one joined audio track per session
+as a JSON API, from a separate container that mounts the recordings
+read-only. `ttsbot/archive` holds the read side (store, mix, cache,
+retention, service), `ttsbot/web` the HTTP layer. The bot's only part in
+it: `session.json` also keeps `guild_name` / `channel_name`, written
+atomically. See [RECORDINGS_WEB.md](RECORDINGS_WEB.md).
+
 ## 10. Persistence and Guild State
 
 Persistent bot settings live in `data/config.json` and are managed by `BotConfigStore`.
@@ -454,6 +617,13 @@ Current commands:
   so only the guild that owns an emoji can set, remove or see its alias;
 - `status` - show current runtime state;
 - `stats` - cache, queue, per-session usage and breaker states;
+
+`/voicebot` is at Discord's limit of 25 subcommands, so a second group
+holds the fallback chain and provider health:
+
+- `/fallback status` - each provider's health and live quota; `reset:`
+  ends a pause by hand;
+- `/fallback set` - show or set the fallback chain (global, or `voice:`).
 - `limit` - show or change the per-message text length cap (persisted in `data/config.json`);
 - `queue-clear` - clear queued work;
 - `test` - enqueue a test phrase, optionally to a specific voice channel.
@@ -476,7 +646,11 @@ Main groups:
 - idle disconnect timings;
 - merge policy;
 - selective hold settings;
-- Piper model path and tuning.
+- Piper model path and tuning;
+- voice recording and transcription (`RECORDING_*`, `STT_*`,
+  `TRANSCRIPT_TIMEZONE`), including `RECORDING_AUDIO_KEEP_DAYS` and
+  `RECORDING_TRANSCRIPT_KEEP_DAYS` for how long audio and transcripts are kept and
+  `RECORDING_PRUNE_INTERVAL_HOURS` for how often that is applied.
 
 The important current engine-specific values are:
 

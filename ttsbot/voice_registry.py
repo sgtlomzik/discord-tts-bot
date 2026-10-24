@@ -1,5 +1,13 @@
 """Unified voice registry: Piper, MiniMax, Fish, Gemini and ElevenLabs voices as profiles.
 
+It also holds the fallback chain: which voices speak a message, in order,
+when the selected voice cannot (provider paused, quota used up, error
+before any audio). ``fallback_chain`` is the default for every voice;
+a voice's own ``fallback`` overrides it. Both are lists of voice names, so
+a new provider needs no code here, only voices. Unset (``None``) means
+"just the Piper ``fallback_profile``", the behavior before chains existed;
+an empty list means no fallback at all.
+
 This module owns the **catalog** of available voices — what voices exist
 and how to drive each engine. It is deliberately separate from the
 **selection** state (per-guild default + per-user override), which lives
@@ -107,6 +115,9 @@ class VoiceRecord:
     fish: Optional[FishParams] = None
     gemini: Optional[GeminiParams] = None
     elevenlabs: Optional[ElevenLabsParams] = None
+    # Voices to try, in order, when this one cannot speak a message.
+    # None: the registry's fallback_chain; (): no fallback.
+    fallback: Optional[tuple[str, ...]] = None
 
     @property
     def is_minimax(self) -> bool:
@@ -136,6 +147,9 @@ class VoiceRegistry:
     fallback_profile: str
     voices: dict[str, VoiceRecord] = field(default_factory=dict)
     version: int = REGISTRY_VERSION
+    # Default fallback chain (voice names) for voices without their own.
+    # None: [fallback_profile].
+    fallback_chain: Optional[list[str]] = None
 
     def get(self, name: Optional[str]) -> Optional[VoiceRecord]:
         if not name:
@@ -153,6 +167,30 @@ class VoiceRegistry:
 
     def fallback_record(self) -> Optional[VoiceRecord]:
         return self.voices.get(self.fallback_profile)
+
+    def fallback_names(self, voice: Optional[VoiceRecord] = None) -> list[str]:
+        """The configured fallback voice names for ``voice`` (unfiltered)."""
+        if voice is not None and voice.fallback is not None:
+            return list(voice.fallback)
+        if self.fallback_chain is not None:
+            return list(self.fallback_chain)
+        return [self.fallback_profile] if self.fallback_profile else []
+
+    def chain_for(self, voice: Optional[VoiceRecord]) -> list[VoiceRecord]:
+        """``voice`` followed by its fallback voices, in order.
+
+        Unknown names and repeats are skipped, so a chain ending in the
+        fallback Piper voice stays valid when that voice is the one chosen.
+        """
+        chain: list[VoiceRecord] = [voice] if voice is not None else []
+        seen = {voice.name} if voice is not None else set()
+        for name in self.fallback_names(voice):
+            record = self.voices.get(name)
+            if record is None or name in seen:
+                continue
+            seen.add(name)
+            chain.append(record)
+        return chain
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +246,16 @@ def _record_to_dict(r: VoiceRecord) -> dict:
             "stability": r.elevenlabs.stability,
             "similarity_boost": r.elevenlabs.similarity_boost,
         }
+    if r.fallback is not None:
+        out["fallback"] = list(r.fallback)
     return out
+
+
+def _names(value) -> Optional[tuple[str, ...]]:
+    """A list of voice names from JSON; None when absent or not a list."""
+    if not isinstance(value, list):
+        return None
+    return tuple(str(v).strip() for v in value if str(v).strip())
 
 
 def _piper_from_dict(d: dict) -> PiperParams:
@@ -359,15 +406,19 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
         fish=fish,
         gemini=gemini,
         elevenlabs=elevenlabs,
+        fallback=_names(d.get("fallback")),
     )
 
 
 def registry_to_dict(reg: VoiceRegistry) -> dict:
-    return {
+    out: dict = {
         "version": reg.version,
         "fallback_profile": reg.fallback_profile,
-        "voices": {name: _record_to_dict(rec) for name, rec in sorted(reg.voices.items())},
     }
+    if reg.fallback_chain is not None:
+        out["fallback_chain"] = list(reg.fallback_chain)
+    out["voices"] = {name: _record_to_dict(rec) for name, rec in sorted(reg.voices.items())}
+    return out
 
 
 def registry_from_dict(data: dict) -> Optional[VoiceRegistry]:
@@ -382,10 +433,12 @@ def registry_from_dict(data: dict) -> Optional[VoiceRegistry]:
         if rec is not None:
             voices[str(name)] = rec
     fallback = str(data.get("fallback_profile", "") or "")
+    chain = _names(data.get("fallback_chain"))
     return VoiceRegistry(
         fallback_profile=fallback,
         voices=voices,
         version=int(data.get("version", REGISTRY_VERSION) or REGISTRY_VERSION),
+        fallback_chain=list(chain) if chain is not None else None,
     )
 
 

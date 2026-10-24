@@ -101,6 +101,9 @@ class PlaybackMixin:
                     first_ts - job.message_ts, first_ts - job.queued_at,
                     job.job_id, first_ts - pickup_ts,
                 )
+                note = getattr(vc, "note_spoken_text", None)
+                if note is not None:
+                    note(job.author_id, job.text)
         if total == 0 or source is None:
             return
         await source.wait_until_drained()
