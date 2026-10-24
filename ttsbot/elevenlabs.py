@@ -41,7 +41,7 @@ from ttsbot import config as bot_config
 from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
 from ttsbot.gemini import write_wav
 from ttsbot.health import QuotaReport, fingerprint
-from ttsbot.httpclient import attach_warmer, provider_limits
+from ttsbot.httpclient import attach_warmer, env_setting, provider_limits, retry_after_seconds
 from ttsbot.streams import StreamSpec
 from ttsbot import voice_registry
 
@@ -60,11 +60,6 @@ EMPTY_KEY_CREDITS = 50
 _REMAINING_RE = re.compile(r"([\d,]+)\s+credits?\s+remaining", re.IGNORECASE)
 # 401/403 reasons that are about the key or its account, not the request.
 _KEY_REASONS = ("invalid_api_key", "missing_permissions", "detected_unusual_activity")
-
-
-def _env(name: str, default: str) -> str:
-    """Env value with an empty string treated as unset (as in .env.example)."""
-    return os.getenv(name, "").strip() or default
 
 
 def key_fingerprint(key: str) -> str:
@@ -102,16 +97,16 @@ class ElevenLabsConfig:
 
     @classmethod
     def from_env(cls) -> "ElevenLabsConfig":
-        ring = tuple(k for k in _env("ELEVENLABS_API_KEYS", "").replace(",", " ").split() if k)
-        single = _env("ELEVENLABS_API_KEY", "")
+        ring = tuple(k for k in env_setting("ELEVENLABS_API_KEYS", "").replace(",", " ").split() if k)
+        single = env_setting("ELEVENLABS_API_KEY", "")
         cfg = cls(
             api_key=single or (ring[0] if ring else ""),
             api_keys=ring,
-            model=_env("ELEVENLABS_MODEL", DEFAULT_MODEL),
-            format=_env("ELEVENLABS_FORMAT", DEFAULT_FORMAT).lower(),
-            voice_id=_env("ELEVENLABS_VOICE_ID", ""),
-            language_code=_env("ELEVENLABS_LANGUAGE_CODE", "").lower(),
-            base_url=_env("ELEVENLABS_BASE_URL", DEFAULT_BASE_URL),
+            model=env_setting("ELEVENLABS_MODEL", DEFAULT_MODEL),
+            format=env_setting("ELEVENLABS_FORMAT", DEFAULT_FORMAT).lower(),
+            voice_id=env_setting("ELEVENLABS_VOICE_ID", ""),
+            language_code=env_setting("ELEVENLABS_LANGUAGE_CODE", "").lower(),
+            base_url=env_setting("ELEVENLABS_BASE_URL", DEFAULT_BASE_URL),
         )
         format_kind(cfg.format)
         return cfg
@@ -230,14 +225,6 @@ class ElevenLabsKeyRateLimitError(ElevenLabsRateLimitError):
     may take the message; ``system_busy`` is the whole service instead."""
 
 
-def _retry_after(value: str | None) -> float | None:
-    try:
-        seconds = float(value) if value else None
-    except ValueError:
-        return None
-    return seconds if seconds is not None and seconds > 0 else None
-
-
 def _http_error(response: httpx.Response, body: bytes) -> ElevenLabsError:
     """Map an error response; ElevenLabs puts the reason in ``detail.status``."""
     status = response.status_code
@@ -263,7 +250,7 @@ def _http_error(response: httpx.Response, body: bytes) -> ElevenLabsError:
         return ElevenLabsVoiceNotFoundError(text, status)
     if status == 429:
         error = ElevenLabsRateLimitError if reason == "system_busy" else ElevenLabsKeyRateLimitError
-        return error(text, status, _retry_after(response.headers.get("retry-after")))
+        return error(text, status, retry_after_seconds(response.headers.get("retry-after")))
     if reason.startswith(_KEY_REASONS) or (status == 401 and not reason):
         return ElevenLabsAuthError(text, status)
     return ElevenLabsError(text, status)

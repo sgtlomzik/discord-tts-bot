@@ -11,11 +11,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 
 import httpx
 
 log = logging.getLogger("tts_bot")
+
+
+def env_setting(name: str, default: str) -> str:
+    """Env value with an empty string treated as unset (as in .env.example)."""
+    return os.getenv(name, "").strip() or default
+
+
+def retry_after_seconds(value: str | None) -> float | None:
+    """A Retry-After header in seconds; None for none, 0 or the HTTP-date form
+    (treated as an ordinary failure)."""
+    try:
+        seconds = float(value) if value else None
+    except ValueError:
+        return None
+    return seconds if seconds is not None and seconds > 0 else None
 
 # How long an idle keep-alive connection stays open. httpx closes it after
 # 5 s by default, so almost every message after a pause paid for a new TLS

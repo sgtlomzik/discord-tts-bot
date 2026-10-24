@@ -16,16 +16,11 @@ import httpx
 
 from ttsbot import config as bot_config
 from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
-from ttsbot.httpclient import attach_warmer, provider_limits
+from ttsbot.httpclient import attach_warmer, env_setting, provider_limits, retry_after_seconds
 from ttsbot.streams import StreamSpec
 from ttsbot import voice_registry
 
 log = logging.getLogger("tts_bot")
-
-
-def _env(name: str, default: str) -> str:
-    """Env value with an empty string treated as unset (as in .env.example)."""
-    return os.getenv(name, "").strip() or default
 
 
 @dataclass(frozen=True)
@@ -44,14 +39,14 @@ class FishConfig:
     @classmethod
     def from_env(cls) -> "FishConfig":
         cfg = cls(
-            api_key=_env("FISH_API_KEY", ""),
-            reference_id=_env("FISH_REFERENCE_ID", ""),
-            model=_env("FISH_MODEL", "s2.1-pro-free"),
-            format=_env("FISH_FORMAT", "opus").lower(),
-            latency=_env("FISH_LATENCY", "low").lower(),
-            chunk_length=int(_env("FISH_CHUNK_LENGTH", "150")),
-            opus_bitrate=int(_env("FISH_OPUS_BITRATE", "48000")),
-            base_url=_env("FISH_BASE_URL", "https://api.fish.audio"),
+            api_key=env_setting("FISH_API_KEY", ""),
+            reference_id=env_setting("FISH_REFERENCE_ID", ""),
+            model=env_setting("FISH_MODEL", "s2.1-pro-free"),
+            format=env_setting("FISH_FORMAT", "opus").lower(),
+            latency=env_setting("FISH_LATENCY", "low").lower(),
+            chunk_length=int(env_setting("FISH_CHUNK_LENGTH", "150")),
+            opus_bitrate=int(env_setting("FISH_OPUS_BITRATE", "48000")),
+            base_url=env_setting("FISH_BASE_URL", "https://api.fish.audio"),
         )
         if cfg.format != "opus" or cfg.latency not in {"low", "balanced", "normal"}:
             raise ValueError("Fish requires opus format and a supported latency mode")
@@ -108,14 +103,6 @@ class FishRequestError(FishError, RequestError):
     """HTTP 400/404/422: this voice or text was rejected; Fish itself works."""
 
 
-def _retry_after(value: str | None) -> float | None:
-    try:
-        seconds = float(value) if value else None
-    except ValueError:
-        return None
-    return seconds if seconds is not None and seconds > 0 else None
-
-
 def _http_error(what: str, status_code: int, detail: str, retry_after: str | None = None) -> FishError:
     message = f"{what} HTTP {status_code}: {detail}"
     if status_code == 402:
@@ -123,7 +110,7 @@ def _http_error(what: str, status_code: int, detail: str, retry_after: str | Non
     if status_code in (401, 403):
         return FishAuthError(message, status_code)
     if status_code == 429:
-        return FishRateLimitError(message, status_code, _retry_after(retry_after))
+        return FishRateLimitError(message, status_code, retry_after_seconds(retry_after))
     if status_code in (400, 404, 422):
         return FishRequestError(message, status_code)
     return FishError(message, status_code)

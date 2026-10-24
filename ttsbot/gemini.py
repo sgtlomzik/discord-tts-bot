@@ -13,7 +13,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,7 +22,7 @@ import httpx
 
 from ttsbot import config as bot_config
 from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
-from ttsbot.httpclient import attach_warmer, provider_limits
+from ttsbot.httpclient import attach_warmer, env_setting, provider_limits, retry_after_seconds
 from ttsbot.streams import StreamSpec
 
 log = logging.getLogger("tts_bot")
@@ -55,11 +54,6 @@ GEMINI_VOICE_STYLES = {
 GEMINI_VOICES = tuple(sorted(GEMINI_VOICE_STYLES))
 
 
-def _env(name: str, default: str) -> str:
-    """Env value with an empty string treated as unset (as in .env.example)."""
-    return os.getenv(name, "").strip() or default
-
-
 @dataclass(frozen=True)
 class GeminiConfig:
     api_key: str = field(repr=False)  # never in logs or tracebacks
@@ -72,12 +66,12 @@ class GeminiConfig:
     @classmethod
     def from_env(cls) -> "GeminiConfig":
         return cls(
-            api_key=_env("OPENROUTER_API_KEY", ""),
-            model=_env("GEMINI_TTS_MODEL", DEFAULT_MODEL),
-            voice=_env("GEMINI_TTS_VOICE", DEFAULT_VOICE),
-            base_url=_env("OPENROUTER_BASE_URL", DEFAULT_BASE_URL),
-            app_title=_env("OPENROUTER_APP_TITLE", ""),
-            referer=_env("OPENROUTER_REFERER", ""),
+            api_key=env_setting("OPENROUTER_API_KEY", ""),
+            model=env_setting("GEMINI_TTS_MODEL", DEFAULT_MODEL),
+            voice=env_setting("GEMINI_TTS_VOICE", DEFAULT_VOICE),
+            base_url=env_setting("OPENROUTER_BASE_URL", DEFAULT_BASE_URL),
+            app_title=env_setting("OPENROUTER_APP_TITLE", ""),
+            referer=env_setting("OPENROUTER_REFERER", ""),
         )
 
     def cache_key(self, params: object | None = None) -> str:
@@ -123,14 +117,6 @@ class GeminiRateLimitError(GeminiError, RateLimitError):
         self.retry_after = retry_after
 
 
-def _retry_after(value: str | None) -> float | None:
-    try:
-        seconds = float(value) if value else None
-    except ValueError:
-        return None  # HTTP-date form: treat as an ordinary failure
-    return seconds if seconds is not None and seconds > 0 else None
-
-
 def _http_error(response: httpx.Response, detail: str) -> GeminiError:
     status = response.status_code
     message = f"OpenRouter HTTP {status}: {detail}"
@@ -139,7 +125,7 @@ def _http_error(response: httpx.Response, detail: str) -> GeminiError:
     if status == 402:
         return GeminiQuotaExhaustedError(message, status)
     if status == 429:
-        return GeminiRateLimitError(message, status, _retry_after(response.headers.get("retry-after")))
+        return GeminiRateLimitError(message, status, retry_after_seconds(response.headers.get("retry-after")))
     if status in (400, 404, 413, 422):
         return GeminiRequestError(message, status)
     return GeminiError(message, status)
