@@ -313,15 +313,10 @@ def build_commands(bot):
             return
         guild = interaction.guild
         assert guild is not None
-        if bot.config_store.is_env_user(user.id):
-            await interaction.response.send_message(
-                f"{user.mention} озвучивается на всех серверах через WHITELIST_USERS в .env; "
-                "убрать его можно только там.",
-                ephemeral=True,
-            )
-            return
         bot.config_store.remove_user(guild.id, user.id)
-        await interaction.response.send_message(f"Исключен из озвучки: {user.mention}", ephemeral=True)
+        note = (" на этом сервере (на остальных его озвучивает WHITELIST_USERS из .env)"
+                if bot.config_store.is_env_user(user.id) else "")
+        await interaction.response.send_message(f"Исключен из озвучки: {user.mention}{note}", ephemeral=True)
 
 
     @tts_group.command(name="voice-set", description="Сменить озвучку по умолчанию")

@@ -80,6 +80,7 @@ class TTSBot(
             config_path=config.BOT_CONFIG_PATH,
             voices_path=config.VOICES_REGISTRY_PATH,
             health_path=config.PROVIDER_HEALTH_PATH,
+            env_users=config.WHITELIST_USERS,
         )
         # Unified voice catalog, seeded on first start from the Piper
         # profiles (and MINIMAX_VOICE_ID); then each plugin points its

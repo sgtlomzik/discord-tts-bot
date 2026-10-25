@@ -200,13 +200,22 @@ def _replace_voice_catalog(db: sqlite3.Connection, data: dict) -> None:
             db.execute("INSERT INTO voice_catalog (key, value) VALUES (?, ?)", (key, _dump(value)))
 
 
-def _config_from_file(path: Path, data: dict) -> dict:
+def _config_from_file(path: Path, data: dict, env_users: set[int] | frozenset[int]) -> dict:
     version = data.get("version", CONFIG_SCHEMA_VERSION)
     if not isinstance(version, int) or version > CONFIG_SCHEMA_VERSION:
         raise StateFileError(
             f"{path} has schema version {version!r}; this build reads up to {CONFIG_SCHEMA_VERSION}"
         )
-    return data
+    # Earlier versions copied WHITELIST_USERS into every guild they saved;
+    # those copies would outlive the user's removal from the env. The env
+    # list is checked live now, so the copies go.
+    guilds = {}
+    for guild_id, guild in _object(data.get("guilds")).items():
+        allowed = guild.get("allowed_users") if isinstance(guild, dict) else None
+        if isinstance(allowed, list):
+            guild = {**guild, "allowed_users": [u for u in allowed if not (str(u).isdigit() and int(u) in env_users)]}
+        guilds[guild_id] = guild
+    return {**data, "guilds": guilds}
 
 
 def _catalog_from_file(path: Path, data: dict) -> dict:
@@ -221,6 +230,7 @@ def import_json_state(
     config_path: Path | None = None,
     voices_path: Path | None = None,
     health_path: Path | None = None,
+    env_users: set[int] | frozenset[int] = frozenset(),
 ) -> list[str]:
     """Import the JSON state files of earlier versions, each only once.
 
@@ -229,7 +239,9 @@ def import_json_state(
     or voices file raises StateFileError and nothing of it is imported. A
     damaged health file is skipped with a warning: it only caches provider
     pauses, so starting with every provider unpaused is safe. Returns the
-    names of the files imported now.
+    names of the files imported now. ``env_users`` (WHITELIST_USERS) are
+    dropped from the guilds' allowed users of config.json, where earlier
+    versions copied them.
     """
     imported = {source for (source,) in db._rows("SELECT source FROM imports")}
     done = []
@@ -248,7 +260,7 @@ def import_json_state(
             continue
         with db._transaction() as conn:
             if source == "config":
-                _replace_config(conn, _config_from_file(path, data))
+                _replace_config(conn, _config_from_file(path, data, env_users))
             elif source == "voices":
                 _replace_voice_catalog(conn, _catalog_from_file(path, data))
             else:

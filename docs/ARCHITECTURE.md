@@ -115,10 +115,11 @@ configured `tts-connection-keepalive`, `tts-provider-health` and
 ### 3.2 Message Intake
 
 `on_message()` lets a message in when the guild has TTS on, the author is
-allowed (the guild's list or `WHITELIST_USERS`) and is in a voice
-channel. `queue_message()` takes its speakable text (`speakable_text`)
-and `enqueue_tts()` normalizes it once, applies the length cap and queues
-a `TTSJob`. Every message is queued as it arrives; nothing is held back
+allowed (the guild's list or `WHITELIST_USERS`, unless the guild denied
+them) and is in a voice channel. `queue_message()` hands the raw text and
+its resolved mentions to `enqueue_tts()`, which cleans it once, applies
+the length cap (`/voicebot limit`, else `TTS_MAX_CHARS`) and queues a
+`TTSJob`. Every message is queued as it arrives; nothing is held back
 or merged.
 
 ### 3.3 Voice Updates
@@ -500,7 +501,8 @@ Current commands:
 - `on` - enable TTS for the guild;
 - `off` - disable TTS and clear active work;
 - `allow` - add a member to the allowed list;
-- `deny` - remove a member from the allowed list;
+- `deny` - remove a member from the allowed list and deny them in this
+  guild, even one `WHITELIST_USERS` allows (`allow` lifts it);
 - `voices` - list available voice profiles;
 - `voice-set` - change the guild default voice;
 - `voice-user` - assign a voice profile to one member;
