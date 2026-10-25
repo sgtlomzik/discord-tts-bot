@@ -473,11 +473,16 @@ All persistent state lives in one SQLite file, `data/state.db`
 
 The stores work on memory and save in one transaction after each change,
 so a crash or a full disk leaves the previous state; a failed save rolls
-memory back. Nested values are JSON text columns. A database that cannot
-be opened stops startup (`StateFileError`) and is left as it is. The
-`config.json`, `voices.json` and `provider_health.json` of earlier versions
-are imported once on startup and left in place (an older image still finds
-them). `sqlite3 data/state.db .dump` shows everything.
+memory back. A save SQLite refuses (full disk, a lock held past the 5 s
+busy timeout) is rolled back, COMMIT included, and raised as
+`StateWriteError`, an `OSError`, so the save handlers that caught failed
+JSON writes catch it too. Nested values are JSON text columns. A missing
+data directory is created. A database that cannot be opened stops startup
+(`StateFileError`) and is left as it is. The `config.json`, `voices.json`
+and `provider_health.json` of earlier versions are imported once on
+startup and left in place (an older image still finds them); a damaged
+`provider_health.json` is skipped with a warning, since it only caches
+provider pauses. `sqlite3 data/state.db .dump` shows everything.
 
 ## 9. Commands
 

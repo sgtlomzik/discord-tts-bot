@@ -7,6 +7,8 @@ memory first and kept the change when the save to disk failed.
 
 from __future__ import annotations
 
+import os
+import sqlite3
 import tempfile
 import types
 import unittest
@@ -16,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from discord import app_commands
 
 from test_bot import load_bot_module
-from ttsbot import voice_registry
+from ttsbot import config, voice_registry
 from ttsbot.store import BotConfigStore
 from support import state_from
 
@@ -99,6 +101,29 @@ class RegistryRollbackTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 tts_bot.persist_voice_registry()
         self.assertEqual(set(tts_bot.voice_registry.names()), before)
+
+    def test_a_locked_database_is_caught_by_the_save_handlers(self):
+        # The handlers around persist_voice_registry() catch OSError; a
+        # real SQLite failure must arrive as one, and leave no new voice.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.db"
+            with patch.dict(os.environ, {"STATE_DB_PATH": str(db_path)}):
+                tts_bot = load_bot_module().bot
+            self.addCleanup(config.reload)
+            self.addCleanup(tts_bot.state_db.close)
+            tts_bot.state_db._conn.execute("PRAGMA busy_timeout = 50")
+            locker = sqlite3.connect(db_path, isolation_level=None, timeout=0.05)
+            self.addCleanup(locker.close)
+            locker.execute("BEGIN IMMEDIATE")
+            before = set(tts_bot.voice_registry.names())
+            tts_bot.voice_registry.add(voice_registry.VoiceRecord(
+                name="new-voice", label="New", description="", provider=voice_registry.PROVIDER_FISH,
+                fish=voice_registry.FishParams(reference_id="abc"),
+            ))
+            with self.assertRaises(OSError):
+                tts_bot.persist_voice_registry()
+            self.assertEqual(set(tts_bot.voice_registry.names()), before)
+            locker.execute("ROLLBACK")
 
 
 if __name__ == "__main__":

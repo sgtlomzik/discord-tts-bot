@@ -746,7 +746,6 @@ def build_commands(bot):
         try:
             bot.persist_voice_registry()
         except OSError as exc:
-            bot.voice_registry.add(rec)
             await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
             return
         await interaction.response.send_message(
@@ -917,7 +916,6 @@ def build_commands(bot):
         try:
             bot.persist_voice_registry()
         except OSError as exc:
-            bot.voice_registry.add(rec)
             log.exception("Failed to save the voice catalog after voice-tune")
             await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
             return
@@ -1114,7 +1112,6 @@ def build_commands(bot):
                 ephemeral=True,
             )
             return
-        previous_chain, previous_record = reg.fallback_chain, record
         if record is not None:
             if names is not None:
                 names = [n for n in names if n != record.name]
@@ -1125,9 +1122,6 @@ def build_commands(bot):
         try:
             bot.persist_voice_registry()
         except OSError as exc:
-            reg.fallback_chain = previous_chain
-            if previous_record is not None:
-                reg.add(previous_record)
             log.exception("Failed to save the voice catalog after changing the fallback chain")
             await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
             return

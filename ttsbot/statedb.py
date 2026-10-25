@@ -12,7 +12,10 @@ The JSON files of earlier versions (``config.json``, ``voices.json``,
 ``provider_health.json``) are imported once by ``import_json_state()`` and
 left where they are, so an older image still finds them. A database that
 cannot be opened raises ``StateFileError``, like a damaged JSON file did:
-startup stops and the file is left as it is.
+startup stops and the file is left as it is. A save SQLite refuses (a full
+disk, a lock held too long) raises ``StateWriteError``, an ``OSError`` like
+the failed JSON writes it replaces, and leaves the database usable for the
+next save.
 
 Inspect it with ``sqlite3 data/state.db .dump``.
 """
@@ -44,6 +47,10 @@ CREATE TABLE imports (source TEXT PRIMARY KEY, path TEXT NOT NULL, imported_at R
 """
 
 
+class StateWriteError(OSError):
+    """A save SQLite refused; nothing of it was written."""
+
+
 class StateDB:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -70,13 +77,20 @@ class StateDB:
 
     @contextmanager
     def _transaction(self):
-        self._conn.execute("BEGIN IMMEDIATE")
+        """One write transaction. A failure anywhere, COMMIT included, rolls
+        it back, so the connection is never left inside a transaction that
+        would make every later BEGIN fail."""
         try:
-            yield self._conn
-        except BaseException:
-            self._conn.execute("ROLLBACK")
-            raise
-        self._conn.execute("COMMIT")
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+        except sqlite3.Error as exc:
+            raise StateWriteError(f"Cannot save to {self.path}: {exc}") from exc
 
     def _rows(self, sql: str) -> list[tuple]:
         try:
@@ -211,16 +225,25 @@ def import_json_state(
     """Import the JSON state files of earlier versions, each only once.
 
     A file already imported is never read again, so it cannot bring back
-    what was changed since. The files are left in place. A damaged file
-    raises StateFileError and nothing of it is imported. Returns the names
-    of the files imported now.
+    what was changed since. The files are left in place. A damaged config
+    or voices file raises StateFileError and nothing of it is imported. A
+    damaged health file is skipped with a warning: it only caches provider
+    pauses, so starting with every provider unpaused is safe. Returns the
+    names of the files imported now.
     """
     imported = {source for (source,) in db._rows("SELECT source FROM imports")}
     done = []
     for source, path in (("config", config_path), ("voices", voices_path), ("health", health_path)):
         if path is None or source in imported:
             continue
-        data = read_json_object(path)
+        damaged = False
+        try:
+            data = read_json_object(path)
+        except StateFileError as exc:
+            if source != "health":
+                raise
+            log.warning("Ignoring the provider pauses in %s: %s", path, exc)
+            data, damaged = {}, True
         if data is None:
             continue
         with db._transaction() as conn:
@@ -239,6 +262,8 @@ def import_json_state(
                 "INSERT INTO imports (source, path, imported_at) VALUES (?, ?, ?)",
                 (source, str(path), time.time()),
             )
+        if damaged:
+            continue
         log.info("Imported %s into %s; the JSON file is kept and no longer read", path, db.path)
         done.append(path.name)
     return done

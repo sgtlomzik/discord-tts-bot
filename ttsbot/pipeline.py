@@ -237,7 +237,8 @@ class SynthesisPipelineMixin:
         """Save the current catalog (one transaction).
 
         On failure the in-memory catalog goes back to what is on disk, so
-        a command never leaves a voice in effect that was not saved.
+        a command never leaves a voice in effect that was not saved; callers
+        only report the error (a StateWriteError, which is an OSError).
         """
         try:
             voice_registry.save_registry(self.state_db, self.voice_registry)
@@ -306,7 +307,6 @@ class SynthesisPipelineMixin:
         try:
             self.persist_voice_registry()
         except OSError as exc:
-            self.voice_registry.voices.pop(name, None)
             log.exception("Failed to save the voice catalog after adding Fish voice %s", name)
             return f"не удалось сохранить: {exc}"
         return ""
@@ -339,7 +339,6 @@ class SynthesisPipelineMixin:
         try:
             self.persist_voice_registry()
         except OSError as exc:
-            self.voice_registry.voices.pop(name, None)
             log.exception("Failed to save the voice catalog after adding Gemini voice %s", name)
             return f"не удалось сохранить: {exc}"
         return ""
@@ -372,7 +371,6 @@ class SynthesisPipelineMixin:
         try:
             self.persist_voice_registry()
         except OSError as exc:
-            self.voice_registry.voices.pop(name, None)
             log.exception("Failed to save the voice catalog after adding ElevenLabs voice %s", name)
             return f"не удалось сохранить: {exc}"
         return ""

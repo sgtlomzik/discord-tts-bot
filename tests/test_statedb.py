@@ -80,6 +80,58 @@ class GuildSettingsTests(_Dir):
         self.assertTrue(BotConfigStore(self.reopen(), set()).is_allowed(1, 5))
 
 
+class SaveFailureTests(_Dir):
+    """SQLite errors reach the callers as OSError, like the JSON writes did,
+    and a failed save never blocks the next one."""
+
+    def setUp(self):
+        super().setUp()
+        self.db = StateDB(self.db_path)
+        self.db._conn.execute("PRAGMA busy_timeout = 50")  # fail fast on a lock
+        self.other = sqlite3.connect(self.db_path, isolation_level=None, timeout=0.05)
+
+    def tearDown(self):
+        self.other.close()
+        self.db.close()
+        super().tearDown()
+
+    def test_a_failed_commit_does_not_block_later_saves(self):
+        store = BotConfigStore(self.db, set())
+        # A reader (an sqlite3 shell, a script) holds a shared lock, so the
+        # COMMIT cannot get the exclusive lock it needs.
+        self.other.execute("BEGIN")
+        self.other.execute("SELECT * FROM guilds").fetchall()
+        with self.assertRaises(OSError):
+            store.add_user(1, 5)
+        self.assertFalse(store.is_allowed(1, 5))
+        self.other.execute("ROLLBACK")
+
+        store.add_user(1, 6)
+        loaded = BotConfigStore(self.reopen(), set())
+        self.assertTrue(loaded.is_allowed(1, 6))
+        self.assertFalse(loaded.is_allowed(1, 5))
+
+    def test_a_locked_database_is_an_os_error(self):
+        self.other.execute("BEGIN IMMEDIATE")
+        with self.assertRaises(OSError):
+            self.db.save_health("fish", {"state": "closed"})
+        with self.assertRaises(OSError):
+            voice_registry.save_registry(
+                self.db, voice_registry.seed_registry(VOICE_PROFILES, fallback_profile="piper-ruslan"),
+            )
+        self.other.execute("ROLLBACK")
+        self.db.save_health("fish", {"state": "closed"})
+        self.assertEqual(self.reopen().load_health(), {"fish": {"state": "closed"}})
+
+    def test_a_seed_that_cannot_be_saved_is_kept_in_memory(self):
+        self.other.execute("BEGIN IMMEDIATE")
+        with self.assertLogs("tts_bot.registry", "ERROR"):
+            reg = voice_registry.load_or_seed(self.db, VOICE_PROFILES, fallback_profile="piper-ruslan")
+        self.assertIn("piper-ruslan", reg)
+        self.other.execute("ROLLBACK")
+        self.assertIsNone(voice_registry.load_registry(self.db))
+
+
 class VoiceCatalogTests(_Dir):
     def test_the_catalog_is_seeded_once_and_then_loaded(self):
         reg = voice_registry.load_or_seed(StateDB(self.db_path), VOICE_PROFILES, fallback_profile="piper-ruslan")
@@ -181,6 +233,17 @@ class JsonImportTests(_Dir):
             self._import(db)
         self.assertIsNone(voice_registry.load_registry(db))
 
+    def test_a_damaged_health_file_is_skipped_not_fatal(self):
+        # provider_health.json only caches breaker pauses: losing it is
+        # safe, refusing to start over it is not.
+        self.health_path.write_text('{"breakers": {', encoding="utf-8")
+        db = StateDB(self.db_path)
+        with self.assertLogs("tts_bot.state", "WARNING"):
+            imported = self._import(db)
+        self.assertEqual(sorted(imported), ["config.json", "voices.json"])
+        self.assertEqual(db.load_health(), {})
+        self.assertEqual(self._import(self.reopen()), [])
+
     def test_a_newer_config_schema_is_refused(self):
         self.config_path.write_text(json.dumps({"version": 99, "guilds": {}}), encoding="utf-8")
         with self.assertRaises(StateFileError):
@@ -216,6 +279,13 @@ class BotStateTests(_Dir):
         self.assertTrue(self._bot().config_store.is_allowed(1, 5))
         self.assertFalse((self.root / "config.json").exists())
         self.assertFalse((self.root / "voices.json").exists())
+
+    def test_a_missing_data_directory_is_created(self):
+        # A fresh checkout has no data/ yet; the state must still be saved.
+        self.db_path = self.root / "data" / "state.db"
+        self._bot().config_store.add_user(1, 5)
+        self.assertTrue(self.db_path.exists())
+        self.assertTrue(self._bot().config_store.is_allowed(1, 5))
 
     def test_the_bot_imports_the_old_json_files_on_start(self):
         (self.root / "config.json").write_text(json.dumps({"guilds": {"7": {"allowed_users": [9]}}}), encoding="utf-8")
