@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Callable
 
 from ttsbot.ogg_opus import UnsupportedOpusStream, opus_packet_samples
-from ttsbot.recording.fsutil import write_atomic
+from ttsbot.recording.fsutil import read_jsonl, write_atomic
 from ttsbot.recording.ogg import OggOpusWriter
 from ttsbot.recording.vad import DetectorFactory, SpeechGate
 
@@ -414,9 +414,7 @@ def recover_session(path: Path) -> int:
     from ttsbot.recording.ogg import ogg_duration
 
     manifest = path / "chunks.jsonl"
-    listed = set()
-    if manifest.exists():
-        listed = {json.loads(line)["file"] for line in manifest.read_text(encoding="utf-8").splitlines() if line}
+    listed = {entry["file"] for entry in read_jsonl(manifest, {"file": str})}
     recovered = 0
     last_mtime = 0.0
     for chunk in sorted(path.glob("*/*.ogg")):

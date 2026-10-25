@@ -32,20 +32,16 @@ from typing import Awaitable, Callable
 
 from ttsbot.recording import recorder
 from ttsbot.recording.groq import MAX_UPLOAD_BYTES, AudioBudget, GroqTranscriber, TranscriptionError
-from ttsbot.recording.fsutil import write_atomic
-from ttsbot.recording.transcript import MAX_ATTEMPTS, build_session_transcript, chunk_result, result_path
+from ttsbot.recording.fsutil import read_jsonl, report_once, write_atomic
+from ttsbot.recording.transcript import (
+    CHUNK_FIELDS, MAX_ATTEMPTS, TTS_FIELDS, build_session_transcript, chunk_result, result_path,
+)
 
 log = logging.getLogger("tts_bot")
 
-# Damaged manifest lines and sessions already reported, so a scan every
-# 30 s does not repeat the same warning.
-_reported: set[tuple[str, int]] = set()
-
-
-def _report_once(key: tuple[str, int], message: str, *args: object) -> None:
-    if key not in _reported:
-        _reported.add(key)
-        log.warning(message, *args)
+# Damaged sessions are reported once, so a scan every 30 s does not repeat
+# the same warning.
+_report_once = report_once
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +78,10 @@ class TranscriptionWorker:
         self.prune_seconds = prune_seconds
         self._next_prune = math.inf  # time.monotonic() of the next sweep; run() arms it
         self._finished: set[Path] = set()  # ended sessions with nothing left to do
+        # Failed attempts per (session, chunk file) in this process: counted
+        # even when the error file cannot be written (a full disk), so a
+        # chunk is never re-sent (and re-billed) forever.
+        self._failures: dict[tuple[str, str], int] = {}
         self._waiting_logged: str | None = None
 
     async def run(self) -> None:
@@ -108,7 +108,7 @@ class TranscriptionWorker:
         """Do one unit of work; return how long to sleep before the next."""
         pending, ended = await asyncio.to_thread(self.scan)
         for session in ended:
-            await self.rebuild(session)
+            await self._rebuild_quietly(session)
             self._finished.add(session)
         if time.monotonic() >= self._next_prune:
             await self._sweep()
@@ -251,40 +251,22 @@ class TranscriptionWorker:
     @staticmethod
     def _entries(session: Path) -> list[dict]:
         """The manifest's entries; a damaged line (a crash mid-append) is skipped."""
-        manifest = session / "chunks.jsonl"
-        if not manifest.exists():
-            return []
-        entries = []
-        for number, line in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-                if not isinstance(entry, dict) or not isinstance(entry.get("file"), str) \
-                        or not isinstance(entry.get("started_at"), (int, float)):
-                    raise ValueError("not a chunk entry")
-            except ValueError as exc:
-                _report_once((str(manifest), number), "Skipping damaged manifest line %s:%d: %s",
-                             manifest, number, exc)
-                continue
-            entries.append(entry)
-        return entries
+        return read_jsonl(session / "chunks.jsonl", CHUNK_FIELDS)
 
     def _needs_work(self, session: Path, entry: dict) -> bool:
         if result_path(session, entry["file"]).exists():
             return False
         return self._attempts(session, entry["file"]) < self.max_attempts
 
-    @staticmethod
-    def _attempts(session: Path, chunk_file: str) -> int:
-        """Failed attempts so far; an unreadable error file counts as none."""
+    def _attempts(self, session: Path, chunk_file: str) -> int:
+        """Failed attempts so far: the error file's count (an unreadable one
+        counts as none) or this process's own, whichever is higher."""
+        counted = self._failures.get((str(session), chunk_file), 0)
         try:
             data = json.loads(error_path(session, chunk_file).read_text(encoding="utf-8"))
-            return int(data.get("attempts", 0))
-        except FileNotFoundError:
-            return 0
+            return max(counted, int(data.get("attempts", 0)))
         except (OSError, ValueError, TypeError, AttributeError):
-            return 0
+            return counted
 
     async def transcribe(self, chunk: PendingChunk, pending: int = 0) -> None:
         entry = chunk.entry
@@ -313,7 +295,10 @@ class TranscriptionWorker:
             if temp is not None:
                 temp.unlink(missing_ok=True)
         # Groq has billed the audio by now, whatever happens next.
-        self.budget.record(entry["audio_seconds"], result.remaining_audio_seconds)
+        try:
+            self.budget.record(entry["audio_seconds"], result.remaining_audio_seconds)
+        except OSError as exc:  # the ledger file; the budget in memory is updated
+            log.warning("Groq budget ledger not written: %s", exc)
         try:
             stored = chunk_result(entry, result.data, model=self.transcriber.model, took=result.took)
             target = result_path(chunk.session, entry["file"])
@@ -333,16 +318,30 @@ class TranscriptionWorker:
             "-" if result.remaining_audio_seconds is None else f"{result.remaining_audio_seconds:.0f}",
             self.budget.used(86400), pending,
         )
-        await self.rebuild(chunk.session)
+        await self._rebuild_quietly(chunk.session)
 
     def _record_error(self, chunk: PendingChunk, message: str, *, final: bool = False) -> None:
         path = error_path(chunk.session, chunk.entry["file"])
         attempts = self.max_attempts if final else self._attempts(chunk.session, chunk.entry["file"]) + 1
-        write_atomic(path, json.dumps({"attempts": attempts, "error": message, "at": round(time.time(), 3)},
-                                      ensure_ascii=False))
+        self._failures[(str(chunk.session), chunk.entry["file"])] = attempts
+        try:
+            write_atomic(path, json.dumps({"attempts": attempts, "error": message, "at": round(time.time(), 3)},
+                                          ensure_ascii=False))
+        except OSError as exc:
+            log.error("Could not save the failed attempt file=%s/%s: %s",
+                      chunk.session.name, chunk.entry["file"], exc)
         log.error("Transcription rejected attempt=%d/%d file=%s/%s: %s",
                   attempts, self.max_attempts, chunk.session.name, chunk.entry["file"], message)
         self.budget.block(60.0)
+
+    async def _rebuild_quietly(self, session: Path) -> None:
+        """rebuild(), but a session whose transcript cannot be built is
+        reported once and left as it is: it must not stop the others."""
+        try:
+            await self.rebuild(session)
+        except Exception as exc:
+            _report_once((str(session), -2), "Transcript not rebuilt session=%s: %s: %s",
+                         session, type(exc).__name__, exc)
 
     async def rebuild(self, session: Path) -> None:
         """Rewrite the session transcript, looking up names it lacks."""
@@ -350,9 +349,7 @@ class TranscriptionWorker:
         names_file = session / "names.json"
         names = json.loads(names_file.read_text(encoding="utf-8")) if names_file.exists() else {}
         speakers = {entry["user_id"] for entry in self._entries(session)}
-        tts = session / "tts.jsonl"
-        if tts.exists():
-            speakers |= {json.loads(line)["user_id"] for line in tts.read_text(encoding="utf-8").splitlines() if line}
+        speakers |= {line["user_id"] for line in read_jsonl(session / "tts.jsonl", TTS_FIELDS)}
         missing = [user_id for user_id in speakers if str(user_id) not in names]
         if session in recorder.ACTIVE_SESSIONS:
             # The recorder's writer thread owns names.json while it records;
