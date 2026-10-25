@@ -13,7 +13,7 @@ import discord
 
 from ttsbot import config
 from ttsbot.models import TTSJob
-from ttsbot.textnorm import normalize_for_tts, speakable_text
+from ttsbot.textnorm import normalize_for_tts
 
 log = logging.getLogger("tts_bot")
 
@@ -28,14 +28,18 @@ class MessageQueueMixin:
         author_id: int,
         text_channel_id: int,
         message_ts: float | None = None,
+        mentions: dict[str, str] | None = None,
     ) -> bool:
-        # Normalize once at the boundary so every caller gets identical
-        # cleanup. The TTS_MAX_CHARS cap is enforced here: it protects the
-        # cloud quotas from walls of text and keeps Piper CPU bounded.
+        # Normalize once, here, so every caller gets identical cleanup:
+        # callers pass the raw text and its resolved mentions. The length
+        # cap (/voicebot limit, else TTS_MAX_CHARS) is enforced here too: it
+        # protects the cloud quotas from walls of text and keeps Piper CPU
+        # bounded.
         cleaned = normalize_for_tts(
             text,
             max_chars=self.config_store.max_chars(),
             emoji_aliases=self.config_store.emoji_say_map(),
+            mentions=mentions,
         )
         if not cleaned:
             log.info(
@@ -68,7 +72,7 @@ class MessageQueueMixin:
                 voice_channel.id,
                 author_id,
                 session.queue.qsize(),
-                len(text),
+                len(cleaned),
                 voice_profile,
                 job.job_id,
             )
@@ -86,10 +90,8 @@ class MessageQueueMixin:
         mentions: dict[str, str] | None = None,
     ) -> None:
         """Queue one Discord message for speech, if anything in it is speakable."""
-        spoken = speakable_text(text, self.config_store.emoji_say_map(), mentions)
-        if spoken:
-            await self.enqueue_tts(spoken, voice_channel, author_id, text_channel_id,
-                                   message_ts=time.perf_counter())
+        await self.enqueue_tts(text, voice_channel, author_id, text_channel_id,
+                               message_ts=time.perf_counter(), mentions=mentions)
 
     def clear_queue_for_guild(self, guild_id: int) -> int:
         """Drop the guild's queued messages and cancel the ones in flight

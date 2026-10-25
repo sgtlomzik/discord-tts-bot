@@ -647,21 +647,22 @@ class ElevenLabsProvider:
 NAME = "elevenlabs"
 
 
-def _config_from_env() -> "ElevenLabsConfig":
+def _config_from_env(*, quiet: bool = False) -> "ElevenLabsConfig":
     """ELEVENLABS_* settings; invalid ones disable it unless a key asks for it."""
     try:
         return ElevenLabsConfig.from_env()
     except ValueError as exc:
         if os.getenv("ELEVENLABS_API_KEY", "").strip():
             raise  # ElevenLabs is wanted, so a bad setting must stop startup
-        log.warning("Ignoring invalid ELEVENLABS_* settings; ElevenLabs is disabled: %s", exc)
+        if not quiet:
+            log.warning("Ignoring invalid ELEVENLABS_* settings; ElevenLabs is disabled: %s", exc)
         return ElevenLabsConfig(api_key="")
 
 
 def seed_voices(registry) -> bool:
     """Point eleven-default at ELEVENLABS_VOICE_ID, keeping its tuning;
     True when the catalog changed."""
-    cfg = _config_from_env()
+    cfg = _config_from_env(quiet=True)  # create() reports bad settings
     if not cfg.api_key or not cfg.voice_id:
         return False
     current = registry.get("eleven-default")

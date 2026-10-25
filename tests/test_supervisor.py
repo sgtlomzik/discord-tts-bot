@@ -70,6 +70,13 @@ class TaskSupervisorTests(unittest.IsolatedAsyncioTestCase):
         sup = TaskSupervisor(base_delay=1.0, max_delay=4.0)
         self.assertEqual([sup.next_delay(n) for n in range(1, 6)], [1.0, 2.0, 4.0, 4.0, 4.0])
 
+    async def test_the_delay_stays_capped_after_any_number_of_crashes(self):
+        # 2 ** 1024 overflows a float: after ~17 h of crashes the supervisor
+        # itself died and the worker was never restarted again.
+        sup = TaskSupervisor(base_delay=1.0, max_delay=60.0)
+        self.assertEqual(sup.next_delay(1025), 60.0)
+        self.assertEqual(sup.next_delay(10**6), 60.0)
+
 
 class BotWorkersTests(unittest.IsolatedAsyncioTestCase):
     async def test_setup_hook_runs_the_pipeline_workers_under_supervision(self):

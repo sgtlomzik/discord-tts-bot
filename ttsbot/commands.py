@@ -28,9 +28,9 @@ from ttsbot import config
 from ttsbot.gemini import GEMINI_VOICE_STYLES, GEMINI_VOICES
 from ttsbot.textnorm import (
     build_mention_say_map_from_guild,
-    normalize_for_tts,
     parse_custom_emoji_arg,
     sanitize_pronunciation,
+    speakable_text,
 )
 
 log = logging.getLogger("tts_bot")
@@ -751,7 +751,7 @@ def build_commands(bot):
         await interaction.response.send_message(
             f"Fish-голос `{name}` настроен: эмоция `{tuned.emotion or 'без метки'}`, "
             f"скорость `{tuned.speed}`, тон `{tuned.pitch}`, громкость `{tuned.volume_db} dB`, "
-            f"модель `{tuned.model or (bot.tts_dispatcher.provider_for('fish').config.model if bot.tts_dispatcher.provider_for('fish') else 's2.1-pro-free')}`, "
+            f"модель `{tuned.model or _configured_model('fish', 's2.1-pro-free')}`, "
             f"temperature `{tuned.temperature}`, top_p `{tuned.top_p}`.",
             ephemeral=True,
         )
@@ -1304,17 +1304,14 @@ def build_commands(bot):
                 if rec.minimax.emotion:
                     extra += f" · {rec.minimax.emotion}"
             elif rec.is_fish and rec.fish is not None:
-                configured = bot.tts_dispatcher.provider_for("fish").config.model if bot.tts_dispatcher.provider_for("fish") else "s2.1-pro-free"
+                configured = _configured_model("fish", "s2.1-pro-free")
                 extra = f" · {rec.fish.model or configured}"
                 if rec.fish.emotion:
                     extra += f" · {rec.fish.emotion}"
             elif rec.is_gemini and rec.gemini is not None:
                 extra = f" · {rec.gemini.voice}"
             elif rec.is_elevenlabs and rec.elevenlabs is not None:
-                configured = (
-                    bot.tts_dispatcher.provider_for("elevenlabs").config.model
-                    if bot.tts_dispatcher.provider_for("elevenlabs") else "eleven_v4_turbo"
-                )
+                configured = _configured_model("elevenlabs", "eleven_v4_turbo")
                 extra = f" · {rec.elevenlabs.model or configured}"
             lines.append(f"`{name}` [{tag}]{extra}")
         if lines:
@@ -1374,6 +1371,23 @@ def build_commands(bot):
             pass
 
 
+    def _configured_model(provider: str, default: str) -> str:
+        """The model a configured provider uses, else its default."""
+        configured = bot.tts_dispatcher.provider_for(provider)
+        return configured.config.model if configured is not None else default
+
+    def _describe_workers(states: dict, guild_id: int) -> str:
+        """The global workers and this guild's own (others' ids stay
+        private), short enough for one Discord message."""
+        own = f":{guild_id}"
+        lines = [
+            f"`{name}` {'ok' if st.running else 'stopped'}"
+            + (f" (restarts {st.restarts}: {(st.last_error or '')[:80]})" if st.restarts else "")
+            for name, st in sorted(states.items())
+            if ":" not in name or name.endswith(own)
+        ]
+        return (", ".join(lines) or "none")[:1500]
+
     @tts_group.command(name="status", description="Показать состояние TTS на сервере")
     async def slash_tts_status(interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -1390,11 +1404,7 @@ def build_commands(bot):
                     f"Queue: `{bot.queue_size(interaction.guild.id)}`",
                     f"Default voice: `{guild_config.default_voice}`",
                     f"Allowed users: `{len(guild_config.allowed_users)}`",
-                    "Workers: " + (", ".join(
-                        f"`{name}` {'ok' if st.running else 'stopped'}"
-                        + (f" (restarts {st.restarts}: {st.last_error})" if st.restarts else "")
-                        for name, st in sorted(bot.supervisor.status().items())
-                    ) or "none"),
+                    "Workers: " + _describe_workers(bot.supervisor.status(), interaction.guild.id),
                 ]
             ),
             ephemeral=True,
@@ -1425,16 +1435,15 @@ def build_commands(bot):
                 ephemeral=True,
             )
             return
-        final_text = normalize_for_tts(
-            text,
-            emoji_aliases=bot.config_store.emoji_say_map(),
-            mentions=build_mention_say_map_from_guild(text, interaction.guild),
-        ) or ""
-        if not final_text:
+        mentions = build_mention_say_map_from_guild(text, interaction.guild)
+        # enqueue_tts cleans the text and applies /voicebot limit; this
+        # check only answers before the interaction times out.
+        if not speakable_text(text, bot.config_store.emoji_say_map(), mentions):
             await interaction.response.send_message("Нет текста для озвучки.", ephemeral=True)
             return
         await interaction.response.send_message("Тестовая фраза добавлена в очередь.", ephemeral=True)
-        await bot.enqueue_tts(final_text, target_channel, interaction.user.id, interaction.channel_id or 0)
+        await bot.enqueue_tts(text, target_channel, interaction.user.id, interaction.channel_id or 0,
+                              mentions=mentions)
 
 
     @tts_group.command(

@@ -65,6 +65,17 @@ class PluginTests(unittest.TestCase):
         with patch.dict(os.environ, {**NO_KEYS, "FISH_API_KEY": "fk", "FISH_REFERENCE_ID": "ref"}):
             self.assertFalse(plugins.seed_voices(registry))  # nothing new
 
+    def test_an_invalid_optional_setting_is_reported_once_per_start(self):
+        # Startup seeds the voices and then builds the providers; each read
+        # the settings and logged the same warning twice.
+        registry = seed_registry(VOICE_PROFILES, fallback_profile="piper-ruslan")
+        env = {**NO_KEYS, "FISH_CHUNK_LENGTH": "5", "ELEVENLABS_FORMAT": "wav_1"}
+        with patch.dict(os.environ, env), self.assertLogs("tts_bot", "WARNING") as logs:
+            plugins.seed_voices(registry)
+            plugins.create_providers(self.store)
+        self.assertEqual(sum("FISH_*" in line for line in logs.output), 1)
+        self.assertEqual(sum("ELEVENLABS_*" in line for line in logs.output), 1)
+
 
 class BotProviderLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_close_shuts_every_registered_provider(self):
