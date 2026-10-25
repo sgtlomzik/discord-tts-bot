@@ -156,8 +156,11 @@ guilds (`TTSDispatcher.slot_for`, `<NAME>_MAX_CONCURRENCY`, default 1;
 wait for its slot checks the phrase cache again, so a phrase repeated back
 to back is generated (and billed) once.
 
-Guilds never wait for each other: a long message or a stuck player in one
-guild holds up only that guild. `queue-clear`, `/voicebot off` and a
+Guilds never wait for each other's queue or player: a long message or a
+stuck player in one guild holds up only that guild. They do share each
+provider's request slots: with the default of one, guild B's Fish message
+waits until guild A's Fish download has finished (downloads run faster
+than playback); raise `FISH_MAX_CONCURRENCY` if the plan allows it. `queue-clear`, `/voicebot off` and a
 disconnect cancel the guild's queued and in-flight items
 (`GuildSession.cancel_all()`). The drain wait after a message is bounded,
 and a player stopped under the worker (`!tts stop`, a kick) never holds it.

@@ -87,7 +87,10 @@ class StateDB:
                 self._conn.execute("COMMIT")
             except BaseException:
                 if self._conn.in_transaction:
-                    self._conn.execute("ROLLBACK")
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        log.exception("ROLLBACK failed on %s", self.path)
                 raise
         except sqlite3.Error as exc:
             raise StateWriteError(f"Cannot save to {self.path}: {exc}") from exc

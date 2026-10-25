@@ -42,7 +42,7 @@ class MessageQueueMixin:
             mentions=mentions,
         )
         if not cleaned:
-            log.info(
+            log.debug(
                 "Skipped TTS enqueue author=%s reason=empty_after_normalize",
                 author_id,
             )

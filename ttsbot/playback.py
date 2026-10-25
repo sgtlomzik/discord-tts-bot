@@ -58,6 +58,7 @@ class PlaybackMixin:
                 raise
             except Exception:
                 log.exception("TTS playback failed; disconnecting voice")
+                prepared.cancelled = True  # stop generating what nobody will play
                 await self.disconnect_guild_voice(prepared.job.voice_channel.guild, cancel_jobs=False)
             finally:
                 session.active.discard(prepared)
@@ -88,6 +89,7 @@ class PlaybackMixin:
             return
         except Exception:
             log.exception("Voice prepare failed (playback)")
+            prepared.cancelled = True  # stop generating what nobody will play
             existing = discord.utils.get(self.voice_clients, guild=job.voice_channel.guild)
             if existing and existing.is_connected():
                 await self.disconnect_guild_voice(job.voice_channel.guild, cancel_jobs=False)
@@ -161,7 +163,7 @@ class PlaybackMixin:
 
         async def watch() -> None:
             # Short waits: each one holds a thread until it returns.
-            while not await source.wait_until_drained(5.0):
+            while not await source.wait_until_drained(1.0):
                 pass
             self.schedule_continuous_idle_stop(guild)
             self.schedule_idle_disconnect(guild)

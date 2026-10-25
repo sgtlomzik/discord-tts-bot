@@ -11,12 +11,16 @@ the second request started before the first one had been cached.
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import types
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from support import load_bot_module
+from pathlib import Path
+
 from ttsbot.models import PreparedAudio, TTSJob
+from ttsbot.providers import LocalProvider, TTSCacheConfig, TTSDispatcher, TTSPhraseCache
 from ttsbot.voice_registry import ElevenLabsParams, FishParams, VoiceRecord
 
 FISH = VoiceRecord(name="fish-a", label="F", description="", provider="fish", fish=FishParams("ref"))
@@ -92,22 +96,29 @@ class ProviderSlotTests(unittest.IsolatedAsyncioTestCase):
         bot._run_stream.assert_awaited_once()
 
     async def test_piper_synthesizes_one_message_at_a_time(self):
-        bot = self._bot()
         running = peak = 0
 
-        async def synthesize(text, filename, voice):
+        async def synthesize(text, filename, profile):
             nonlocal running, peak
             running += 1
             peak = max(peak, running)
             await asyncio.sleep(0.05)
             running -= 1
-            return "local"
 
-        bot.tts_dispatcher.synthesize_piper = synthesize
-        bot._safe_pcm_frames = AsyncMock(return_value=[b"\x00" * 3840])
-        piper = bot.voice_registry.get("piper-ruslan")
-        results = await asyncio.gather(*(bot._generate_file_into(_prepared(i), piper) for i in range(3)))
-        self.assertEqual(results, [True] * 3)
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = TTSPhraseCache(TTSCacheConfig(enabled=True, cache_dir=Path(tmp) / "cache"))
+            dispatcher = TTSDispatcher(local=LocalProvider(AsyncMock(side_effect=synthesize)), cache=cache)
+            cached = Path(tmp) / "cached.wav"
+            cached.write_bytes(b"RIFF" + bytes(40))
+            cache.store("ага", cached, "piper-ruslan")
+            piper = VoiceRecord(name="piper-ruslan", label="P", description="", provider="piper")
+            slow = [dispatcher.synthesize_piper(f"фраза {i}", Path(tmp) / f"{i}.wav", piper) for i in range(3)]
+            tasks = [asyncio.create_task(job) for job in slow]
+            await asyncio.sleep(0.01)  # the first synthesis holds the slot
+            hit = await asyncio.wait_for(
+                dispatcher.synthesize_piper("ага", Path(tmp) / "hit.wav", piper), 0.04)
+            await asyncio.gather(*tasks)
+        self.assertEqual(hit, "cache")
         self.assertEqual(peak, 1)
 
 

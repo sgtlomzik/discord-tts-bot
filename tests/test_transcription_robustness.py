@@ -110,8 +110,9 @@ class WorkerRobustnessTests(unittest.IsolatedAsyncioTestCase):
         # chunks must still be transcribed and both transcripts written.
         first = self.record_session(guild_id=1)
         second = self.record_session(guild_id=3)
-        with (first.path / "tts.jsonl").open("a", encoding="utf-8") as tts:
-            tts.write('{"user_id": 9, "at": 1000.5, "text": "при')
+        line = '{"user_id": 9, "at": 1000.5, "text": "привет"}'.encode()
+        with (first.path / "tts.jsonl").open("ab") as tts:
+            tts.write(line[:-3])  # cut inside the two-byte letter "т"
         fake = FakeTranscriber([groq_json((0, 1, "раз")), groq_json((0, 1, "два"))])
         worker = self.worker(fake)
         with self.assertLogs("tts_bot", "WARNING"):
@@ -133,7 +134,7 @@ class WorkerRobustnessTests(unittest.IsolatedAsyncioTestCase):
                 for _ in range(5):
                     await worker.step()
         self.assertEqual(len(fake.sent), 2)  # the other session was transcribed
-        self.assertIn(broken.path, worker._finished)
+        self.assertNotIn(broken.path, worker._finished)  # tried again next scan
 
     async def test_an_unreadable_error_file_is_retried(self):
         rec = self.record_session()

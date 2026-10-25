@@ -683,7 +683,7 @@ class ElevenLabsPipelineTests(unittest.IsolatedAsyncioTestCase):
         piper = VoiceRecord(name="piper-ruslan", label="P", description="", provider="piper")
         pipeline.voice_registry = VoiceRegistry(fallback_profile="piper-ruslan",
                                                 voices={"eleven-george": _voice(), "piper-ruslan": piper})
-        pipeline._generate_file_into = AsyncMock()
+        pipeline._generate_file_into = AsyncMock(return_value=True)
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         await pipeline._prepare_into(prepared)
         pipeline._generate_file_into.assert_awaited_once_with(prepared, piper)

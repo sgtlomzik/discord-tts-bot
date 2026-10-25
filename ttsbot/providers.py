@@ -687,7 +687,8 @@ class TTSDispatcher:
         voice_key = voice_cache_key(voice)
         if self._cache_hit(text, filename, voice_key):
             return "cache"
-        await self._local.synthesize(text, filename, getattr(voice, "name", None))
+        async with self.slot_for("piper"):  # Piper is CPU-bound
+            await self._local.synthesize(text, filename, getattr(voice, "name", None))
         self._maybe_cache(text, filename, voice_key, suffix="wav")
         return self._local.name
 
@@ -719,5 +720,6 @@ class TTSDispatcher:
         currently marked primary. MiniMax is HTTP-only and does not need
         warming.
         """
-        await self._local.synthesize(text, filename)
+        async with self.slot_for("piper"):
+            await self._local.synthesize(text, filename)
         log.debug("TTSDispatcher.warm_local completed via %s", self._local.name)

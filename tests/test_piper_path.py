@@ -69,7 +69,7 @@ class FileFallbackTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict("os.environ", env or {}):
             bot_mod = load_bot_module()
         bot = bot_mod.TTSBot()
-        bot._generate_file_into = AsyncMock()
+        bot._generate_file_into = AsyncMock(return_value=True)
         return bot
 
     async def test_a_voice_whose_provider_is_not_configured_falls_to_piper(self):

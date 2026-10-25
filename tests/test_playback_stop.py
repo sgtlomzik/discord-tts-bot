@@ -150,6 +150,7 @@ class PlaybackFailureTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(session.ready.join(), 2.0)
         worker.cancel()
         self.assertEqual(played, [first, second])
+        self.assertTrue(first.cancelled)  # its generation stops
         self.assertFalse(second.cancelled)
 
     async def test_a_failed_voice_prepare_keeps_the_rest_of_the_guilds_queue(self):
@@ -167,6 +168,7 @@ class PlaybackFailureTests(unittest.IsolatedAsyncioTestCase):
             with self.assertLogs("tts_bot", "ERROR"):
                 await tts_bot._play_prepared(failing)
         connected.disconnect.assert_awaited()  # the broken connection is dropped
+        self.assertTrue(failing.cancelled)  # its generation stops instead of running on
         self.assertFalse(waiting.cancelled)  # and the next message reconnects
 
 

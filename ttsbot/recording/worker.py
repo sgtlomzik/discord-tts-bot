@@ -108,8 +108,8 @@ class TranscriptionWorker:
         """Do one unit of work; return how long to sleep before the next."""
         pending, ended = await asyncio.to_thread(self.scan)
         for session in ended:
-            await self._rebuild_quietly(session)
-            self._finished.add(session)
+            if await self._rebuild_quietly(session):
+                self._finished.add(session)  # else: tried again next scan
         if time.monotonic() >= self._next_prune:
             await self._sweep()
         if not pending:
@@ -334,14 +334,16 @@ class TranscriptionWorker:
                   attempts, self.max_attempts, chunk.session.name, chunk.entry["file"], message)
         self.budget.block(60.0)
 
-    async def _rebuild_quietly(self, session: Path) -> None:
-        """rebuild(), but a session whose transcript cannot be built is
-        reported once and left as it is: it must not stop the others."""
+    async def _rebuild_quietly(self, session: Path) -> bool:
+        """rebuild(); a session whose transcript cannot be built is reported
+        once and skipped (False), so it never stops the others."""
         try:
             await self.rebuild(session)
+            return True
         except Exception as exc:
             _report_once((str(session), -2), "Transcript not rebuilt session=%s: %s: %s",
                          session, type(exc).__name__, exc)
+            return False
 
     async def rebuild(self, session: Path) -> None:
         """Rewrite the session transcript, looking up names it lacks."""

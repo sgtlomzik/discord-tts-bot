@@ -475,7 +475,7 @@ class PrefetchChainTests(unittest.IsolatedAsyncioTestCase):
         pipeline.voice_registry = registry
         pipeline.tts_dispatcher = TTSDispatcher(local=MagicMock(), providers={"fish": with_spec(SimpleNamespace(config=FishConfig(api_key="fk")), FishProvider), "elevenlabs": with_spec(SimpleNamespace(config=ElevenLabsConfig(api_key="xk")), ElevenLabsProvider)})
         pipeline._should_attempt_stream = lambda voice: voice.provider != "piper"
-        pipeline._generate_file_into = AsyncMock()
+        pipeline._generate_file_into = AsyncMock(return_value=True)
         return pipeline
 
     async def test_elevenlabs_quota_streams_the_fish_fallback(self):

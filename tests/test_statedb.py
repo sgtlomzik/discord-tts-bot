@@ -21,7 +21,7 @@ from unittest.mock import patch
 from ttsbot import config, models, voice_registry
 from ttsbot.health import CircuitBreaker, CircuitState, FailureKind, HealthStore
 from ttsbot.models import VOICE_PROFILES
-from ttsbot.statedb import SCHEMA_VERSION, StateDB, import_json_state
+from ttsbot.statedb import SCHEMA_VERSION, StateDB, StateWriteError, import_json_state
 from ttsbot.statefile import StateFileError
 from ttsbot.store import BotConfigStore
 
@@ -73,8 +73,8 @@ class GuildSettingsTests(_Dir):
         db = StateDB(self.db_path)
         store = BotConfigStore(db, set())
         store.add_user(1, 5)
-        with patch.object(db, "save_config", side_effect=sqlite3.OperationalError("disk I/O error")):
-            with self.assertRaises(sqlite3.OperationalError):
+        with patch.object(db, "save_config", side_effect=StateWriteError("disk I/O error")):
+            with self.assertRaises(OSError):
                 store.add_user(1, 6)
         self.assertFalse(store.is_allowed(1, 6))
         self.assertTrue(BotConfigStore(self.reopen(), set()).is_allowed(1, 5))

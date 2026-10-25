@@ -73,6 +73,17 @@ class ReorderTests(unittest.TestCase):
         self.assertEqual(rec.counters["late_packets"], 0)
         self.assertEqual(rec.counters["written_ms"], 40 * 20)
 
+    def test_a_straggler_after_a_short_gap_is_still_late(self):
+        rec = self.recorder()
+        for i in range(20):
+            rec.submit(5, 960 * i, FRAME, 1000.0 + i * 0.02)
+        rec.submit(5, 960 * 10, FRAME, 1000.7)  # jitter, then an old packet
+        for i in range(20, 30):
+            rec.submit(5, 960 * i, FRAME, 1000.72 + (i - 20) * 0.02)
+        rec.stop()
+        self.assertEqual(rec.counters["late_packets"], 1)
+        self.assertEqual(rec.counters["written_ms"], 30 * 20)
+
     def test_a_clock_that_jumps_by_half_its_range_keeps_being_recorded(self):
         rec = self.recorder()
         for i in range(20):

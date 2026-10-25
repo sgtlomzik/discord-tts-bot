@@ -1381,7 +1381,13 @@ def build_commands(bot):
             for name, st in sorted(states.items())
             if ":" not in name or name.endswith(own)
         ]
-        return (", ".join(lines) or "none")[:1500]
+        shown: list[str] = []
+        for line in lines:
+            if sum(len(item) + 2 for item in shown) + len(line) > 1500:
+                shown.append(f"… +{len(lines) - len(shown)}")
+                break
+            shown.append(line)
+        return ", ".join(shown) or "none"
 
     @tts_group.command(name="status", description="Показать состояние TTS на сервере")
     async def slash_tts_status(interaction: discord.Interaction) -> None:

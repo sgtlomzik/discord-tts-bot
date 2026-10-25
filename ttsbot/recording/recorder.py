@@ -58,6 +58,9 @@ REORDER_FLUSH_SECONDS = 0.3
 # A wall-clock gap this long between packets means the sender paused, so
 # nothing older is still on its way.
 _SENDER_PAUSE_SECONDS = 0.2
+# A timestamp this far behind the last one written (10 s), arriving after a
+# pause, is a restarted RTP clock, not a late packet.
+_CLOCK_RESTART_SAMPLES = 48000 * 10
 
 
 def _signed(delta: int) -> int:
@@ -295,10 +298,11 @@ class ChannelRecorder:
             # still while it was not transmitting; 0.2 s absorbs jitter.
             wall_gap = wall - track.last_wall - (track.last_samples + pause) / 48000
             if delta == 0 or delta >= 0x80000000:
-                if wall - track.last_wall <= _SENDER_PAUSE_SECONDS:
+                behind = 0x100000000 - delta if delta else 0
+                if wall - track.last_wall <= _SENDER_PAUSE_SECONDS or behind < _CLOCK_RESTART_SAMPLES:
                     self.count("late_packets")  # a duplicate, or older than the last one written
                     return
-                # After a pause an "older" timestamp is a restarted clock.
+                # Far behind, after a pause: the sender restarted its clock.
                 gap, new_piece = 0, True
             else:
                 gap = max(0, delta - track.last_samples)

@@ -280,7 +280,8 @@ class SynthesisPipelineMixin:
             return False, "MiniMax не настроен (нет MINIMAX_API_KEY)."
         tmp = config.TMP_DIR / f"voiceadd_{uuid.uuid4().hex}.mp3"
         try:
-            await cloud.synthesize("проверка голоса", tmp, voice_id=voice_id)
+            async with self.tts_dispatcher.slot_for("minimax"):  # a probe is a request too
+                await cloud.synthesize("проверка голоса", tmp, voice_id=voice_id)
             return True, ""
         except MiniMaxVoiceNotFoundError:
             return False, f"voice_id `{voice_id}` не существует (MiniMax 2054)."
@@ -306,7 +307,8 @@ class SynthesisPipelineMixin:
         fish = self.tts_dispatcher.provider_for("fish")
         probe = config.TMP_DIR / f"fish_probe_{uuid.uuid4().hex}.opus"
         try:
-            await fish.synthesize("Проверка голоса.", probe, reference_id=reference_id)
+            async with self.tts_dispatcher.slot_for("fish"):  # a probe is a request too
+                await fish.synthesize("Проверка голоса.", probe, reference_id=reference_id)
             with probe.open("rb") as audio:
                 if audio.read(4) != b"OggS":
                     raise FishError("Fish returned no Ogg/Opus audio")
@@ -341,7 +343,8 @@ class SynthesisPipelineMixin:
         gemini = self.tts_dispatcher.provider_for("gemini")
         params = voice_registry.GeminiParams(voice=voice)
         try:
-            _, _, pcm = await gemini.fetch_pcm("Проверка голоса.", params)
+            async with self.tts_dispatcher.slot_for("gemini"):  # a probe is a request too
+                _, _, pcm = await gemini.fetch_pcm("Проверка голоса.", params)
             if not pcm:
                 raise GeminiError("Gemini returned no audio")
         except Exception as exc:
@@ -373,7 +376,8 @@ class SynthesisPipelineMixin:
         elevenlabs = self.tts_dispatcher.provider_for("elevenlabs")
         params = voice_registry.ElevenLabsParams(voice_id=voice_id)
         try:
-            _, _, audio = await elevenlabs.fetch("Проверка голоса.", params)
+            async with self.tts_dispatcher.slot_for("elevenlabs"):  # a probe is a request too
+                _, _, audio = await elevenlabs.fetch("Проверка голоса.", params)
             if not audio:
                 raise ElevenLabsError("ElevenLabs returned no audio")
         except Exception as exc:
@@ -555,6 +559,7 @@ class SynthesisPipelineMixin:
                             return
                         prepared.error = RuntimeError("Piper produced no audio")
                     except Exception as exc:
+                        log.exception("Piper failed job=%s voice=%s", job.job_id, getattr(candidate, "name", "piper"))
                         prepared.error = exc
                     if prepared.cancelled:
                         return
@@ -824,10 +829,7 @@ class SynthesisPipelineMixin:
         job = prepared.job
         filename = config.TMP_DIR / f"tts_{uuid.uuid4().hex}.wav"
         try:
-            async with self.tts_dispatcher.slot_for("piper"):  # Piper is CPU-bound
-                if prepared.cancelled:
-                    return True
-                prepared.provider = await self.tts_dispatcher.synthesize_piper(job.text, filename, voice)
+            prepared.provider = await self.tts_dispatcher.synthesize_piper(job.text, filename, voice)
             if prepared.cancelled:
                 return True
             frames = limit_pcm_frames(await self._safe_pcm_frames(filename), job.text, voice)
@@ -1185,7 +1187,7 @@ class SynthesisPipelineMixin:
             log.warning("Stream failed mid-stream after %d frames (%s); truncated",
                         frames_count, mid_error[0])
             return ("truncated", frames_count)
-        if proc.returncode != 0:
+        if proc.returncode not in (0, None):
             _discard()
             log.warning("ffmpeg stream decode failed rc=%s format=%s", proc.returncode, input_format)
             # The provider's audio could not be decoded: a failed stream,

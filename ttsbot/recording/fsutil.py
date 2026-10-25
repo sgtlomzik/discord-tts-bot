@@ -30,11 +30,11 @@ def read_jsonl(path: Path, fields: dict[str, type | tuple[type, ...]] | None = N
     if not path.exists():
         return []
     rows = []
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line:
+    for number, raw in enumerate(path.read_bytes().splitlines(), 1):
+        if not raw.strip():
             continue
         try:
-            row = json.loads(line)
+            row = json.loads(raw.decode("utf-8"))  # UnicodeDecodeError is a ValueError
             if not isinstance(row, dict) or any(
                 not isinstance(row.get(name), kind) for name, kind in (fields or {}).items()
             ):
