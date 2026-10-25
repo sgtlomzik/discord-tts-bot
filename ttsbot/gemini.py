@@ -100,8 +100,9 @@ class GeminiAuthError(GeminiError, AuthError):
 
 
 class GeminiRequestError(GeminiError, RequestError):
-    """HTTP 400/404/413/422: OpenRouter rejected this request (input,
-    voice, length), not the provider: other messages still work."""
+    """HTTP 400/413/422, or a 404 about the voice: OpenRouter rejected this
+    request (input, voice, length), not the provider: other messages still
+    work."""
 
 
 class GeminiQuotaExhaustedError(GeminiError, QuotaExhaustedError):
@@ -126,9 +127,20 @@ def _http_error(response: httpx.Response, detail: str) -> GeminiError:
         return GeminiQuotaExhaustedError(message, status)
     if status == 429:
         return GeminiRateLimitError(message, status, retry_after_seconds(response.headers.get("retry-after")))
-    if status in (400, 404, 413, 422):
+    # A missing model or endpoint (a misspelled GEMINI_TTS_MODEL, a model
+    # OpenRouter retired) fails every request: count it against the
+    # provider so its breaker opens. A 404 is only this request's when it
+    # is about the voice.
+    lowered = detail.lower()
+    no_model = any(phrase in lowered for phrase in _NO_MODEL_PHRASES)
+    if status in (413, 422) or (status == 400 and not no_model):
+        return GeminiRequestError(message, status)
+    if status == 404 and "voice" in lowered and not no_model:
         return GeminiRequestError(message, status)
     return GeminiError(message, status)
+
+
+_NO_MODEL_PHRASES = ("not a valid model", "model not found", "no such model", "unknown model", "no endpoints")
 
 
 def parse_pcm_content_type(content_type: str) -> tuple[int, int]:

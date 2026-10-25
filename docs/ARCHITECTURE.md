@@ -148,6 +148,13 @@ own task and moves on, so the next message's request goes out while the
 current one is still downloading or playing. The playback worker drains the
 channels strictly in order into the guild's continuous player.
 
+Each provider takes a bounded number of requests at once, across all
+guilds (`TTSDispatcher.slot_for`, `<NAME>_MAX_CONCURRENCY`, default 1;
+`PIPER_MAX_CONCURRENCY` for Piper's CPU): a plan's concurrency limit answers
+429, which would pause the provider for everyone. A message that had to
+wait for its slot checks the phrase cache again, so a phrase repeated back
+to back is generated (and billed) once.
+
 Guilds never wait for each other: a long message or a stuck player in one
 guild holds up only that guild. `queue-clear`, `/voicebot off` and a
 disconnect cancel the guild's queued and in-flight items

@@ -60,6 +60,12 @@ def _number(name: str, default, kind, low=None, high=None):
     return value
 
 
+def provider_max_concurrency(name: str) -> int:
+    """Requests allowed at once to provider ``name`` (``FISH_MAX_CONCURRENCY``,
+    ``PIPER_MAX_CONCURRENCY``, ...; default 1, at least 1)."""
+    return _number(f"{name.upper()}_MAX_CONCURRENCY", 1, int, 1)
+
+
 def reload() -> None:
     """(Re)read every tunable from the environment into module globals."""
     global TMP_DIR, BOT_CONFIG_PATH, VOICES_REGISTRY_PATH, DEFAULT_VOICE_PROFILE

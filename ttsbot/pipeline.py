@@ -12,6 +12,7 @@ import time
 import uuid
 import wave
 from pathlib import Path
+from typing import Any
 
 import discord
 
@@ -111,8 +112,26 @@ def _log_stream_done(label: str, job, status: str, frames: int, started: float) 
     )
 
 
+def _close_cache_file(part) -> bool:
+    """Close a cache file being written. False when that fails (close
+    flushes what is buffered, and a full disk refuses it again): the file
+    is cut short and must not be committed. The message plays on either
+    way, and the provider is not blamed for the local disk."""
+    try:
+        part.close()
+        return True
+    except OSError as exc:
+        log.warning("TTS cache write failed (%s); not caching this message", exc)
+        return False
+
+
 class SynthesisPipelineMixin:
     """TTS generation, streaming and worker loops; mixed into TTSBot."""
+
+    # The TTSDispatcher, set by TTSBot.__init__. Any until provider_for()
+    # returns a typed provider; with the real type every provider call
+    # and Optional breaker would need narrowing first.
+    tts_dispatcher: Any
 
     async def warmup_tts(self) -> None:
         filename = config.TMP_DIR / f"warmup_{uuid.uuid4().hex}.wav"
@@ -460,7 +479,7 @@ class SynthesisPipelineMixin:
         return voice is not None and self.tts_dispatcher.provider_for(getattr(voice, "provider", None)) is not None
 
     # ------------------------------------------------------------------
-    # Prefetch pipeline (TTS_PREFETCH_ENABLED): generation_worker produces
+    # Prefetch pipeline (TTS_PREFETCH_LOOKAHEAD): generation_worker produces
     # PreparedAudio ahead of playback_worker, which plays strictly FIFO.
     # ------------------------------------------------------------------
 
@@ -571,20 +590,26 @@ class SynthesisPipelineMixin:
         provider = dispatcher.provider_for(voice.provider)
         breaker = dispatcher.breaker_for(voice.provider)
         spec = provider.stream_spec(job.text, voice)
-        frames = await self._cached_frames(spec, job.text, voice)
-        if frames and not prepared.cancelled:
-            await prepared.channel.put(frames)
-            prepared.provider = "cache"
-            return "cache"
-        if prepared.cancelled:
-            return "cancelled"
-        if not breaker.allow_request():
-            log.info("%s circuit breaker open; next voice guild=%s", spec.label, job.guild_id)
-            return "pre_audio"
-        # Set before streaming so the playback worker logs the provider on
-        # the first frame.
-        prepared.provider = voice.provider
-        status, _ = await self._run_stream(prepared, voice, spec)
+        served = await self._serve_cached(prepared, spec, voice)
+        if served:
+            return served
+        # Messages are generated in parallel; the provider takes a bounded
+        # number of requests at once (dispatcher.slot_for).
+        slot = dispatcher.slot_for(voice.provider)
+        waited = slot.locked()
+        async with slot:
+            if waited:
+                # The message ahead may have just cached this very phrase.
+                served = await self._serve_cached(prepared, spec, voice)
+                if served:
+                    return served
+            if not breaker.allow_request():
+                log.info("%s circuit breaker open; next voice guild=%s", spec.label, job.guild_id)
+                return "pre_audio"
+            # Set before streaming so the playback worker logs the provider
+            # on the first frame.
+            prepared.provider = voice.provider
+            status, _ = await self._run_stream(prepared, voice, spec)
         if status == "ok" or (status == "truncated" and prepared.error is None):
             # Cut without an error (the length limit on a stutter loop, an
             # Opus stream that changed format): the provider answered.
@@ -594,6 +619,16 @@ class SynthesisPipelineMixin:
             # not counted: it must not pause the provider's other voices.
             dispatcher.record_failure(breaker, prepared.error)
         return status
+
+    async def _serve_cached(self, prepared: PreparedAudio, spec, voice) -> str | None:
+        """"cache" when the phrase came from the cache, "cancelled" for a
+        cancelled job, None when it still has to be generated."""
+        frames = await self._cached_frames(spec, prepared.job.text, voice)
+        if frames and not prepared.cancelled:
+            await prepared.channel.put(frames)
+            prepared.provider = "cache"
+            return "cache"
+        return "cancelled" if prepared.cancelled else None
 
     async def _cached_frames(self, spec, text: str, voice) -> list[bytes]:
         """The cached audio of ``spec`` as frames, or [] (miss or unreadable)."""
@@ -729,7 +764,7 @@ class SynthesisPipelineMixin:
                         try:
                             cache_part.write(chunk)
                         except OSError:
-                            cache_part.close()
+                            _close_cache_file(cache_part)
                             cache_part = None
                     await emit(framer.feed(chunk))
                     if limit_hit:
@@ -756,8 +791,8 @@ class SynthesisPipelineMixin:
         finally:
             if stream is not None:
                 await stream.aclose()
-            if cache_part is not None:
-                cache_part.close()
+            if cache_part is not None and not _close_cache_file(cache_part):
+                cache_part = None
 
         if prepared.cancelled:
             status = "cancelled"
@@ -789,7 +824,10 @@ class SynthesisPipelineMixin:
         job = prepared.job
         filename = config.TMP_DIR / f"tts_{uuid.uuid4().hex}.wav"
         try:
-            prepared.provider = await self.tts_dispatcher.synthesize_piper(job.text, filename, voice)
+            async with self.tts_dispatcher.slot_for("piper"):  # Piper is CPU-bound
+                if prepared.cancelled:
+                    return True
+                prepared.provider = await self.tts_dispatcher.synthesize_piper(job.text, filename, voice)
             if prepared.cancelled:
                 return True
             frames = limit_pcm_frames(await self._safe_pcm_frames(filename), job.text, voice)
@@ -869,7 +907,7 @@ class SynthesisPipelineMixin:
                     for packet in packets:
                         write_frame(cache_part, packet)
                 except OSError:
-                    cache_part.close()
+                    _close_cache_file(cache_part)
                     cache_part = None
             await prepared.channel.put(packets)
             frames_count += len(packets)
@@ -914,8 +952,8 @@ class SynthesisPipelineMixin:
         finally:
             if not to_ffmpeg:
                 await agen.aclose()
-            if cache_part is not None:
-                cache_part.close()
+            if cache_part is not None and not _close_cache_file(cache_part):
+                cache_part = None
 
         if to_ffmpeg:
             if part_path is not None:
@@ -1025,13 +1063,11 @@ class SynthesisPipelineMixin:
                 cache_part.write(chunk)
             except OSError as exc:
                 log.warning("TTS cache write failed (%s); not caching this message", exc)
-                try:
-                    cache_part.close()
-                except OSError:
-                    pass
+                _close_cache_file(cache_part)
                 cache_part = cache_final = None
 
         async def _feed() -> None:
+            nonlocal cache_part, cache_final
             try:
                 proc.stdin.write(first_chunk)
                 await proc.stdin.drain()
@@ -1053,11 +1089,8 @@ class SynthesisPipelineMixin:
                     proc.stdin.close()
                 except Exception:
                     pass
-                if cache_part is not None:
-                    try:
-                        cache_part.close()
-                    except Exception:
-                        pass
+                if cache_part is not None and not _close_cache_file(cache_part):
+                    cache_part = cache_final = None
 
         feeder = asyncio.create_task(_feed())
         frame_limit = playback_frame_limit(job.text, voice)
@@ -1155,6 +1188,9 @@ class SynthesisPipelineMixin:
         if proc.returncode != 0:
             _discard()
             log.warning("ffmpeg stream decode failed rc=%s format=%s", proc.returncode, input_format)
+            # The provider's audio could not be decoded: a failed stream,
+            # not the "cut without an error" that counts as a success.
+            prepared.error = RuntimeError(f"ffmpeg could not decode the {input_format} stream (rc={proc.returncode})")
             return ("truncated" if frames_count else "pre_audio", frames_count)
         if frames_count == 0:
             _discard()
