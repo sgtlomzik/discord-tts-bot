@@ -12,8 +12,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from ttsbot import config
+
+if TYPE_CHECKING:
+    from ttsbot.audio import ContinuousTTSAudioSource
 
 
 @dataclass(eq=False)
@@ -25,12 +29,13 @@ class GuildSession:
     generating: set = field(default_factory=set)  # tasks generating audio
     workers_started: bool = False
     # Voice state (ttsbot.voice_lifecycle, ttsbot.playback).
-    player: object | None = None  # the guild's ContinuousTTSAudioSource
+    player: ContinuousTTSAudioSource | None = None
     voice_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # connect/move
     connect_cooldown_until: float = 0.0  # time.monotonic(); after a failed connect
     auto_connect_suppressed_until: float = 0.0  # after an explicit or idle disconnect
     idle_disconnect_task: asyncio.Task | None = None
     idle_stop_task: asyncio.Task | None = None  # stops the idle continuous player
+    drain_watch_task: asyncio.Task | None = None  # arms both after a drain timeout
 
     def take_player(self):
         """The player, detached from the session (None if there is none)."""

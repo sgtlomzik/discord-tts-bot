@@ -514,8 +514,9 @@ class SynthesisPipelineMixin:
         until one produces audio; a failure before any audio moves on to the
         next voice. A provider that failed for a reason other than this one
         message (or is paused) is skipped for the rest of the chain, and so
-        is a voice whose provider is not configured. The first Piper voice
-        is synthesized to a file and ends the chain.
+        is a voice whose provider is not configured. A Piper voice is
+        synthesized to a file; it ends the chain once it produced audio, and
+        a Piper failure moves on like any other voice.
         """
         job = prepared.job
         voice = self.voice_registry.get(job.voice_profile) or self.voice_registry.fallback_record()
@@ -530,8 +531,17 @@ class SynthesisPipelineMixin:
                 if getattr(candidate, "provider", None) in skipped:
                     continue
                 if candidate is None or candidate.is_piper:
-                    await self._generate_file_into(prepared, candidate)
-                    return
+                    try:
+                        if await self._generate_file_into(prepared, candidate):
+                            return
+                        prepared.error = RuntimeError("Piper produced no audio")
+                    except Exception as exc:
+                        prepared.error = exc
+                    if prepared.cancelled:
+                        return
+                    nxt = next((v for v in chain[index + 1:] if v.provider not in skipped), None)
+                    self._log_fallback(job, candidate, nxt, prepared.error)
+                    continue
                 if not self._should_attempt_stream(candidate):
                     continue  # its provider is not configured
                 prepared.error = None
@@ -543,7 +553,7 @@ class SynthesisPipelineMixin:
                 nxt = next((v for v in chain[index + 1:] if v.provider not in skipped), None)
                 self._log_fallback(job, candidate, nxt, prepared.error)
             log.error("No voice could speak job=%s guild=%s chain=%s", job.job_id, job.guild_id,
-                      ",".join(v.name for v in chain))
+                      ",".join(getattr(v, "name", "piper") for v in chain))
         finally:
             # Always terminate the channel so the consumer never hangs.
             await prepared.channel.put(None)
@@ -627,7 +637,7 @@ class SynthesisPipelineMixin:
 
     def _log_fallback(self, job, voice, nxt, error) -> None:
         """One line per fallback step; quiet (INFO) while the provider is paused."""
-        breaker = self.tts_dispatcher.breaker_for(voice.provider)
+        breaker = self.tts_dispatcher.breaker_for(getattr(voice, "provider", "piper"))
         paused = error is None and breaker is not None and breaker.state.value != "closed"
         if error is not None:
             reason = f"{type(error).__name__}: {error}"
@@ -638,7 +648,7 @@ class SynthesisPipelineMixin:
         log.log(
             logging.INFO if paused else logging.WARNING,
             "Fallback guild=%s job=%s voice=%s -> %s reason=%s",
-            job.guild_id, job.job_id, voice.name, nxt.name if nxt else "none", reason[:200],
+            job.guild_id, job.job_id, getattr(voice, "name", "piper"), nxt.name if nxt else "none", reason[:200],
         )
 
     async def _safe_pcm_frames(self, path: Path, pitch: int = 0) -> list[bytes]:
@@ -770,19 +780,23 @@ class SynthesisPipelineMixin:
                 part_path.unlink(missing_ok=True)
         return status, frames_count
 
-    async def _generate_file_into(self, prepared: PreparedAudio, voice) -> None:
-        """Synthesize the Piper ``voice`` to a file and put its frames into the channel."""
+    async def _generate_file_into(self, prepared: PreparedAudio, voice) -> bool:
+        """Synthesize the Piper ``voice`` to a file and put its frames into
+        the channel. True when it produced audio (or the job was cancelled:
+        nothing else should speak it)."""
         if prepared.cancelled:
-            return
+            return True
         job = prepared.job
         filename = config.TMP_DIR / f"tts_{uuid.uuid4().hex}.wav"
         try:
             prepared.provider = await self.tts_dispatcher.synthesize_piper(job.text, filename, voice)
             if prepared.cancelled:
-                return
+                return True
             frames = limit_pcm_frames(await self._safe_pcm_frames(filename), job.text, voice)
-            if frames:
-                await prepared.channel.put(frames)
+            if not frames:
+                return False
+            await prepared.channel.put(frames)
+            return True
         finally:
             if filename.exists():
                 try:

@@ -106,6 +106,52 @@ class FileFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spoken, ["eleven-a", "eleven-b"])
         bot._generate_file_into.assert_not_awaited()
 
+    def _chain_with_piper_in_the_middle(self, bot):
+        bot.tts_dispatcher.register("elevenlabs", MagicMock())
+        for name in ("eleven-a", "eleven-b"):
+            bot.voice_registry.add(VoiceRecord(name=name, label=name, description="", provider="elevenlabs",
+                                               elevenlabs=ElevenLabsParams(voice_id=name)))
+        bot.voice_registry.fallback_chain = ["piper-ruslan", "eleven-b"]
+        spoken = []
+
+        async def stream(prepared, voice):
+            spoken.append(voice.name)
+            if voice.name == "eleven-a":
+                prepared.error = ElevenLabsVoiceNotFoundError("404", 404)
+                return "pre_audio"
+            return "ok"
+
+        bot._stream_voice_into = AsyncMock(side_effect=stream)
+        return spoken
+
+    async def test_a_failing_piper_voice_falls_through_to_the_rest_of_the_chain(self):
+        bot = self._bot()
+        spoken = self._chain_with_piper_in_the_middle(bot)
+        bot._generate_file_into = AsyncMock(side_effect=RuntimeError("Piper model not found"))
+        prepared = PreparedAudio(job=_job("eleven-a"), channel=asyncio.Queue())
+        with self.assertLogs("tts_bot", "WARNING") as logs:
+            await bot._prepare_into(prepared)
+        self.assertEqual(spoken, ["eleven-a", "eleven-b"])
+        self.assertTrue(any("piper-ruslan -> eleven-b" in line for line in logs.output))
+
+    async def test_a_piper_voice_without_audio_falls_through_too(self):
+        bot = self._bot()
+        spoken = self._chain_with_piper_in_the_middle(bot)
+        bot._generate_file_into = AsyncMock(return_value=False)
+        prepared = PreparedAudio(job=_job("eleven-a"), channel=asyncio.Queue())
+        with self.assertLogs("tts_bot", "WARNING"):
+            await bot._prepare_into(prepared)
+        self.assertEqual(spoken, ["eleven-a", "eleven-b"])
+
+    async def test_piper_that_speaks_ends_the_chain(self):
+        bot = self._bot()
+        spoken = self._chain_with_piper_in_the_middle(bot)
+        bot._generate_file_into = AsyncMock(return_value=True)
+        prepared = PreparedAudio(job=_job("eleven-a"), channel=asyncio.Queue())
+        with self.assertLogs("tts_bot", "WARNING"):
+            await bot._prepare_into(prepared)
+        self.assertEqual(spoken, ["eleven-a"])
+
     async def test_the_old_streaming_switch_changes_nothing(self):
         bot = self._bot({"TTS_STREAMING_ENABLED": "0"})
         bot.tts_dispatcher.register("elevenlabs", MagicMock())

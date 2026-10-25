@@ -237,7 +237,7 @@ class TTSBot(
             await transcriber.aclose()
 
         for session in self.sessions.values():
-            for task in (session.idle_disconnect_task, session.idle_stop_task):
+            for task in (session.idle_disconnect_task, session.idle_stop_task, session.drain_watch_task):
                 if task is not None:
                     task.cancel()
             player = session.take_player()

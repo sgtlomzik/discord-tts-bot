@@ -146,14 +146,6 @@
                     "endColumn": 45,
                     "lineCount": 1
                 }
-            },
-            {
-                "code": "reportAttributeAccessIssue",
-                "range": {
-                    "startColumn": 23,
-                    "endColumn": 27,
-                    "lineCount": 1
-                }
             }
         ],
         "./ttsbot/elevenlabs.py": [
@@ -845,31 +837,7 @@
                 "code": "reportAttributeAccessIssue",
                 "range": {
                     "startColumn": 13,
-                    "endColumn": 42,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportAttributeAccessIssue",
-                "range": {
-                    "startColumn": 13,
-                    "endColumn": 37,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportAttributeAccessIssue",
-                "range": {
-                    "startColumn": 13,
                     "endColumn": 40,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportAttributeAccessIssue",
-                "range": {
-                    "startColumn": 23,
-                    "endColumn": 34,
                     "lineCount": 1
                 }
             }
