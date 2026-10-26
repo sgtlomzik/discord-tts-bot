@@ -357,20 +357,21 @@ class FishProvider:
 NAME = "fish"
 
 
-def _config_from_env() -> "FishConfig":
+def _config_from_env(*, quiet: bool = False) -> "FishConfig":
     """FISH_* settings; invalid ones disable Fish unless FISH_API_KEY asks for it."""
     try:
         return FishConfig.from_env()
     except ValueError as exc:
         if os.getenv("FISH_API_KEY", "").strip():
             raise  # Fish is wanted, so a bad setting must stop startup
-        log.warning("Ignoring invalid FISH_* settings; Fish is disabled: %s", exc)
+        if not quiet:
+            log.warning("Ignoring invalid FISH_* settings; Fish is disabled: %s", exc)
         return FishConfig(api_key="")
 
 
 def seed_voices(registry) -> bool:
     """Point fish-default at FISH_REFERENCE_ID; True when the catalog changed."""
-    reference_id = _config_from_env().reference_id
+    reference_id = _config_from_env(quiet=True).reference_id  # create() reports bad settings
     if not reference_id:
         return False
     current = registry.get("fish-default")

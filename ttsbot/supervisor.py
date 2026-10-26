@@ -38,7 +38,9 @@ class TaskSupervisor:
 
     def next_delay(self, failures: int) -> float:
         """Delay before restart number *failures* (1-based) in a row."""
-        return min(self.max_delay, self.base_delay * 2 ** (failures - 1))
+        # Clamp the exponent first: 2 ** 1024 does not fit in a float, and an
+        # OverflowError here would end the supervisor loop itself.
+        return min(self.max_delay, self.base_delay * 2 ** min(failures - 1, 32))
 
     def start(self, name: str, factory: Callable[[], Awaitable[None]]) -> asyncio.Task[None]:
         state = self._states[name] = WorkerState(running=True)

@@ -31,6 +31,8 @@ class VoiceProfile:
 class GuildConfig:
     enabled: bool = True
     allowed_users: set[int] = field(default_factory=set)
+    # Denied in this guild by /voicebot deny; wins over WHITELIST_USERS.
+    denied_users: set[int] = field(default_factory=set)
     default_voice: str = field(default_factory=lambda: config.DEFAULT_VOICE_PROFILE)
     user_voices: dict[int, str] = field(default_factory=dict)
     user_fixed_phrases: dict[int, str] = field(default_factory=dict)

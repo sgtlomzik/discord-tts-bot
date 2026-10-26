@@ -1,10 +1,8 @@
 """Connection warm-up on typing and the Discord delivery log."""
 
-import asyncio
 import datetime as dt
 import types
 import unittest
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import discord

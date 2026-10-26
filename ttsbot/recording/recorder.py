@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Callable
 
 from ttsbot.ogg_opus import UnsupportedOpusStream, opus_packet_samples
-from ttsbot.recording.fsutil import write_atomic
+from ttsbot.recording.fsutil import read_jsonl, write_atomic
 from ttsbot.recording.ogg import OggOpusWriter
 from ttsbot.recording.vad import DetectorFactory, SpeechGate
 
@@ -58,6 +58,9 @@ REORDER_FLUSH_SECONDS = 0.3
 # A wall-clock gap this long between packets means the sender paused, so
 # nothing older is still on its way.
 _SENDER_PAUSE_SECONDS = 0.2
+# A timestamp this far behind the last one written (10 s), arriving after a
+# pause, is a restarted RTP clock, not a late packet.
+_CLOCK_RESTART_SAMPLES = 48000 * 10
 
 
 def _signed(delta: int) -> int:
@@ -232,8 +235,11 @@ class ChannelRecorder:
                 user_id=user_id, ssrc=ssrc, detector=factory() if factory else None, gate=SpeechGate()
             )
         track.last_arrival = time.monotonic()
-        if track.held and wall - track.held_wall > _SENDER_PAUSE_SECONDS:
-            self._release(track, len(track.held))  # the sender paused: nothing older is coming
+        if wall - track.held_wall > _SENDER_PAUSE_SECONDS:
+            # The sender paused: nothing older is coming, and its clock may
+            # have restarted, so the next packet starts a fresh window.
+            self._release(track, len(track.held))
+            track.released = None
         self._hold(track, timestamp, opus, wall)
         if len(track.held) > REORDER_PACKETS:
             self._release(track, len(track.held) - REORDER_PACKETS)
@@ -288,14 +294,19 @@ class ChannelRecorder:
         gap = 0
         if not new_piece:
             delta = (timestamp - track.last_timestamp) & 0xFFFFFFFF
-            if delta == 0 or delta >= 0x80000000:
-                self.count("late_packets")  # a duplicate, or older than the last one written
-                return
-            gap = max(0, delta - track.last_samples)
             # The wall clock also catches a sender whose RTP clock stood
             # still while it was not transmitting; 0.2 s absorbs jitter.
             wall_gap = wall - track.last_wall - (track.last_samples + pause) / 48000
-            new_piece = gap > pause or wall_gap > 0.2
+            if delta == 0 or delta >= 0x80000000:
+                behind = 0x100000000 - delta if delta else 0
+                if wall - track.last_wall <= _SENDER_PAUSE_SECONDS or behind < _CLOCK_RESTART_SAMPLES:
+                    self.count("late_packets")  # a duplicate, or older than the last one written
+                    return
+                # Far behind, after a pause: the sender restarted its clock.
+                gap, new_piece = 0, True
+            else:
+                gap = max(0, delta - track.last_samples)
+                new_piece = gap > pause or wall_gap > 0.2
         if new_piece and track.writer is not None and track.writer.seconds >= settings.chunk_seconds:
             self._close_chunk(track, reason="full")
         if track.writer is None:
@@ -407,9 +418,7 @@ def recover_session(path: Path) -> int:
     from ttsbot.recording.ogg import ogg_duration
 
     manifest = path / "chunks.jsonl"
-    listed = set()
-    if manifest.exists():
-        listed = {json.loads(line)["file"] for line in manifest.read_text(encoding="utf-8").splitlines() if line}
+    listed = {entry["file"] for entry in read_jsonl(manifest, {"file": str})}
     recovered = 0
     last_mtime = 0.0
     for chunk in sorted(path.glob("*/*.ogg")):

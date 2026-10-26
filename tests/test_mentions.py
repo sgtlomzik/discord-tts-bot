@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import types
 import unittest
-from pathlib import Path
 
 
 from support import load_bot_module  # noqa: E402,F401  (re-exported for other tests)

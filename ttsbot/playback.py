@@ -9,6 +9,7 @@ import asyncio
 import logging
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import discord
 
@@ -25,6 +26,9 @@ from ttsbot.audio import (
 from ttsbot.models import PreparedAudio
 from ttsbot.voice_lifecycle import VoiceCooldown
 
+if TYPE_CHECKING:
+    from ttsbot.session import GuildSession
+
 log = logging.getLogger("tts_bot")
 
 # How much longer than the queued audio the playback worker waits for the
@@ -35,6 +39,12 @@ DRAIN_SLACK_SECONDS = 5.0
 
 class PlaybackMixin:
     """Continuous/file playback for PCM and Opus; mixed into TTSBot."""
+
+    if TYPE_CHECKING:
+        # Provided by TTSBot and VoiceLifecycleMixin; declared for the type checker.
+        def session_for(self, guild_id: int) -> GuildSession: ...
+        def schedule_continuous_idle_stop(self, guild: discord.Guild) -> None: ...
+        def schedule_idle_disconnect(self, guild: discord.Guild) -> None: ...
 
     async def _playback_worker(self, session) -> None:
         """Play the guild's prepared messages in order."""
@@ -48,7 +58,8 @@ class PlaybackMixin:
                 raise
             except Exception:
                 log.exception("TTS playback failed; disconnecting voice")
-                await self.disconnect_guild_voice(prepared.job.voice_channel.guild)
+                prepared.cancelled = True  # stop generating what nobody will play
+                await self.disconnect_guild_voice(prepared.job.voice_channel.guild, cancel_jobs=False)
             finally:
                 session.active.discard(prepared)
                 session.ready.task_done()
@@ -78,9 +89,10 @@ class PlaybackMixin:
             return
         except Exception:
             log.exception("Voice prepare failed (playback)")
+            prepared.cancelled = True  # stop generating what nobody will play
             existing = discord.utils.get(self.voice_clients, guild=job.voice_channel.guild)
             if existing and existing.is_connected():
-                await self.disconnect_guild_voice(job.voice_channel.guild)
+                await self.disconnect_guild_voice(job.voice_channel.guild, cancel_jobs=False)
             await self._drain_channel(prepared)
             return
 
@@ -121,22 +133,42 @@ class PlaybackMixin:
                 note = getattr(vc, "note_spoken_text", None)
                 if note is not None:
                     note(job.author_id, job.text)
-        if total == 0 or source is None or source.stopped:
+        if total == 0 or source is None:
             return
-        budget = total * PCM_FRAME_MS / 1000 + DRAIN_SLACK_SECONDS
-        if not await source.wait_until_drained(budget):
-            log.warning(
-                "Playback drain timed out guild=%s job=%s frames=%d waited_s=%.1f",
-                job.voice_channel.guild.id, job.job_id, total, budget,
+        guild = job.voice_channel.guild
+        if not source.stopped:
+            budget = total * PCM_FRAME_MS / 1000 + DRAIN_SLACK_SECONDS
+            if not await source.wait_until_drained(budget):
+                log.warning(
+                    "Playback drain timed out guild=%s job=%s frames=%d waited_s=%.1f",
+                    guild.id, job.job_id, total, budget,
+                )
+                # The rest plays once the stalled connection recovers; the
+                # next message must not wait for it, but the idle timers
+                # (cancelled by ensure_voice) must still be armed then.
+                self._arm_idle_timers_when_drained(guild, source)
+                return
+            log.info(
+                "Playback finished guild=%s channel=%s frames=%d total_since_queue=%.3fs job=%s provider=%s",
+                guild.id, job.voice_channel.id, total,
+                time.perf_counter() - job.queued_at, job.job_id, prepared.provider or "?",
             )
-            return
-        log.info(
-            "Playback finished guild=%s channel=%s frames=%d total_since_queue=%.3fs job=%s provider=%s",
-            job.voice_channel.guild.id, job.voice_channel.id, total,
-            time.perf_counter() - job.queued_at, job.job_id, prepared.provider or "?",
-        )
-        self.schedule_continuous_idle_stop(job.voice_channel.guild)
-        self.schedule_idle_disconnect(job.voice_channel.guild)
+        self.schedule_continuous_idle_stop(guild)
+        self.schedule_idle_disconnect(guild)
+
+    def _arm_idle_timers_when_drained(self, guild, source: ContinuousTTSAudioSource) -> None:
+        session = self.session_for(guild.id)
+        if session.drain_watch_task is not None:
+            session.drain_watch_task.cancel()
+
+        async def watch() -> None:
+            # Short waits: each one holds a thread until it returns.
+            while not await source.wait_until_drained(1.0):
+                pass
+            self.schedule_continuous_idle_stop(guild)
+            self.schedule_idle_disconnect(guild)
+
+        session.drain_watch_task = asyncio.create_task(watch(), name=f"drain-watch-{guild.id}")
 
     def ensure_continuous_player(
         self, vc: discord.VoiceClient, *, initial_frames: list[bytes] | None = None,

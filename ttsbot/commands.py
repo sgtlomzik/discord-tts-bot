@@ -28,9 +28,9 @@ from ttsbot import config
 from ttsbot.gemini import GEMINI_VOICE_STYLES, GEMINI_VOICES
 from ttsbot.textnorm import (
     build_mention_say_map_from_guild,
-    normalize_for_tts,
     parse_custom_emoji_arg,
     sanitize_pronunciation,
+    speakable_text,
 )
 
 log = logging.getLogger("tts_bot")
@@ -313,15 +313,10 @@ def build_commands(bot):
             return
         guild = interaction.guild
         assert guild is not None
-        if bot.config_store.is_env_user(user.id):
-            await interaction.response.send_message(
-                f"{user.mention} озвучивается на всех серверах через WHITELIST_USERS в .env; "
-                "убрать его можно только там.",
-                ephemeral=True,
-            )
-            return
         bot.config_store.remove_user(guild.id, user.id)
-        await interaction.response.send_message(f"Исключен из озвучки: {user.mention}", ephemeral=True)
+        note = (" на этом сервере (на остальных его озвучивает WHITELIST_USERS из .env)"
+                if bot.config_store.is_env_user(user.id) else "")
+        await interaction.response.send_message(f"Исключен из озвучки: {user.mention}{note}", ephemeral=True)
 
 
     @tts_group.command(name="voice-set", description="Сменить озвучку по умолчанию")
@@ -746,13 +741,12 @@ def build_commands(bot):
         try:
             bot.persist_voice_registry()
         except OSError as exc:
-            bot.voice_registry.add(rec)
             await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
             return
         await interaction.response.send_message(
             f"Fish-голос `{name}` настроен: эмоция `{tuned.emotion or 'без метки'}`, "
             f"скорость `{tuned.speed}`, тон `{tuned.pitch}`, громкость `{tuned.volume_db} dB`, "
-            f"модель `{tuned.model or (bot.tts_dispatcher.provider_for('fish').config.model if bot.tts_dispatcher.provider_for('fish') else 's2.1-pro-free')}`, "
+            f"модель `{tuned.model or _configured_model('fish', 's2.1-pro-free')}`, "
             f"temperature `{tuned.temperature}`, top_p `{tuned.top_p}`.",
             ephemeral=True,
         )
@@ -917,7 +911,6 @@ def build_commands(bot):
         try:
             bot.persist_voice_registry()
         except OSError as exc:
-            bot.voice_registry.add(rec)
             log.exception("Failed to save the voice catalog after voice-tune")
             await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
             return
@@ -1114,7 +1107,6 @@ def build_commands(bot):
                 ephemeral=True,
             )
             return
-        previous_chain, previous_record = reg.fallback_chain, record
         if record is not None:
             if names is not None:
                 names = [n for n in names if n != record.name]
@@ -1125,9 +1117,6 @@ def build_commands(bot):
         try:
             bot.persist_voice_registry()
         except OSError as exc:
-            reg.fallback_chain = previous_chain
-            if previous_record is not None:
-                reg.add(previous_record)
             log.exception("Failed to save the voice catalog after changing the fallback chain")
             await interaction.response.send_message(f"Не удалось сохранить: {exc}", ephemeral=True)
             return
@@ -1310,17 +1299,14 @@ def build_commands(bot):
                 if rec.minimax.emotion:
                     extra += f" · {rec.minimax.emotion}"
             elif rec.is_fish and rec.fish is not None:
-                configured = bot.tts_dispatcher.provider_for("fish").config.model if bot.tts_dispatcher.provider_for("fish") else "s2.1-pro-free"
+                configured = _configured_model("fish", "s2.1-pro-free")
                 extra = f" · {rec.fish.model or configured}"
                 if rec.fish.emotion:
                     extra += f" · {rec.fish.emotion}"
             elif rec.is_gemini and rec.gemini is not None:
                 extra = f" · {rec.gemini.voice}"
             elif rec.is_elevenlabs and rec.elevenlabs is not None:
-                configured = (
-                    bot.tts_dispatcher.provider_for("elevenlabs").config.model
-                    if bot.tts_dispatcher.provider_for("elevenlabs") else "eleven_v4_turbo"
-                )
+                configured = _configured_model("elevenlabs", "eleven_v4_turbo")
                 extra = f" · {rec.elevenlabs.model or configured}"
             lines.append(f"`{name}` [{tag}]{extra}")
         if lines:
@@ -1380,6 +1366,29 @@ def build_commands(bot):
             pass
 
 
+    def _configured_model(provider: str, default: str) -> str:
+        """The model a configured provider uses, else its default."""
+        configured = bot.tts_dispatcher.provider_for(provider)
+        return configured.config.model if configured is not None else default
+
+    def _describe_workers(states: dict, guild_id: int) -> str:
+        """The global workers and this guild's own (others' ids stay
+        private), short enough for one Discord message."""
+        own = f":{guild_id}"
+        lines = [
+            f"`{name}` {'ok' if st.running else 'stopped'}"
+            + (f" (restarts {st.restarts}: {(st.last_error or '')[:80]})" if st.restarts else "")
+            for name, st in sorted(states.items())
+            if ":" not in name or name.endswith(own)
+        ]
+        shown: list[str] = []
+        for line in lines:
+            if sum(len(item) + 2 for item in shown) + len(line) > 1500:
+                shown.append(f"… +{len(lines) - len(shown)}")
+                break
+            shown.append(line)
+        return ", ".join(shown) or "none"
+
     @tts_group.command(name="status", description="Показать состояние TTS на сервере")
     async def slash_tts_status(interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -1396,11 +1405,7 @@ def build_commands(bot):
                     f"Queue: `{bot.queue_size(interaction.guild.id)}`",
                     f"Default voice: `{guild_config.default_voice}`",
                     f"Allowed users: `{len(guild_config.allowed_users)}`",
-                    "Workers: " + (", ".join(
-                        f"`{name}` {'ok' if st.running else 'stopped'}"
-                        + (f" (restarts {st.restarts}: {st.last_error})" if st.restarts else "")
-                        for name, st in sorted(bot.supervisor.status().items())
-                    ) or "none"),
+                    "Workers: " + _describe_workers(bot.supervisor.status(), interaction.guild.id),
                 ]
             ),
             ephemeral=True,
@@ -1431,16 +1436,15 @@ def build_commands(bot):
                 ephemeral=True,
             )
             return
-        final_text = normalize_for_tts(
-            text,
-            emoji_aliases=bot.config_store.emoji_say_map(),
-            mentions=build_mention_say_map_from_guild(text, interaction.guild),
-        ) or ""
-        if not final_text:
+        mentions = build_mention_say_map_from_guild(text, interaction.guild)
+        # enqueue_tts cleans the text and applies /voicebot limit; this
+        # check only answers before the interaction times out.
+        if not speakable_text(text, bot.config_store.emoji_say_map(), mentions):
             await interaction.response.send_message("Нет текста для озвучки.", ephemeral=True)
             return
         await interaction.response.send_message("Тестовая фраза добавлена в очередь.", ephemeral=True)
-        await bot.enqueue_tts(final_text, target_channel, interaction.user.id, interaction.channel_id or 0)
+        await bot.enqueue_tts(text, target_channel, interaction.user.id, interaction.channel_id or 0,
+                              mentions=mentions)
 
 
     @tts_group.command(

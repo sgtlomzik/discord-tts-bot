@@ -12,12 +12,17 @@ import logging
 
 from ttsbot import config
 from ttsbot.models import GuildConfig, VOICE_PROFILES
+from ttsbot.statedb import StateDB
 
 log = logging.getLogger("tts_bot")
 
 
 def _as_dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
+
+
+def _user_ids(value: object) -> set[int]:
+    return {int(user_id) for user_id in (value if isinstance(value, list) else []) if str(user_id).isdigit()}
 
 
 def _as_bool(value: object, default: bool = True) -> bool:
@@ -31,8 +36,8 @@ def _as_bool(value: object, default: bool = True) -> bool:
 
 
 class BotConfigStore:
-    def __init__(self, db, fallback_users: set[int], voice_registry=None) -> None:
-        self.db = db  # ttsbot.statedb.StateDB
+    def __init__(self, db: StateDB, fallback_users: set[int], voice_registry=None) -> None:
+        self.db = db
         self.fallback_users = set(fallback_users)
         # Validate stored voice names against the unified registry when
         # available (so MiniMax assignments survive reload); otherwise fall
@@ -84,12 +89,8 @@ class BotConfigStore:
                 continue
             if not isinstance(raw_config, dict):
                 continue
-            raw_allowed = raw_config.get("allowed_users", [])
-            allowed_users = {
-                int(user_id)
-                for user_id in (raw_allowed if isinstance(raw_allowed, list) else [])
-                if str(user_id).isdigit()
-            }
+            allowed_users = _user_ids(raw_config.get("allowed_users"))
+            denied_users = _user_ids(raw_config.get("denied_users"))
             user_voices = {
                 int(user_id): voice
                 for user_id, voice in _as_dict(raw_config.get("user_voices")).items()
@@ -106,6 +107,7 @@ class BotConfigStore:
             self.guilds[guild_id] = GuildConfig(
                 enabled=_as_bool(raw_config.get("enabled", True)),
                 allowed_users=allowed_users,
+                denied_users=denied_users,
                 default_voice=default_voice,
                 user_voices=user_voices,
                 user_fixed_phrases=user_fixed_phrases,
@@ -178,6 +180,7 @@ class BotConfigStore:
                 str(guild_id): {
                     "enabled": config.enabled,
                     "allowed_users": sorted(config.allowed_users),
+                    "denied_users": sorted(config.denied_users),
                     "default_voice": config.default_voice,
                     "user_voices": {
                         str(user_id): voice
@@ -211,19 +214,27 @@ class BotConfigStore:
         return self.get_guild(guild_id).enabled
 
     def is_allowed(self, guild_id: int, user_id: int) -> bool:
-        return user_id in self.fallback_users or user_id in self.get_guild(guild_id).allowed_users
+        """The guild's deny wins; then WHITELIST_USERS, then the guild's list."""
+        config = self.get_guild(guild_id)
+        if user_id in config.denied_users:
+            return False
+        return user_id in self.fallback_users or user_id in config.allowed_users
 
     def is_env_user(self, user_id: int) -> bool:
-        """Allowed in every guild by WHITELIST_USERS (changed only in .env)."""
+        """Allowed by WHITELIST_USERS in every guild that has not denied them."""
         return user_id in self.fallback_users
 
     def add_user(self, guild_id: int, user_id: int) -> None:
-        self.get_guild(guild_id).allowed_users.add(user_id)
+        config = self.get_guild(guild_id)
+        config.allowed_users.add(user_id)
+        config.denied_users.discard(user_id)
         self.save()
 
     def remove_user(self, guild_id: int, user_id: int) -> None:
+        """Deny the user in this guild, even one WHITELIST_USERS allows."""
         config = self.get_guild(guild_id)
         config.allowed_users.discard(user_id)
+        config.denied_users.add(user_id)
         config.user_voices.pop(user_id, None)
         config.user_fixed_phrases.pop(user_id, None)
         self.save()

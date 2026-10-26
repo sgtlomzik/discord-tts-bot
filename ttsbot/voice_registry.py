@@ -560,7 +560,11 @@ def load_or_seed(
         minimax_model=minimax_model,
         minimax_language_boost=minimax_language_boost,
     )
-    save_registry(db, seeded)
+    try:
+        save_registry(db, seeded)
+    except OSError:
+        log.exception("Could not save the seeded voice catalog in %s; keeping it in memory", db.path)
+        return seeded
     log.info(
         "Voice registry seeded in %s voices=%s fallback=%s minimax_seed=%s",
         db.path, seeded.names(), seeded.fallback_profile, minimax_voice_id or "none",

@@ -28,7 +28,7 @@ from ttsbot.ogg_opus import opus_packet_samples
 from ttsbot.pipeline import DISCORD_OPUS_CACHE_SUFFIX, SynthesisPipelineMixin
 from ttsbot.providers import (
     CircuitState, DispatcherConfig, TTSCacheConfig, TTSDispatcher,
-    TTSPhraseCache, load_dispatcher_config_from_env,
+    TTSPhraseCache,
 )
 from ttsbot.voice_registry import (
     ElevenLabsParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict,
@@ -683,7 +683,7 @@ class ElevenLabsPipelineTests(unittest.IsolatedAsyncioTestCase):
         piper = VoiceRecord(name="piper-ruslan", label="P", description="", provider="piper")
         pipeline.voice_registry = VoiceRegistry(fallback_profile="piper-ruslan",
                                                 voices={"eleven-george": _voice(), "piper-ruslan": piper})
-        pipeline._generate_file_into = AsyncMock()
+        pipeline._generate_file_into = AsyncMock(return_value=True)
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         await pipeline._prepare_into(prepared)
         pipeline._generate_file_into.assert_awaited_once_with(prepared, piper)

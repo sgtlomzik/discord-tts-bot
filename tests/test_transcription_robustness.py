@@ -89,6 +89,53 @@ class WorkerRobustnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake.sent), 3)  # given up after max_attempts, not forever
         self.assertEqual(json.loads(error_path(rec.path, "5/0001.ogg").read_text())["attempts"], 3)
 
+    async def test_a_full_disk_still_bounds_the_resends(self):
+        # The result cannot be written, and neither can the error file that
+        # counts the attempts: Groq must not bill the same chunk forever.
+        self.record_session()
+        fake = FakeTranscriber([groq_json((0, 1, "текст"))] * 5)
+        worker = self.worker(fake, max_attempts=3)
+        worker.budget._ledger = self.root / "unwritable" / "ledger.jsonl"  # the ledger fails too
+        disk_full = OSError(28, "No space left on device")
+        with mock.patch("ttsbot.recording.worker.chunk_result", side_effect=disk_full), \
+                mock.patch("ttsbot.recording.worker.write_atomic", side_effect=disk_full):
+            with self.assertLogs("tts_bot", "ERROR"):
+                for _ in range(5):
+                    await worker.step()
+        self.assertEqual(len(fake.sent), 3)
+        self.assertEqual(worker.scan()[0], [])
+
+    async def test_a_truncated_tts_line_does_not_stop_transcription(self):
+        # The process died while appending to tts.jsonl; the next session's
+        # chunks must still be transcribed and both transcripts written.
+        first = self.record_session(guild_id=1)
+        second = self.record_session(guild_id=3)
+        line = '{"user_id": 9, "at": 1000.5, "text": "привет"}'.encode()
+        with (first.path / "tts.jsonl").open("ab") as tts:
+            tts.write(line[:-3])  # cut inside the two-byte letter "т"
+        fake = FakeTranscriber([groq_json((0, 1, "раз")), groq_json((0, 1, "два"))])
+        worker = self.worker(fake)
+        with self.assertLogs("tts_bot", "WARNING"):
+            for _ in range(4):
+                await worker.step()
+        self.assertEqual(len(fake.sent), 2)
+        self.assertIn("раз", (first.path / "transcript.md").read_text(encoding="utf-8"))
+        self.assertIn("два", (second.path / "transcript.md").read_text(encoding="utf-8"))
+
+    async def test_a_session_whose_transcript_cannot_be_built_is_left_alone(self):
+        broken = self.record_session(guild_id=1)
+        self.record_session(guild_id=3)
+        fake = FakeTranscriber([groq_json((0, 1, "раз")), groq_json((0, 1, "два"))])
+        worker = self.worker(fake)
+        build = mock.Mock(side_effect=lambda session, *a, **k: (_ for _ in ()).throw(KeyError("channel_id"))
+                          if session == broken.path else {})
+        with mock.patch("ttsbot.recording.worker.build_session_transcript", build):
+            with self.assertLogs("tts_bot", "WARNING"):
+                for _ in range(5):
+                    await worker.step()
+        self.assertEqual(len(fake.sent), 2)  # the other session was transcribed
+        self.assertNotIn(broken.path, worker._finished)  # tried again next scan
+
     async def test_an_unreadable_error_file_is_retried(self):
         rec = self.record_session()
         error_path(rec.path, "5/0001.ogg").write_text("{", encoding="utf-8")

@@ -1,5 +1,3 @@
-import asyncio
-import contextlib
 import tempfile
 import types
 import unittest

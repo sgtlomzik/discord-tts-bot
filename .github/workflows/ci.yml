@@ -8,6 +8,28 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The Dockerfile's base image: tests run on the production Python and
+    # Debian packages, and apt uses the deb.debian.org CDN instead of the
+    # runner's Azure Ubuntu mirror, which can crawl at tens of KB/s.
+    container: python:3.11-slim
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        # ffmpeg and libopus are runtime deps (see Dockerfile); without them
+        # the audio and Fish decode tests are skipped.
+        run: apt-get update && apt-get install -y --no-install-recommends ffmpeg libopus0
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -16,13 +38,13 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install system packages
-        # ffmpeg and libopus are runtime deps (see Dockerfile); without them
-        # the audio and Fish decode tests are skipped.
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg libopus0
-
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        # The type check resolves imports, so it needs the runtime deps too.
+        run: pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: Run tests
-        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Ruff
+        run: ruff check --output-format=github .
+
+      - name: Type check
+        # Fails only on errors missing from .basedpyright/baseline.json.
+        run: basedpyright

@@ -27,12 +27,13 @@ from ttsbot.statedb import StateDB, import_json_state
 os.environ.setdefault("STATE_DB_PATH", ":memory:")
 
 
-def state_from(config_path) -> StateDB:
+def state_from(config_path, env_users: set[int] | None = None) -> StateDB:
     """The state database in ``config_path``'s directory, with that
-    config.json (an earlier version's file) imported if it exists. Opening
+    config.json (an earlier version's file) imported if it exists, minus
+    the ``env_users`` (WHITELIST_USERS) the old bot copied into it. Opening
     it again gives the same state, as after a restart."""
     db = StateDB(config_path.parent / "state.db")
-    import_json_state(db, config_path=config_path)
+    import_json_state(db, config_path=config_path, env_users=env_users or set())
     return db
 
 

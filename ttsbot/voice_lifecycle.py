@@ -311,10 +311,16 @@ class VoiceLifecycleMixin:
 
         return vc
 
-    async def disconnect_guild_voice(self, guild: discord.Guild) -> None:
-        # Jobs being generated or played for this guild have nowhere to go.
+    async def disconnect_guild_voice(self, guild: discord.Guild, *, cancel_jobs: bool = True) -> None:
+        """Leave the guild's voice channel.
+
+        A deliberate disconnect (``/voicebot off``, ``!tts leave``) also
+        cancels the jobs being generated or played: they have nowhere to go.
+        Recovery from a broken connection passes ``cancel_jobs=False``: the
+        next job reconnects, so one failed message does not drop the rest.
+        """
         session = self.sessions.get(guild.id)
-        for prepared in session.active if session is not None else ():
+        for prepared in session.active if cancel_jobs and session is not None else ():
             prepared.cancelled = True
         self.cancel_idle_disconnect(guild.id)
         self.cancel_continuous_idle_stop(guild.id)

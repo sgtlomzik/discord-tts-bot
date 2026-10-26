@@ -16,7 +16,7 @@ import re
 from pathlib import Path
 from typing import Callable
 
-from ttsbot.recording.fsutil import write_atomic
+from ttsbot.recording.fsutil import read_jsonl, write_atomic
 
 # Whisper's well-known inventions on noise or silence, mostly learned from
 # subtitles; a segment matching one is dropped (kept under "dropped").
@@ -88,6 +88,12 @@ def result_path(session: Path, chunk_file: str) -> Path:
 MERGE_GAP_SECONDS = 2.0
 
 
+# The fields every reader of chunks.jsonl / tts.jsonl relies on; a line
+# without them is skipped like a damaged one (fsutil.read_jsonl).
+CHUNK_FIELDS = {"file": str, "started_at": (int, float), "user_id": int}
+TTS_FIELDS = {"user_id": int, "at": (int, float), "text": str}
+
+
 def utterances(entries: list[dict], results: dict[str, dict], tts: list[dict]) -> list[dict]:
     """Every kept segment and TTS line of a session, in time order.
 
@@ -132,10 +138,7 @@ def build_session_transcript(session: Path, name_for: Callable[[int], str], tz: 
                              merge_gap: float = MERGE_GAP_SECONDS) -> dict:
     """Write ``transcript.md`` / ``transcript.jsonl``; return a summary."""
     info = json.loads((session / "session.json").read_text(encoding="utf-8"))
-    entries = []
-    manifest = session / "chunks.jsonl"
-    if manifest.exists():
-        entries = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line]
+    entries = read_jsonl(session / "chunks.jsonl", CHUNK_FIELDS)
     results: dict[str, dict] = {}
     pending = 0
     for entry in entries:
@@ -144,10 +147,7 @@ def build_session_transcript(session: Path, name_for: Callable[[int], str], tz: 
             pending += 1
             continue
         results[entry["file"]] = json.loads(path.read_text(encoding="utf-8"))
-    tts_lines = []
-    tts = session / "tts.jsonl"
-    if tts.exists():
-        tts_lines = [json.loads(raw) for raw in tts.read_text(encoding="utf-8").splitlines() if raw]
+    tts_lines = read_jsonl(session / "tts.jsonl", TTS_FIELDS)
     merged = merge_lines(utterances(entries, results, tts_lines), merge_gap)
 
     def clock(epoch: float, fmt: str = "%H:%M:%S") -> str:

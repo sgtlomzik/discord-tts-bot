@@ -7,7 +7,6 @@ are attached from the outside by the composition root (bot.py).
 """
 
 import logging
-import sqlite3
 import time
 import zoneinfo
 from functools import partial
@@ -50,16 +49,6 @@ intents.voice_states = True
 intents.guilds = True
 
 
-def _state_db_location() -> Path | str:
-    """STATE_DB_PATH, or memory when its data directory does not exist
-    (a run outside the container: nothing is written to the host)."""
-    path = config.STATE_DB_PATH
-    if str(path) == ":memory:" or path.parent.exists():
-        return path
-    log.warning("Data directory %s does not exist; keeping state in memory only", path.parent)
-    return ":memory:"
-
-
 class TTSBot(
     VoiceLifecycleMixin,
     MessageQueueMixin,
@@ -83,13 +72,15 @@ class TTSBot(
         self.sessions: dict[int, GuildSession] = {}
         # Guild settings, the voice catalog and provider pauses live in one
         # SQLite file (data/state.db); the JSON files of earlier versions
-        # are imported into it once.
-        self.state_db = StateDB(_state_db_location())
+        # are imported into it once. A missing data directory is created;
+        # STATE_DB_PATH=:memory: keeps the state in memory (tests).
+        self.state_db = StateDB(config.STATE_DB_PATH)
         import_json_state(
             self.state_db,
             config_path=config.BOT_CONFIG_PATH,
             voices_path=config.VOICES_REGISTRY_PATH,
             health_path=config.PROVIDER_HEALTH_PATH,
+            env_users=config.WHITELIST_USERS,
         )
         # Unified voice catalog, seeded on first start from the Piper
         # profiles (and MINIMAX_VOICE_ID); then each plugin points its
@@ -107,7 +98,7 @@ class TTSBot(
         if plugins.seed_voices(self.voice_registry):
             try:
                 voice_registry.save_registry(self.state_db, self.voice_registry)
-            except sqlite3.Error:
+            except OSError:
                 log.exception("Could not save the seeded voices; keeping them in memory")
         self.config_store = BotConfigStore(
             self.state_db, config.WHITELIST_USERS, voice_registry=self.voice_registry
@@ -247,7 +238,7 @@ class TTSBot(
             await transcriber.aclose()
 
         for session in self.sessions.values():
-            for task in (session.idle_disconnect_task, session.idle_stop_task):
+            for task in (session.idle_disconnect_task, session.idle_stop_task, session.drain_watch_task):
                 if task is not None:
                     task.cancel()
             player = session.take_player()

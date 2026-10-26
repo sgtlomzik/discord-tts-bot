@@ -14,7 +14,7 @@ Two real data sources:
 
 Each logged message is matched to its Discord message and passed through the
 bot's own ``normalize_for_tts`` (emoji aliases, mentions, URL stripping, the
-TTS_MAX_CHARS cap), so "generated chars" is the text length the provider
+/voicebot limit cap), so "generated chars" is the text length the provider
 received. The share of the user's text that was voiced inside the log window
 is then applied to the Discord history outside it to fill the full period.
 
@@ -282,12 +282,15 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     from ttsbot import config
+    from ttsbot.statedb import StateDB
     from ttsbot.store import BotConfigStore
     from ttsbot.textnorm import normalize_for_tts
 
     config.reload()
-    store = BotConfigStore(config.BOT_CONFIG_PATH, set())
-    store.load()  # applies the runtime tts_max_chars override to config
+    if not config.STATE_DB_PATH.exists():
+        p.error(f"state database not found: {config.STATE_DB_PATH} (set STATE_DB_PATH)")
+    store = BotConfigStore(StateDB(config.STATE_DB_PATH), set())
+    max_chars = store.max_chars()  # /voicebot limit, else TTS_MAX_CHARS
     aliases = store.emoji_say_map()
 
     end = datetime.now(timezone.utc)
@@ -312,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             raw = fixed if fixed is not None else msg.get("content", "")
             generated = normalize_for_tts(
-                raw, max_chars=config.TTS_MAX_CHARS, emoji_aliases=aliases,
+                raw, max_chars=max_chars, emoji_aliases=aliases,
                 mentions={} if fixed is not None else mention_map(msg, roles, channels),
             )
             messages.append(Message(int(msg["id"]), snowflake_time(msg["id"]), channel_id, raw, generated))

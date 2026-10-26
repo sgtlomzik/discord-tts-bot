@@ -115,10 +115,11 @@ configured `tts-connection-keepalive`, `tts-provider-health` and
 ### 3.2 Message Intake
 
 `on_message()` lets a message in when the guild has TTS on, the author is
-allowed (the guild's list or `WHITELIST_USERS`) and is in a voice
-channel. `queue_message()` takes its speakable text (`speakable_text`)
-and `enqueue_tts()` normalizes it once, applies the length cap and queues
-a `TTSJob`. Every message is queued as it arrives; nothing is held back
+allowed (the guild's list or `WHITELIST_USERS`, unless the guild denied
+them) and is in a voice channel. `queue_message()` hands the raw text and
+its resolved mentions to `enqueue_tts()`, which cleans it once, applies
+the length cap (`/voicebot limit`, else `TTS_MAX_CHARS`) and queues a
+`TTSJob`. Every message is queued as it arrives; nothing is held back
 or merged.
 
 ### 3.3 Voice Updates
@@ -148,8 +149,18 @@ own task and moves on, so the next message's request goes out while the
 current one is still downloading or playing. The playback worker drains the
 channels strictly in order into the guild's continuous player.
 
-Guilds never wait for each other: a long message or a stuck player in one
-guild holds up only that guild. `queue-clear`, `/voicebot off` and a
+Each provider takes a bounded number of requests at once, across all
+guilds (`TTSDispatcher.slot_for`, `<NAME>_MAX_CONCURRENCY`, default 1;
+`PIPER_MAX_CONCURRENCY` for Piper's CPU): a plan's concurrency limit answers
+429, which would pause the provider for everyone. A message that had to
+wait for its slot checks the phrase cache again, so a phrase repeated back
+to back is generated (and billed) once.
+
+Guilds never wait for each other's queue or player: a long message or a
+stuck player in one guild holds up only that guild. They do share each
+provider's request slots: with the default of one, guild B's Fish message
+waits until guild A's Fish download has finished (downloads run faster
+than playback); raise `FISH_MAX_CONCURRENCY` if the plan allows it. `queue-clear`, `/voicebot off` and a
 disconnect cancel the guild's queued and in-flight items
 (`GuildSession.cancel_all()`). The drain wait after a message is bounded,
 and a player stopped under the worker (`!tts stop`, a kick) never holds it.
@@ -473,11 +484,16 @@ All persistent state lives in one SQLite file, `data/state.db`
 
 The stores work on memory and save in one transaction after each change,
 so a crash or a full disk leaves the previous state; a failed save rolls
-memory back. Nested values are JSON text columns. A database that cannot
-be opened stops startup (`StateFileError`) and is left as it is. The
-`config.json`, `voices.json` and `provider_health.json` of earlier versions
-are imported once on startup and left in place (an older image still finds
-them). `sqlite3 data/state.db .dump` shows everything.
+memory back. A save SQLite refuses (full disk, a lock held past the 5 s
+busy timeout) is rolled back, COMMIT included, and raised as
+`StateWriteError`, an `OSError`, so the save handlers that caught failed
+JSON writes catch it too. Nested values are JSON text columns. A missing
+data directory is created. A database that cannot be opened stops startup
+(`StateFileError`) and is left as it is. The `config.json`, `voices.json`
+and `provider_health.json` of earlier versions are imported once on
+startup and left in place (an older image still finds them); a damaged
+`provider_health.json` is skipped with a warning, since it only caches
+provider pauses. `sqlite3 data/state.db .dump` shows everything.
 
 ## 9. Commands
 
@@ -488,7 +504,8 @@ Current commands:
 - `on` - enable TTS for the guild;
 - `off` - disable TTS and clear active work;
 - `allow` - add a member to the allowed list;
-- `deny` - remove a member from the allowed list;
+- `deny` - remove a member from the allowed list and deny them in this
+  guild, even one `WHITELIST_USERS` allows (`allow` lifts it);
 - `voices` - list available voice profiles;
 - `voice-set` - change the guild default voice;
 - `voice-user` - assign a voice profile to one member;

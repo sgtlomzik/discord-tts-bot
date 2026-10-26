@@ -17,7 +17,6 @@ from ttsbot.pipeline import SynthesisPipelineMixin
 from ttsbot.providers import (CircuitBreaker, CircuitBreakerConfig, CircuitState, DispatcherConfig, TTSDispatcher)
 from ttsbot.minimax import (MiniMaxConfig, MiniMaxError, MiniMaxProvider, MiniMaxQuotaError, MiniMaxQuotaExhaustedError)
 from ttsbot.streams import StreamSpec
-from ttsbot.minimax import (MiniMaxProvider)
 from support import with_spec
 
 QUOTA_BODY = (

@@ -12,6 +12,7 @@ ttsbot.plugins builds the configured ones.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -28,6 +29,7 @@ from typing import (
     Protocol,
 )
 
+from ttsbot import config as bot_config
 from ttsbot.health import (  # noqa: F401  (CircuitState is re-exported)
     LONG_KINDS,
     CircuitBreaker,
@@ -497,10 +499,26 @@ class TTSDispatcher:
         self._quota_unknown: set[str] = set()
         self._config = config or DispatcherConfig()
         self._cache = cache  # None means caching disabled
+        self._slots: dict[str, asyncio.Semaphore] = {}
 
     @property
     def config(self) -> DispatcherConfig:
         return self._config
+
+    def slot_for(self, provider: str | None) -> asyncio.Semaphore:
+        """Bounds the requests running at once to ``provider`` ("piper" for
+        Piper's CPU), ``<NAME>_MAX_CONCURRENCY``, by default 1.
+
+        Messages are generated in parallel (per guild, and the next one
+        while the current one plays); a provider plan's concurrency limit
+        answers 429, which would pause the provider for every guild. The
+        limit is read on first use, so a change needs a restart.
+        """
+        name = provider or "piper"
+        slot = self._slots.get(name)
+        if slot is None:
+            slot = self._slots[name] = asyncio.Semaphore(bot_config.provider_max_concurrency(name))
+        return slot
 
     def register(self, name: str, provider, breaker: Optional[CircuitBreaker] = None) -> None:
         """Add a cloud provider under the name its voices use.
@@ -669,7 +687,8 @@ class TTSDispatcher:
         voice_key = voice_cache_key(voice)
         if self._cache_hit(text, filename, voice_key):
             return "cache"
-        await self._local.synthesize(text, filename, getattr(voice, "name", None))
+        async with self.slot_for("piper"):  # Piper is CPU-bound
+            await self._local.synthesize(text, filename, getattr(voice, "name", None))
         self._maybe_cache(text, filename, voice_key, suffix="wav")
         return self._local.name
 
@@ -701,5 +720,6 @@ class TTSDispatcher:
         currently marked primary. MiniMax is HTTP-only and does not need
         warming.
         """
-        await self._local.synthesize(text, filename)
+        async with self.slot_for("piper"):
+            await self._local.synthesize(text, filename)
         log.debug("TTSDispatcher.warm_local completed via %s", self._local.name)

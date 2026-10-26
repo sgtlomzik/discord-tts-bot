@@ -23,8 +23,8 @@ from ttsbot.gemini import (
 from ttsbot.models import PreparedAudio, TTSJob
 from ttsbot.pipeline import SynthesisPipelineMixin
 from ttsbot.providers import (
-    CircuitBreaker, CircuitState, DispatcherConfig, TTSCacheConfig,
-    TTSDispatcher, TTSPhraseCache, load_dispatcher_config_from_env,
+    CircuitState, DispatcherConfig, TTSCacheConfig,
+    TTSDispatcher, TTSPhraseCache,
 )
 from ttsbot.voice_registry import (
     GeminiParams, VoiceRecord, VoiceRegistry, registry_from_dict, registry_to_dict,
@@ -300,7 +300,7 @@ class GeminiPipelineTests(unittest.IsolatedAsyncioTestCase):
         piper = VoiceRecord(name="piper-ruslan", label="P", description="", provider="piper")
         pipeline.voice_registry = VoiceRegistry(fallback_profile="piper-ruslan",
                                                 voices={"gemini-kore": _voice(), "piper-ruslan": piper})
-        pipeline._generate_file_into = AsyncMock()
+        pipeline._generate_file_into = AsyncMock(return_value=True)
         prepared = PreparedAudio(job=_job(), channel=asyncio.Queue())
         await pipeline._prepare_into(prepared)
         pipeline._generate_file_into.assert_awaited_once_with(prepared, piper)
