@@ -21,6 +21,7 @@ from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, Reques
 from ttsbot.httpclient import attach_warmer, provider_limits
 from ttsbot.providers import voice_cache_key
 from ttsbot.streams import StreamSpec
+from ttsbot.textnorm import derive_auto_emotion
 
 log = logging.getLogger("tts_bot.minimax")
 
@@ -114,9 +115,9 @@ def load_minimax_config_from_env() -> MiniMaxConfig:
         model=model,
         base_url=base_url,
         language_boost=lang,
-        timeout_seconds=float(os.getenv("TTS_REQUEST_TIMEOUT", "2.5")),
-        sample_rate=int(os.getenv("MINIMAX_SAMPLE_RATE", "32000")),
-        bitrate=int(os.getenv("MINIMAX_BITRATE", "128000")),
+        timeout_seconds=bot_config._number("TTS_REQUEST_TIMEOUT", 2.5, float),
+        sample_rate=bot_config._number("MINIMAX_SAMPLE_RATE", 32000, int),
+        bitrate=bot_config._number("MINIMAX_BITRATE", 128000, int),
     )
 
 
@@ -124,27 +125,6 @@ def load_minimax_config_from_env() -> MiniMaxConfig:
 MINIMAX_EMOTIONS = (
     "neutral", "happy", "sad", "angry", "fearful", "disgusted", "surprised",
 )
-
-
-def derive_auto_emotion(text: str) -> str:
-    """Heuristic per-message emotion from punctuation/case.
-
-    Used when a voice's emotion is set to ``"auto"``. It is a pure function of
-    the (already normalized) text, which is part of the cache key — so the
-    same text always maps to the same emotion and the cache stays consistent.
-    Returns one of MINIMAX_EMOTIONS, or "" for neutral/no emotion.
-    """
-    if not text:
-        return ""
-    stripped = text.strip()
-    letters = [c for c in stripped if c.isalpha()]
-    if len(letters) >= 4 and all(c.isupper() for c in letters):
-        return "angry"  # SHOUTING
-    if "?!" in stripped or "!?" in stripped:
-        return "surprised"
-    if stripped.endswith("!"):
-        return "happy"
-    return ""
 
 
 def resolve_emotion(emotion: str, text: str) -> str:
