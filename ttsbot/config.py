@@ -10,7 +10,11 @@ latency) live in ``BotConfigStore``.
 
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
+
+_N = TypeVar("_N", int, float)
 
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
@@ -45,7 +49,9 @@ def _flag(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() not in {"0", "false", "no"}
 
 
-def _number(name: str, default, kind, low=None, high=None):
+def _number(
+    name: str, default: _N, kind: Callable[[str], _N], low: _N | None = None, high: _N | None = None,
+) -> _N:
     """A numeric setting; a malformed one logs a warning and uses ``default``."""
     raw = os.getenv(name, "").strip()
     try:

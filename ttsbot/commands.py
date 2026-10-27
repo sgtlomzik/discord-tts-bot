@@ -26,6 +26,7 @@ from dataclasses import replace
 
 from ttsbot import config
 from ttsbot.gemini import GEMINI_VOICE_STYLES, GEMINI_VOICES
+from ttsbot.voice_lifecycle import VoiceCooldown
 from ttsbot.textnorm import (
     build_mention_say_map_from_guild,
     parse_custom_emoji_arg,
@@ -279,10 +280,12 @@ def build_commands(bot):
             return
         guild = interaction.guild
         assert guild is not None
+        # Disconnecting can take longer than Discord's 3 s to answer.
+        await interaction.response.defer(ephemeral=True)
         bot.config_store.set_enabled(guild.id, False)
         cleared = bot.clear_queue_for_guild(guild.id)
         await bot.disconnect_guild_voice(guild)
-        await interaction.response.send_message(f"TTS отключен. Очередь очищена: {cleared}.", ephemeral=True)
+        await interaction.followup.send(f"TTS отключен. Очередь очищена: {cleared}.", ephemeral=True)
 
 
     @tts_group.command(name="on", description="Включить озвучку на сервере")
@@ -1508,11 +1511,23 @@ def build_commands(bot):
             await ctx.reply("You are not allowed to use TTS.", mention_author=False)
             return
 
+        if not bot.config_store.is_enabled(ctx.guild.id):
+            await ctx.reply("TTS is turned off on this server (/voicebot on).", mention_author=False)
+            return
+
         if not ctx.author.voice or not isinstance(ctx.author.voice.channel, discord.VoiceChannel):
             await ctx.reply("You must be in a voice channel.", mention_author=False)
             return
 
-        await bot.ensure_voice(ctx.author.voice.channel)
+        try:
+            await bot.ensure_voice(ctx.author.voice.channel)
+        except VoiceCooldown as exc:
+            await ctx.reply(f"Voice is reconnecting, try again shortly ({exc}).", mention_author=False)
+            return
+        except Exception:
+            log.exception("!tts join failed guild=%s", ctx.guild.id)
+            await ctx.reply("Could not connect to voice.", mention_author=False)
+            return
         await ctx.reply("TTS connected.", mention_author=False)
 
 
