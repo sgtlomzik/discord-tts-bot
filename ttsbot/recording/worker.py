@@ -39,6 +39,9 @@ from ttsbot.recording.transcript import (
 
 log = logging.getLogger("tts_bot")
 
+# Re-encoding a 25 MB file takes seconds; a hung ffmpeg must not take forever.
+SHRINK_TIMEOUT_SECONDS = 300.0
+
 # Damaged sessions are reported once, so a scan every 30 s does not repeat
 # the same warning.
 _report_once = report_once
@@ -372,10 +375,23 @@ class TranscriptionWorker:
         fd, name = tempfile.mkstemp(suffix=".ogg")
         os.close(fd)
         process = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-v", "error", "-y", "-i", str(path), "-ac", "1", "-c:a", "libopus", "-b:a", "32k", name,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
+            "-ac", "1", "-c:a", "libopus", "-b:a", "32k", name,
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await process.communicate()
+        try:
+            _, stderr = await asyncio.wait_for(process.communicate(), SHRINK_TIMEOUT_SECONDS)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            # A stuck ffmpeg would hold the worker, and every later chunk, for good.
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+            Path(name).unlink(missing_ok=True)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise TranscriptionError(
+                f"ffmpeg did not finish in {SHRINK_TIMEOUT_SECONDS:.0f} s", retry=True,
+            ) from None
         if process.returncode != 0:
             Path(name).unlink(missing_ok=True)
             raise TranscriptionError(f"ffmpeg failed: {stderr.decode(errors='replace')[:200]}", retry=False)
