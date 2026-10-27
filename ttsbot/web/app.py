@@ -14,7 +14,9 @@ import binascii
 import contextlib
 import hmac
 import logging
+import time
 import zoneinfo
+from collections import deque
 from pathlib import Path
 
 from aiohttp import web
@@ -73,14 +75,63 @@ async def errors_middleware(request: web.Request, handler) -> web.StreamResponse
         return _error(500, "internal_error", "Internal error")
 
 
-def auth_middleware(username: str, password: str):
+class FailedLogins:
+    """Wrong passwords per client: after ``limit`` of them within ``window``
+    seconds the client gets 429 until the oldest one is ``window`` old.
+
+    Keyed by the peer address. Behind a reverse proxy that is the proxy, so
+    a guessing client then locks out everyone for up to ``window``: the
+    price of not trusting a forwarded-for header anyone can set.
+    """
+
+    def __init__(self, limit: int = 10, window: float = 300.0) -> None:
+        self.limit = limit
+        self.window = window
+        self._failures: dict[str, deque[float]] = {}
+
+    def _recent(self, key: str, now: float) -> deque[float]:
+        failures = self._failures.setdefault(key, deque())
+        while failures and failures[0] <= now - self.window:
+            failures.popleft()
+        if not failures:
+            del self._failures[key]
+        return failures
+
+    def retry_after(self, key: str, now: float | None = None) -> float:
+        """Seconds the client must wait, 0 if it may try."""
+        now = time.monotonic() if now is None else now
+        failures = self._recent(key, now)
+        if len(failures) < self.limit:
+            return 0.0
+        return failures[0] + self.window - now
+
+    def failed(self, key: str, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        self._recent(key, now)
+        self._failures.setdefault(key, deque()).append(now)
+
+
+def auth_middleware(username: str, password: str, failed_logins: FailedLogins | None = None):
     """HTTP Basic auth when a password is set (browsers ask for it once,
-    and send it with <audio> requests too, unlike a token header)."""
+    and send it with <audio> requests too, unlike a token header).
+
+    Wrong passwords are rate limited (``FailedLogins``); a request without
+    credentials, the browser's first one, does not count."""
+    failed_logins = failed_logins or FailedLogins()
 
     @web.middleware
     async def middleware(request: web.Request, handler) -> web.StreamResponse:
         if password and request.method != "OPTIONS" and request.path != f"{API_PREFIX}/health":
-            if not _authorized(request.headers.get("Authorization", ""), username, password):
+            key = request.remote or "?"
+            wait = failed_logins.retry_after(key)
+            if wait > 0:
+                return _error(429, "too_many_attempts", "Too many wrong passwords, try again later",
+                              {"Retry-After": str(int(wait) + 1)})
+            header = request.headers.get("Authorization", "")
+            if not _authorized(header, username, password):
+                if header:
+                    failed_logins.failed(key)
+                    log.warning("Wrong recordings password from %s", key)
                 return _error(401, "unauthorized", "Authentication required",
                               {"WWW-Authenticate": 'Basic realm="recordings", charset="UTF-8"'})
         return await handler(request)

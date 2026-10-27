@@ -19,6 +19,8 @@ from pathlib import Path
 
 import httpx
 
+from ttsbot.recording.fsutil import write_atomic
+
 log = logging.getLogger("tts_bot")
 
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -149,7 +151,8 @@ class AudioBudget:
                     continue
                 if at >= cutoff:
                     self._entries.append((at, seconds))
-            ledger.write_text("".join(json.dumps(list(e)) + "\n" for e in self._entries), encoding="utf-8")
+            # Atomic: a crash mid-rewrite must not lose the day's billing.
+            write_atomic(ledger, "".join(json.dumps(list(e)) + "\n" for e in self._entries))
 
     def billed(self, seconds: float) -> float:
         return max(seconds, self.min_billed)

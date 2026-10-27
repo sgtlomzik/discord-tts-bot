@@ -24,6 +24,12 @@ if TYPE_CHECKING:
 log = logging.getLogger("tts_bot")
 
 
+def records_guild(guild_id: int) -> bool:
+    """Whether the bot records voice in this guild (RECORDING_GUILD_IDS)."""
+    guilds = config.RECORDING_GUILD_IDS
+    return config.RECORDING_ENABLED and (not guilds or guild_id in guilds)
+
+
 class VoiceCooldown(RuntimeError):
     """A connect or move was refused because a recent one failed.
 
@@ -266,7 +272,7 @@ class VoiceLifecycleMixin:
                     voice_channel.id,
                 )
                 try:
-                    if config.RECORDING_ENABLED:
+                    if records_guild(guild_id):
                         # A deafened member receives no audio.
                         vc = await voice_channel.connect(
                             timeout=60.0, self_deaf=False, cls=RecordingVoiceClient

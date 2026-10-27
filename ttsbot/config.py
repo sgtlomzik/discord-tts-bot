@@ -32,7 +32,7 @@ def setup_logging() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-def parse_user_ids(value: str) -> set[int]:
+def parse_user_ids(value: str, name: str = "WHITELIST_USERS") -> set[int]:
     user_ids: set[int] = set()
     for part in value.replace(";", ",").split(","):
         part = part.strip()
@@ -41,7 +41,7 @@ def parse_user_ids(value: str) -> set[int]:
         try:
             user_ids.add(int(part))
         except ValueError:
-            log.warning("Ignoring invalid WHITELIST_USERS entry: %r", part)
+            log.warning("Ignoring invalid %s entry: %r", name, part)
     return user_ids
 
 
@@ -92,7 +92,7 @@ def reload() -> None:
     global PIPER_MODELS_DIR, PIPER_MODEL_PATH, PIPER_CONFIG_PATH
     global PIPER_SPEAKER, PIPER_LENGTH_SCALE
     global WHITELIST_USERS, OWNER_IDS
-    global RECORDING_ENABLED, RECORDING_DIR, RECORDING_CHUNK_SECONDS
+    global RECORDING_ENABLED, RECORDING_GUILD_IDS, RECORDING_DIR, RECORDING_CHUNK_SECONDS
     global RECORDING_IDLE_CLOSE_SECONDS, RECORDING_PAUSE_MS, RECORDING_VAD_AGGRESSIVENESS
     global RECORDING_AUDIO_KEEP_DAYS, RECORDING_TRANSCRIPT_KEEP_DAYS, RECORDING_PRUNE_INTERVAL_HOURS
     global STT_ENABLED, GROQ_API_KEY, STT_MODEL, STT_LANGUAGE, STT_PROMPT
@@ -183,6 +183,9 @@ def reload() -> None:
     # breathing and silence; 3 was the one that dropped loud breathing in
     # the first live test. Longer gaps become RECORDING_PAUSE_MS of silence.
     RECORDING_ENABLED = _flag("RECORDING_ENABLED", "0")
+    # Guilds whose voice is recorded (comma-separated ids); empty = every
+    # guild the bot joins. Elsewhere the bot joins deafened and only speaks.
+    RECORDING_GUILD_IDS = parse_user_ids(os.getenv("RECORDING_GUILD_IDS", ""), "RECORDING_GUILD_IDS")
     RECORDING_DIR = Path(os.getenv("RECORDING_DIR", str(BOT_CONFIG_PATH.parent / "recordings")))
     RECORDING_CHUNK_SECONDS = _number("RECORDING_CHUNK_SECONDS", 600.0, float, 10.0)
     # 15 min: Groq bills every file for at least 10 s, and a 60 s close
@@ -251,7 +254,7 @@ def reload() -> None:
     WHITELIST_USERS = parse_user_ids(os.getenv("WHITELIST_USERS", DEFAULT_WHITELIST))
     # Who may change settings shared by every guild; the Discord
     # application's owner always may.
-    OWNER_IDS = parse_user_ids(os.getenv("OWNER_IDS", ""))
+    OWNER_IDS = parse_user_ids(os.getenv("OWNER_IDS", ""), "OWNER_IDS")
 
 
 reload()
