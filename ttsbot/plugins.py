@@ -11,9 +11,9 @@ status lists them in.
 
 from __future__ import annotations
 
-from ttsbot import elevenlabs, fish, gemini, minimax
+from ttsbot import elevenlabs, fish, gemini, mai, minimax
 
-PLUGINS = (minimax, fish, gemini, elevenlabs)
+PLUGINS = (minimax, fish, gemini, mai, elevenlabs)
 
 
 def seed_voices(registry) -> bool:

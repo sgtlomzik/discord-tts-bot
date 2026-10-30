@@ -11,8 +11,8 @@ The bot is a single-process Discord service that:
 2. checks whether the author is allowed to use TTS;
 3. turns the message into speakable text (markup, links, emoji, mentions);
 4. queues a TTS job per message, in arrival order;
-5. synthesizes speech with the selected Fish, ElevenLabs, MiniMax, Gemini
-   or Piper voice, falling back along the voice's chain;
+5. synthesizes speech with the selected Fish, ElevenLabs, MiniMax, Gemini,
+   MAI-Voice or Piper voice, falling back along the voice's chain;
 6. turns the result into 20 ms frames: Fish and ElevenLabs Opus packets
    pass through as-is, everything else is decoded to PCM;
 7. plays the frames into a Discord voice channel through one continuous
@@ -81,7 +81,13 @@ The active runtime pieces are:
   deduplication.
 - `ttsbot/elevenlabs.py` - ElevenLabs streaming client, error mapping and
   the API-key ring.
-- `ttsbot/gemini.py` - Gemini TTS through OpenRouter (raw PCM).
+- `ttsbot/openrouter.py` - OpenRouter's `/audio/speech` endpoint shared by
+  its plugins: request, error mapping, raw PCM reading
+  (`OpenRouterSpeechProvider`).
+- `ttsbot/gemini.py` - Gemini TTS through OpenRouter (raw PCM, sent only
+  once the whole clip is generated).
+- `ttsbot/mai.py` - Microsoft MAI-Voice-2.1-Flash through OpenRouter (raw
+  PCM, streamed); seeds the voice `mai-lev` (ru-RU-Lev).
 - `ttsbot/pcm.py` - `PcmFramer`: raw PCM to 48 kHz stereo 20 ms frames
   in-process (soxr), plus the `.pcm` cache format.
 - `ttsbot/voice_registry.py` - the unified voice catalog
@@ -596,6 +602,8 @@ The important current engine-specific values are:
 - `ELEVENLABS_MODEL=eleven_v4_turbo`, `ELEVENLABS_FORMAT=opus_48000_64`,
   `ELEVENLABS_TTFA_TIMEOUT=3`; `ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEYS`
   supplied from `.env`
+- `MAI_TTS_MODEL=microsoft/mai-voice-2.1-flash`, `MAI_TTFA_TIMEOUT=3`;
+  `OPENROUTER_API_KEY` (shared with Gemini) supplied from `.env`
 - `CB_FAILURE_THRESHOLD=3`, `CB_COOLDOWN_SECONDS=60`
 - `TTS_QUOTA_COOLDOWN_SECONDS=1800`
 - `TTS_DEFAULT_VOICE_PROFILE=piper-ruslan`
@@ -620,7 +628,8 @@ It covers:
 Engine-specific suites sit next to it: `test_fish.py` (Fish requests,
 Ogg/Opus demuxing, the mixed Opus/PCM player, cache keys, pitch),
 `test_minimax_quota.py` (quota errors, the long breaker trip, the Fish
-first-audio timeout), `test_gemini.py` and `test_pcm.py` (the PCM path),
+first-audio timeout), `test_gemini.py`, `test_mai.py` and `test_pcm.py`
+(the OpenRouter PCM path),
 `test_elevenlabs.py` (both ElevenLabs paths, error mapping, the key ring)
 and the `test_providers*.py` files.
 
@@ -680,7 +689,10 @@ If the goal is to add a new voice engine, the architecture points that matter mo
 4. make engine selection a profile-level concern, not a scattered global `if`;
 5. keep playback and voice lifecycle unchanged unless the new engine genuinely needs a different artifact format;
 6. add tests around engine selection, fallback, and missing-model behavior;
-7. for a cloud engine, build the httpx client with `provider_limits()` and
+7. a model OpenRouter serves at `/audio/speech` subclasses
+   `OpenRouterSpeechProvider` (`ttsbot/openrouter.py`) and adds only its
+   config, voice id and `stream_spec`, as `gemini.py` and `mai.py` do;
+8. for a cloud engine, build the httpx client with `provider_limits()` and
    call `attach_warmer()` on it (`ttsbot/httpclient.py`), and return the
    provider from `TTSDispatcher.provider_for()`. That gives it the 120 s
    keep-alive and the typing warm-up with no other code.

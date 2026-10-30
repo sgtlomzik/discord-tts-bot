@@ -39,7 +39,7 @@ import httpx
 
 from ttsbot import config as bot_config
 from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
-from ttsbot.gemini import write_wav
+from ttsbot.openrouter import write_wav
 from ttsbot.health import QuotaReport, fingerprint
 from ttsbot.httpclient import attach_warmer, env_setting, provider_limits, retry_after_seconds
 from ttsbot.streams import StreamSpec

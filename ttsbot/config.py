@@ -99,7 +99,7 @@ def reload() -> None:
     global TOKEN, MAX_TEXT_LENGTH, TTS_MAX_CHARS, QUEUE_MAXSIZE
     global TTS_STREAM_TTFA_TIMEOUT
     global FISH_TTFA_TIMEOUT, GEMINI_TTFA_TIMEOUT, GEMINI_TTFA_PER_CHAR
-    global ELEVENLABS_TTFA_TIMEOUT, TTS_CONNECTION_KEEPALIVE_SECONDS
+    global ELEVENLABS_TTFA_TIMEOUT, MAI_TTFA_TIMEOUT, TTS_CONNECTION_KEEPALIVE_SECONDS
     global PROVIDER_HEALTH_PATH, TTS_HEALTH_CHECK_INTERVAL, STATE_DB_PATH
     global TTS_PREFETCH_LOOKAHEAD
     global TTS_IDLE_FRAME_MODE, TTS_IDLE_VOLUME_DB, TTS_STREAM_TAIL_MS
@@ -157,6 +157,9 @@ def reload() -> None:
     # ElevenLabs streams while it generates: first audio measured 0.22-0.26 s
     # (0.66 s on a cold connection) for 2-133 characters, so a flat budget.
     ELEVENLABS_TTFA_TIMEOUT = _number("ELEVENLABS_TTFA_TIMEOUT", 3.0, float, 0.5)
+    # OpenRouter streams MAI-Voice-2.1-Flash: first audio measured 0.56-0.99 s
+    # for 12-253 characters (2026-10-30), so a flat budget too.
+    MAI_TTFA_TIMEOUT = _number("MAI_TTFA_TIMEOUT", 3.0, float, 0.5)
     # While an allowed user sits in the bot's voice channel, ping their cloud
     # provider after this many idle seconds so the TLS connection stays open
     # (a new one costs 0.3-0.5 s through the VPN). ~1 KB per ping, no
