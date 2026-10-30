@@ -256,3 +256,25 @@ def normalize_for_tts(
             cut = cut[:cut.rfind(" ")]  # do not end on half a word
         text = cut.rstrip()
     return text or None
+
+
+def derive_auto_emotion(text: str) -> str:
+    """Heuristic per-message emotion from punctuation/case.
+
+    Used when a voice's emotion is set to ``"auto"``. It is a pure function of
+    the (already normalized) text, which is part of the cache key — so the
+    same text always maps to the same emotion and the cache stays consistent.
+    Returns a MiniMax emotion name (Fish maps it to its own cue), or "" for
+    neutral/no emotion. Shared by the Fish and MiniMax providers.
+    """
+    if not text:
+        return ""
+    stripped = text.strip()
+    letters = [c for c in stripped if c.isalpha()]
+    if len(letters) >= 4 and all(c.isupper() for c in letters):
+        return "angry"  # SHOUTING
+    if "?!" in stripped or "!?" in stripped:
+        return "surprised"
+    if stripped.endswith("!"):
+        return "happy"
+    return ""

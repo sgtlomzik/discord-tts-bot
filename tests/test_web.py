@@ -111,6 +111,30 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await client.get("/api/v1/sessions", headers={"Authorization": f"Basic {good}"})).status, 200)
         self.assertEqual((await client.get("/api/v1/health")).status, 200)  # for the container healthcheck
 
+    async def test_wrong_passwords_are_rate_limited(self):
+        client = await self.client(username="me", password="secret")
+        wrong = {"Authorization": "Basic " + base64.b64encode(b"me:nope").decode()}
+        good = {"Authorization": "Basic " + base64.b64encode(b"me:secret").decode()}
+        for _ in range(5):  # the browser's first, credential-less request does not count
+            self.assertEqual((await client.get("/api/v1/sessions")).status, 401)
+        with self.assertLogs("tts_web", "WARNING"):
+            for _ in range(10):
+                self.assertEqual((await client.get("/api/v1/sessions", headers=wrong)).status, 401)
+        locked = await client.get("/api/v1/sessions", headers=good)
+        self.assertEqual(locked.status, 429)
+        self.assertGreater(int(locked.headers["Retry-After"]), 0)
+        self.assertEqual((await client.get("/api/v1/health")).status, 200)
+
+    def test_failed_logins_expire_after_the_window(self):
+        from ttsbot.web.app import FailedLogins
+
+        limiter = FailedLogins(limit=3, window=60.0)
+        for at in (0.0, 1.0, 2.0):
+            limiter.failed("ip", now=at)
+        self.assertAlmostEqual(limiter.retry_after("ip", now=3.0), 57.0)
+        self.assertEqual(limiter.retry_after("ip", now=60.5), 0.0)  # the first one aged out
+        self.assertEqual(limiter.retry_after("other", now=3.0), 0.0)
+
     async def test_cors_for_listed_origins_only(self):
         client = await self.client(cors_origins=("http://localhost:5173",), password="secret")
         preflight = await client.options("/api/v1/sessions", headers={

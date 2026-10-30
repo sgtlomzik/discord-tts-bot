@@ -121,7 +121,7 @@ class LocalProvider:
 def load_circuit_breaker_from_env() -> CircuitBreaker:
     """Build a CircuitBreaker from the ``CB_*`` and ``TTS_*_RECHECK`` env vars."""
     def number(name: str, default: str) -> float:
-        return float(os.getenv(name, "").strip() or default)
+        return bot_config._number(name, float(default), float)
 
     return CircuitBreaker(
         CircuitBreakerConfig(
@@ -172,8 +172,8 @@ class TTSCacheConfig:
 def load_cache_config_from_env() -> TTSCacheConfig:
     enabled_raw = os.getenv("TTS_CACHE_ENABLED", "0").strip().lower()
     enabled = enabled_raw in ("1", "true", "yes", "on")
-    max_bytes = int(os.getenv("TTS_CACHE_MAX_BYTES", str(_DEFAULT_CACHE_MAX_BYTES)))
-    max_entries = int(os.getenv("TTS_CACHE_MAX_ENTRIES", "0"))
+    max_bytes = bot_config._number("TTS_CACHE_MAX_BYTES", _DEFAULT_CACHE_MAX_BYTES, int, 0)
+    max_entries = bot_config._number("TTS_CACHE_MAX_ENTRIES", 0, int, 0)
     cache_dir_raw = os.getenv("TTS_CACHE_DIR", _DEFAULT_CACHE_DIR).strip()
     cache_dir = Path(cache_dir_raw) if cache_dir_raw else Path(_DEFAULT_CACHE_DIR)
     return TTSCacheConfig(
@@ -443,9 +443,12 @@ def voice_cache_key(voice) -> str:
 def load_dispatcher_config_from_env() -> DispatcherConfig:
     """Build a ``DispatcherConfig`` from ``TTS_QUOTA_COOLDOWN_SECONDS``."""
     return DispatcherConfig(
-        quota_cooldown_seconds=max(0.0, float(os.getenv(
-            "TTS_QUOTA_COOLDOWN_SECONDS", os.getenv("MINIMAX_QUOTA_COOLDOWN_SECONDS", "1800"),
-        ))),
+        quota_cooldown_seconds=bot_config._number(
+            "TTS_QUOTA_COOLDOWN_SECONDS",
+            bot_config._number("MINIMAX_QUOTA_COOLDOWN_SECONDS", 1800.0, float, 0.0),
+            float,
+            0.0,
+        ),
     )
 
 

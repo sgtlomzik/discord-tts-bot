@@ -18,6 +18,7 @@ from ttsbot import config as bot_config
 from ttsbot.errors import AuthError, QuotaExhaustedError, RateLimitError, RequestError
 from ttsbot.httpclient import attach_warmer, env_setting, provider_limits, retry_after_seconds
 from ttsbot.streams import StreamSpec
+from ttsbot.textnorm import derive_auto_emotion
 from ttsbot import voice_registry
 
 log = logging.getLogger("tts_bot")
@@ -119,15 +120,7 @@ def _http_error(what: str, status_code: int, detail: str, retry_after: str | Non
 def fish_tts_text(text: str, emotion: str) -> str:
     """Apply S2 emotion cues after Discord text normalization."""
     if emotion == "auto":
-        letters = [ch for ch in text if ch.isalpha()]
-        if len(letters) >= 4 and all(ch.isupper() for ch in letters):
-            emotion = "angry"
-        elif "?!" in text or "!?" in text:
-            emotion = "surprised"
-        elif text.rstrip().endswith("!"):
-            emotion = "happy"
-        else:
-            emotion = ""
+        emotion = derive_auto_emotion(text)
     emotion = {"fearful": "scared", "neutral": "indifferent"}.get(emotion, emotion)
     return f"[{emotion}] {text}" if emotion else text
 

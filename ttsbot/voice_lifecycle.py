@@ -18,9 +18,16 @@ from ttsbot import config
 from ttsbot.recording.client import RecordingVoiceClient
 
 if TYPE_CHECKING:
+    from ttsbot.session import GuildSession
     from ttsbot.store import BotConfigStore
 
 log = logging.getLogger("tts_bot")
+
+
+def records_guild(guild_id: int) -> bool:
+    """Whether the bot records voice in this guild (RECORDING_GUILD_IDS)."""
+    guilds = config.RECORDING_GUILD_IDS
+    return config.RECORDING_ENABLED and (not guilds or guild_id in guilds)
 
 
 class VoiceCooldown(RuntimeError):
@@ -38,6 +45,8 @@ class VoiceLifecycleMixin:
         # Provided by TTSBot and discord.Client; declared for the type checker.
         config_store: BotConfigStore
         rejoin_task: asyncio.Task | None
+
+        def session_for(self, guild_id: int) -> GuildSession: ...
 
         @property
         def guilds(self) -> Sequence[discord.Guild]: ...
@@ -152,31 +161,34 @@ class VoiceLifecycleMixin:
                     log.debug("Skip idle disconnect guild=%s reason=playback_active", guild.id)
                     return
 
-            vc = discord.utils.get(self.voice_clients, guild=guild)
-            if not vc or not vc.is_connected():
-                return
+            # Under the connect lock: a connect or move that is in progress
+            # finishes first, and the checks below see where it landed.
+            async with self.get_voice_connect_lock(guild.id):
+                vc = discord.utils.get(self.voice_clients, guild=guild)
+                if not vc or not vc.is_connected():
+                    return
 
-            if self.has_active_voice_playback(guild.id, vc):
-                log.debug("Skip idle disconnect guild=%s reason=playback_active", guild.id)
-                return
+                if self.has_active_voice_playback(guild.id, vc):
+                    log.debug("Skip idle disconnect guild=%s reason=playback_active", guild.id)
+                    return
 
-            channel = vc.channel if isinstance(vc.channel, discord.VoiceChannel) else None
-            if self._whitelisted_user_in_channel(guild, channel):
-                log.debug(
-                    "Cancel idle disconnect guild=%s reason=whitelisted_user_present",
-                    guild.id,
-                )
-                return
+                channel = vc.channel if isinstance(vc.channel, discord.VoiceChannel) else None
+                if self._whitelisted_user_in_channel(guild, channel):
+                    log.debug(
+                        "Cancel idle disconnect guild=%s reason=whitelisted_user_present",
+                        guild.id,
+                    )
+                    return
 
-            source = self.session_for(guild.id).take_player()
-            if source:
-                source.stop()
-                if vc.is_playing() or vc.is_paused():
-                    vc.stop()
+                source = self.session_for(guild.id).take_player()
+                if source:
+                    source.stop()
+                    if vc.is_playing() or vc.is_paused():
+                        vc.stop()
 
-            await vc.disconnect(force=True)
-            self.suppress_auto_connect(guild.id, "idle_disconnect")
-            log.info("Idle disconnect executed guild=%s", guild.id)
+                await vc.disconnect(force=True)
+                self.suppress_auto_connect(guild.id, "idle_disconnect")
+                log.info("Idle disconnect executed guild=%s", guild.id)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -260,7 +272,7 @@ class VoiceLifecycleMixin:
                     voice_channel.id,
                 )
                 try:
-                    if config.RECORDING_ENABLED:
+                    if records_guild(guild_id):
                         # A deafened member receives no audio.
                         vc = await voice_channel.connect(
                             timeout=60.0, self_deaf=False, cls=RecordingVoiceClient
@@ -340,15 +352,18 @@ class VoiceLifecycleMixin:
         source = self.session_for(guild.id).take_player()
         if source:
             source.stop()
-        vc = discord.utils.get(self.voice_clients, guild=guild)
-        if not vc:
-            return
-        try:
-            await vc.disconnect(force=True)
-            self.suppress_auto_connect(guild.id, "explicit_disconnect")
-            log.info("Voice disconnected guild=%s", guild.id)
-        except Exception:
-            log.exception("Voice disconnect cleanup failed")
+        # The audio stops at once; the disconnect waits for a connect or
+        # move in progress, which would otherwise land after it.
+        async with self.get_voice_connect_lock(guild.id):
+            vc = discord.utils.get(self.voice_clients, guild=guild)
+            if not vc:
+                return
+            try:
+                await vc.disconnect(force=True)
+                self.suppress_auto_connect(guild.id, "explicit_disconnect")
+                log.info("Voice disconnected guild=%s", guild.id)
+            except Exception:
+                log.exception("Voice disconnect cleanup failed")
 
     def schedule_voice_rejoin(self, reason: str) -> None:
         """Rejoin occupied voice channels in the background (see below)."""

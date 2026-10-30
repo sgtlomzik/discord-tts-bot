@@ -213,6 +213,22 @@ class ContinuousTTSAudioSource(discord.AudioSource):
         for frame in frames:
             self.frames.put(frame)
 
+    def clear(self) -> int:
+        """Drop the frames not played yet, so a cleared queue also cuts the
+        phrase being spoken; the player goes on with idle frames. Returns
+        how many frames were dropped."""
+        dropped = 0
+        with self._lock:
+            while True:
+                try:
+                    self.frames.get_nowait()
+                except thread_queue.Empty:
+                    break
+                dropped += 1
+            self._pending_frames = 0
+            self._drained.set()
+        return dropped
+
     async def wait_until_drained(self, timeout: float | None = None) -> bool:
         return await asyncio.to_thread(self._drained.wait, timeout)
 

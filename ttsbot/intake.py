@@ -94,7 +94,14 @@ class MessageQueueMixin:
                                message_ts=time.perf_counter(), mentions=mentions)
 
     def clear_queue_for_guild(self, guild_id: int) -> int:
-        """Drop the guild's queued messages and cancel the ones in flight
-        (neither played nor finishing their generation); return how many."""
+        """Drop the guild's queued messages, cancel the ones in flight and cut
+        the phrase being spoken; return how many messages were dropped."""
         session = self.sessions.get(guild_id)
-        return session.cancel_all() if session is not None else 0
+        if session is None:
+            return 0
+        cleared = session.cancel_all()
+        # Cancelling stops feeding the player, but the frames it already
+        # holds (seconds of speech) would still play out.
+        if session.player is not None:
+            session.player.clear()
+        return cleared

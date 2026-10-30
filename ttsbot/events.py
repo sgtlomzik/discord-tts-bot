@@ -12,6 +12,7 @@ from datetime import datetime
 import discord
 
 from ttsbot import config
+from ttsbot.core import COMMAND_PREFIXES
 from ttsbot.models import VOICE_PROFILES
 from ttsbot.textnorm import build_mention_say_map
 
@@ -50,6 +51,7 @@ def register_events(bot):
 
         if (
             message.guild is not None
+            and not message.content.startswith(COMMAND_PREFIXES)
             and bot.config_store.is_enabled(message.guild.id)
             and bot.config_store.is_allowed(message.guild.id, message.author.id)
             and message.author.voice

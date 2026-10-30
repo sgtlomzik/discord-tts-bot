@@ -52,7 +52,12 @@ def write_atomic(path: Path, text: str) -> None:
     one, never half of it."""
     tmp = path.with_name(f".{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
     try:
-        tmp.write_text(text, encoding="utf-8", newline="\n")
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            # On disk before the rename: after a power cut the file is the
+            # old one or the new one, not an empty one.
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)

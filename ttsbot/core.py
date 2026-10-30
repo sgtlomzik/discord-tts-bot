@@ -49,6 +49,9 @@ intents.message_content = True
 intents.voice_states = True
 intents.guilds = True
 
+# Prefix commands (!tts join, !tts stop, ...); on_message does not speak them.
+COMMAND_PREFIXES = ("!tts ", "!tts")
+
 
 class TTSBot(
     VoiceLifecycleMixin,
@@ -58,7 +61,7 @@ class TTSBot(
     commands.Bot,
 ):
     def __init__(self) -> None:
-        super().__init__(command_prefix=("!tts ", "!tts"), intents=intents)
+        super().__init__(command_prefix=COMMAND_PREFIXES, intents=intents)
         self.started_at = time.time()  # process start, for the stats uptime
         # The /voicebot command group; attached by the composition root
         # (bot.py) before the bot starts, added to the tree in setup_hook.
