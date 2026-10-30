@@ -59,7 +59,12 @@ class StateDB:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._conn = sqlite3.connect(str(path), isolation_level=None)
-            self._conn.execute("PRAGMA synchronous = FULL")
+            if not in_memory:
+                # WAL + NORMAL: a commit no longer fsyncs (saves ran on the
+                # event loop); the database stays consistent after a crash
+                # or power cut, only the last commits may be lost.
+                self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.execute("PRAGMA synchronous = NORMAL")
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version > SCHEMA_VERSION:
                 raise StateFileError(

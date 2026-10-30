@@ -1,6 +1,6 @@
 # TTS Bot Current State
 
-Updated: 2026-10-24
+Updated: 2026-10-30
 
 ## Summary
 
@@ -8,7 +8,9 @@ The Discord TTS bot runs as two Docker services from one image
 (`ghcr.io/sgtlomzik/discord-tts-bot`):
 
 - `discord_tts_bot` (`tts_bot`): speaks allowed users' messages in voice,
-  records the voice channel and transcribes it with Groq Whisper.
+  records the voice channel and transcribes it with Groq Whisper. It
+  records only in the home guild (`RECORDING_GUILD_IDS=1030870431181312060`)
+  and rejoins occupied voice channels after a restart or reconnect.
 - `discord_tts_web` (`tts_web`): the read-only recordings website
   (`python -m ttsbot.web`, see [RECORDINGS_WEB.md](../RECORDINGS_WEB.md)).
 
@@ -18,17 +20,37 @@ How the code is organised is described in [ARCHITECTURE.md](../ARCHITECTURE.md).
 
 - Compose files: `docker-compose.yml` plus an untracked
   `docker-compose.override.yml` that puts the bot on the gluetun VPN
-  (`network_mode: container:gluetun`).
+  (`network_mode: container:gluetun`) and attaches `tts_web` to
+  nginx_proxy_manager's network (`global_npm_network`).
 - Image tag: `TTS_IMAGE_TAG` in `.env`, used by both services. CI
   (`.github/workflows/docker.yml`) publishes `latest` and `sha-<short sha>`
   for every push to `main`; production pins a `sha-` tag.
 - Runtime config: `.env` (untracked, mode 600).
-- State in `data/` (untracked): `state.db` (SQLite: guild settings,
-  voice catalog and fallback chain, provider pauses; the `config.json`,
-  `voices.json` and `provider_health.json` of earlier versions were
-  imported into it once and are no longer read),
-  `tts_cache/`, `recordings/`.
+- State in `data/` (untracked): `state.db` (SQLite in WAL mode, mode 600:
+  guild settings, voice catalog and fallback chain, provider pauses),
+  `tts_cache/`, `recordings/`. The `config.json`, `voices.json` and
+  `provider_health.json` of earlier versions were imported once; they and
+  older backups are in `/root/backups/tts-bot-2026-10/`.
+- Logs: `docker logs` (json-file, 5 x 20 MB per service); set
+  `LOG_FILE=/app/data/logs/bot.log` to keep a rotating copy across
+  container recreation.
 - Models: `models/` (Piper ONNX voices, read-only mount).
+
+## Recordings website ("Эхо")
+
+The site's port is bound to 127.0.0.1 (`WEB_BIND=127.0.0.1` in `.env`);
+nothing is forwarded from the internet (the OpenWrt router has no DNAT to
+the server and rejects wan -> lan).
+
+- LAN: `http://echo` / `echo.lan` / `echo.konev.site` via
+  nginx_proxy_manager (`/data/nginx/custom/http.conf`,
+  `proxy_pass http://discord_tts_web:8095`). Plain HTTP on the home LAN.
+- Tailnet: `https://homelab-st-1.tail25eb37.ts.net:8443`
+  (`tailscale serve --bg --https=8443 http://127.0.0.1:8095` in the
+  `tailscaled` container; 443 is taken by nginx_proxy_manager). Tailnet
+  only, no Funnel.
+- Basic auth (`WEB_USERNAME` / `WEB_PASSWORD`); 10 wrong passwords in
+  5 minutes give 429.
 
 ## Voices and providers
 
@@ -41,7 +63,9 @@ How the code is organised is described in [ARCHITECTURE.md](../ARCHITECTURE.md).
 
 ## Deploying
 
-1. Merge to `main`; wait for the Docker workflow.
+1. Merge to `main`; wait for the Docker workflow. Open every PR against
+   `main`: a PR based on another PR's branch merges into that branch, not
+   into `main`.
 2. Set `TTS_IMAGE_TAG=sha-<short sha>` in `.env`.
 3. `docker compose pull && docker compose up -d`.
 4. Check `docker logs --tail 100 discord_tts_bot` and `docker ps`.

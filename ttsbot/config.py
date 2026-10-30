@@ -9,6 +9,7 @@ latency) live in ``BotConfigStore``.
 """
 
 import logging
+import logging.handlers
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -27,6 +28,26 @@ DEFAULT_WHITELIST = ""
 
 def setup_logging() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format=LOG_FORMAT)
+    # The container log is lost when the container is recreated (every
+    # deploy), and the latency lines live only there: LOG_FILE keeps a
+    # rotating copy, e.g. /app/data/logs/bot.log (LOG_FILE_MAX_MB x
+    # LOG_FILE_BACKUPS files).
+    log_file = os.getenv("LOG_FILE", "").strip()
+    if log_file:
+        path = Path(log_file)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                path,
+                maxBytes=_number("LOG_FILE_MAX_MB", 20, int, 1) * 1024 * 1024,
+                backupCount=_number("LOG_FILE_BACKUPS", 5, int, 1),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            log.warning("LOG_FILE %s cannot be written (%s); logging to stdout only", path, exc)
+        else:
+            handler.setFormatter(logging.Formatter(LOG_FORMAT))
+            logging.getLogger().addHandler(handler)
     # Every provider request gets a richer "<Provider> HTTP ..." line from
     # ttsbot.httpclient (connection reuse, idle time, header latency).
     logging.getLogger("httpx").setLevel(logging.WARNING)
