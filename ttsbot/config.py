@@ -67,7 +67,7 @@ def parse_user_ids(value: str, name: str = "WHITELIST_USERS") -> set[int]:
 
 
 def _flag(name: str, default: str) -> bool:
-    return os.getenv(name, default).strip().lower() not in {"0", "false", "no"}
+    return os.getenv(name, default).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _number(
@@ -105,7 +105,7 @@ def reload() -> None:
     global TTS_IDLE_FRAME_MODE, TTS_IDLE_VOLUME_DB, TTS_STREAM_TAIL_MS
     global TTS_MAX_CONTINUOUS_IDLE_SECONDS, IDLE_DISCONNECT_SECONDS
     global TTS_AUTO_CONNECT_ENABLED, AUTO_CONNECT_SUPPRESS_SECONDS
-    global TTS_TRIM_SILENCE
+    global TTS_TRIM_SILENCE, TTS_NUMBERS
     global TTS_QUEUE_PUT_TIMEOUT_MS
     global TTS_AUDIO_LIMIT_ENABLED, TTS_AUDIO_CHARS_PER_SECOND
     global TTS_AUDIO_LIMIT_SAFETY, TTS_AUDIO_LIMIT_MIN_SECONDS
@@ -183,6 +183,8 @@ def reload() -> None:
     TTS_AUTO_CONNECT_ENABLED = _flag("TTS_AUTO_CONNECT_ENABLED", "1")
     AUTO_CONNECT_SUPPRESS_SECONDS = _number("TTS_AUTO_CONNECT_SUPPRESS_SECONDS", 30, int)
     TTS_TRIM_SILENCE = _flag("TTS_TRIM_SILENCE", "1")
+    # Numbers in Russian messages spoken as Russian words (ttsbot/numerals.py).
+    TTS_NUMBERS = _flag("TTS_NUMBERS", "1")
     TTS_QUEUE_PUT_TIMEOUT_MS = _number("TTS_QUEUE_PUT_TIMEOUT_MS", 500, int)
     # Playback length guard: MiniMax occasionally "stutters" and streams one
     # sound forever. We cap playback at a rough estimate of how long the text

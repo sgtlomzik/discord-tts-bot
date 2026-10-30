@@ -34,6 +34,10 @@ The active runtime pieces are:
     `reload()`; runtime code reads `config.NAME` at call time.
   - `textnorm.py` - Discord markup stripping, emoji aliases, mention
     resolution, one cleanup behind `speakable_text` and `normalize_for_tts`.
+  - `numerals.py` - the cleanup's last step (`TTS_NUMBERS`): numbers
+    spelled out as Russian words in agreement with the preposition before
+    them and the noun after them (num2words, pymorphy3), except in English
+    text; `scripts/bench_numerals.py` measures what it costs.
   - `models.py` - `VoiceProfile`, `GuildConfig`, `TTSJob`,
     `PreparedAudio` and the hardcoded Piper `VOICE_PROFILES`.
   - `store.py` - `BotConfigStore` (guild settings in data/state.db; a failed
@@ -120,7 +124,8 @@ configured `tts-connection-keepalive`, `tts-provider-health` and
 lets a message in when the guild has TTS on, the author is
 allowed (the guild's list or `WHITELIST_USERS`, unless the guild denied
 them) and is in a voice channel. `queue_message()` hands the raw text and
-its resolved mentions to `enqueue_tts()`, which cleans it once, applies
+its resolved mentions to `enqueue_tts()`, which cleans it once (numbers
+become words: "с 5 до 7" is "с пяти до семи"), applies
 the length cap (`/voicebot limit`, else `TTS_MAX_CHARS`) and queues a
 `TTSJob`. Every message is queued as it arrives; nothing is held back
 or merged.

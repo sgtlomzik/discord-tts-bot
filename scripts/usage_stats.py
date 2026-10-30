@@ -130,7 +130,7 @@ def match_events(events: list[QueuedEvent], messages: list[Message]) -> list[Que
     """Mark the Discord message behind each log event as voiced.
 
     A match is the nearest not-yet-used message in the same channel whose raw
-    length equals the logged ``chars`` and which was sent no later than
+    or generated length equals the logged ``chars`` and which was sent no later than
     ``MATCH_WINDOW_S`` before the log line. Returns the events left unmatched.
     """
     by_channel: dict[int, list[Message]] = defaultdict(list)
@@ -141,7 +141,10 @@ def match_events(events: list[QueuedEvent], messages: list[Message]) -> list[Que
         best: Message | None = None
         for msg in by_channel.get(ev.channel_id, ()):
             lag = (ev.ts - msg.ts).total_seconds()
-            if msg.voiced or len(msg.raw) != ev.raw_chars or not -1.0 <= lag <= MATCH_WINDOW_S:
+            # The log has the cleaned length: the raw one for most messages
+            # voiced before numbers were spelled out, the generated one since.
+            lengths = (len(msg.raw), len(msg.generated or ""))
+            if msg.voiced or ev.raw_chars not in lengths or not -1.0 <= lag <= MATCH_WINDOW_S:
                 continue
             if best is None or abs(lag) < abs((ev.ts - best.ts).total_seconds()):
                 best = msg
