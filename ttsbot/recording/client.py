@@ -12,6 +12,7 @@ Those are internal APIs, so requirements.txt pins discord.py.
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import logging
 import threading
@@ -89,6 +90,16 @@ class RecordingVoiceClient(discord.VoiceClient):
             self._reset_streams()
             await self.client.loop.run_in_executor(None, recorder.stop)
             self._start_recording()
+
+    async def stop_recording(self) -> None:
+        """Finish the recording and wait until its files are closed.
+
+        cleanup() hands the stop to a daemon thread, which a process that
+        is exiting does not wait for; the bot's close() calls this first.
+        """
+        recorder, self._recorder = self._recorder, None  # _on_packet now drops packets
+        if recorder is not None:
+            await asyncio.to_thread(recorder.stop)
 
     def cleanup(self) -> None:
         recorder, self._recorder = self._recorder, None

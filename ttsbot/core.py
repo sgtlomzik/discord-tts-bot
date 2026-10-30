@@ -239,6 +239,17 @@ class TTSBot(
         for session in self.sessions.values():
             for task in list(session.generating):
                 task.cancel()
+        # Close the recordings' files while the voice clients are still up;
+        # the disconnect in super().close() would leave that to a thread
+        # the exiting process does not wait for.
+        for voice_client in list(self.voice_clients):
+            stop_recording = getattr(voice_client, "stop_recording", None)
+            if stop_recording is None:
+                continue
+            try:
+                await stop_recording()
+            except Exception:
+                log.exception("Recording did not finish cleanly")
         transcriber = getattr(self, "transcriber", None)
         if transcriber is not None:
             await transcriber.aclose()

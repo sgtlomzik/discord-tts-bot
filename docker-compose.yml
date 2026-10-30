@@ -15,6 +15,9 @@ services:
     # an untracked docker-compose.override.yml — compose merges it in
     # automatically.
     restart: unless-stopped
+    # On SIGTERM the bot closes its open recordings (each writer gets up
+    # to 10 s) before it exits; docker's default 10 s is too short.
+    stop_grace_period: 30s
     logging: &logging
       driver: json-file
       options:
