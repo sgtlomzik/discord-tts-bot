@@ -9,11 +9,16 @@ voice lifecycle policy.
 import asyncio
 import logging
 import time
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import discord
 
 from ttsbot import config
 from ttsbot.recording.client import RecordingVoiceClient
+
+if TYPE_CHECKING:
+    from ttsbot.store import BotConfigStore
 
 log = logging.getLogger("tts_bot")
 
@@ -28,6 +33,14 @@ class VoiceCooldown(RuntimeError):
 
 class VoiceLifecycleMixin:
     """Voice connect/disconnect policy; mixed into TTSBot."""
+
+    if TYPE_CHECKING:
+        # Provided by TTSBot and discord.Client; declared for the type checker.
+        config_store: BotConfigStore
+        rejoin_task: asyncio.Task | None
+
+        @property
+        def guilds(self) -> Sequence[discord.Guild]: ...
 
     def cancel_idle_disconnect(self, guild_id: int) -> None:
         session = self.sessions.get(guild_id)
@@ -336,6 +349,51 @@ class VoiceLifecycleMixin:
             log.info("Voice disconnected guild=%s", guild.id)
         except Exception:
             log.exception("Voice disconnect cleanup failed")
+
+    def schedule_voice_rejoin(self, reason: str) -> None:
+        """Rejoin occupied voice channels in the background (see below)."""
+        if self.rejoin_task is not None and not self.rejoin_task.done():
+            return
+        self.rejoin_task = asyncio.create_task(self.rejoin_occupied_voice(reason), name="voice-rejoin")
+
+    async def rejoin_occupied_voice(self, reason: str) -> None:
+        """Join allowed members already sitting in voice.
+
+        Auto-connect only reacts to a member joining or switching a channel,
+        so after a restart, or a gateway outage long enough to drop the voice
+        connection, the bot stayed out (and nothing was recorded) until
+        someone moved. Runs on every on_ready: in each guild the bot is not
+        connected in, it picks the voice channel with the most allowed
+        members and goes through auto_connect_for_member and its checks.
+        """
+        for guild in list(self.guilds):
+            try:
+                if not config.TTS_AUTO_CONNECT_ENABLED or not self.config_store.is_enabled(guild.id):
+                    continue
+                vc = guild.voice_client
+                if isinstance(vc, discord.VoiceClient) and vc.is_connected():
+                    continue
+                best: discord.VoiceChannel | None = None
+                best_allowed: list[discord.Member] = []
+                for channel in guild.voice_channels:
+                    allowed = [
+                        user for user in channel.members
+                        if not user.bot and self.config_store.is_allowed(guild.id, user.id)
+                    ]
+                    if len(allowed) > len(best_allowed):
+                        best, best_allowed = channel, allowed
+                if best is None:
+                    continue
+                log.info(
+                    "Rejoining occupied voice guild=%s channel=%s allowed=%s reason=%s",
+                    guild.id,
+                    best.id,
+                    len(best_allowed),
+                    reason,
+                )
+                await self.auto_connect_for_member(best_allowed[0], best)
+            except Exception:
+                log.exception("Voice rejoin failed guild=%s reason=%s", guild.id, reason)
 
     async def auto_connect_for_member(self, member: discord.Member, channel: discord.VoiceChannel) -> None:
         if not config.TTS_AUTO_CONNECT_ENABLED:

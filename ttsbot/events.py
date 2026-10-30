@@ -39,6 +39,8 @@ def register_events(bot):
             config.TTS_STREAM_TAIL_MS,
             config.TTS_MAX_CONTINUOUS_IDLE_SECONDS,
         )
+        # on_ready fires again after a reconnect that could not resume.
+        bot.schedule_voice_rejoin("ready")
 
 
     @bot.event

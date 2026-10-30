@@ -6,6 +6,7 @@ The behavior lives in four concern mixins; this module owns construction
 are attached from the outside by the composition root (bot.py).
 """
 
+import asyncio
 import logging
 import time
 import zoneinfo
@@ -70,6 +71,8 @@ class TTSBot(
         # One session per guild: its queue, prefetch, player and voice
         # state; its workers start with the guild's first message.
         self.sessions: dict[int, GuildSession] = {}
+        # Rejoining occupied voice channels after (re)connecting to Discord.
+        self.rejoin_task: asyncio.Task | None = None
         # Guild settings, the voice catalog and provider pauses live in one
         # SQLite file (data/state.db); the JSON files of earlier versions
         # are imported into it once. A missing data directory is created;
