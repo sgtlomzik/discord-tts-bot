@@ -1,4 +1,4 @@
-"""Unified voice registry: Piper, MiniMax, Fish, Gemini and ElevenLabs voices as profiles.
+"""Unified voice registry: Piper, MiniMax, Fish, Gemini, MAI and ElevenLabs voices as profiles.
 
 It also holds the fallback chain: which voices speak a message, in order,
 when the selected voice cannot (provider paused, quota used up, error
@@ -45,6 +45,7 @@ PROVIDER_PIPER = "piper"
 PROVIDER_MINIMAX = "minimax"
 PROVIDER_FISH = "fish"
 PROVIDER_GEMINI = "gemini"
+PROVIDER_MAI = "mai"
 PROVIDER_ELEVENLABS = "elevenlabs"
 
 
@@ -92,6 +93,15 @@ class GeminiParams:
 
 
 @dataclass(frozen=True)
+class MaiParams:
+    # "ru-RU-Lev" gets the model's suffix (":MAI-Voice-2.1-Flash");
+    # a full id with its own suffix is sent as it is.
+    voice: str = "ru-RU-Lev"
+    model: str = ""  # empty: use the configured MAI_TTS_MODEL
+    volume_db: float = 0.0  # applied locally, not sent to the API
+
+
+@dataclass(frozen=True)
 class ElevenLabsParams:
     voice_id: str = ""
     model: str = ""  # empty: use the configured ELEVENLABS_MODEL
@@ -105,12 +115,13 @@ class VoiceRecord:
     name: str
     label: str
     description: str
-    provider: str  # PROVIDER_PIPER | _MINIMAX | _FISH | _GEMINI | _ELEVENLABS
+    provider: str  # PROVIDER_PIPER | _MINIMAX | _FISH | _GEMINI | _MAI | _ELEVENLABS
     piper: Optional[PiperParams] = None
     minimax: Optional[MiniMaxParams] = None
     fish: Optional[FishParams] = None
     gemini: Optional[GeminiParams] = None
     elevenlabs: Optional[ElevenLabsParams] = None
+    mai: Optional[MaiParams] = None
     # Voices to try, in order, when this one cannot speak a message.
     # None: the registry's fallback_chain; (): no fallback.
     fallback: Optional[tuple[str, ...]] = None
@@ -134,6 +145,10 @@ class VoiceRecord:
     @property
     def is_elevenlabs(self) -> bool:
         return self.provider == PROVIDER_ELEVENLABS
+
+    @property
+    def is_mai(self) -> bool:
+        return self.provider == PROVIDER_MAI
 
 
 @dataclass
@@ -255,6 +270,8 @@ def _record_to_dict(r: VoiceRecord) -> dict:
             "stability": r.elevenlabs.stability,
             "similarity_boost": r.elevenlabs.similarity_boost,
         }
+    if r.mai is not None:
+        out["mai"] = {"voice": r.mai.voice, "model": r.mai.model, "volume_db": r.mai.volume_db}
     if r.fallback is not None:
         out["fallback"] = list(r.fallback)
     return out
@@ -353,6 +370,20 @@ def _gemini_from_dict(d: dict) -> GeminiParams:
     )
 
 
+def _mai_from_dict(d: dict) -> MaiParams:
+    if not isinstance(d, dict):
+        d = {}
+    try:
+        volume_db = float(d["volume_db"]) if d.get("volume_db") is not None else 0.0
+    except (TypeError, ValueError):
+        volume_db = 0.0
+    return MaiParams(
+        voice=str(d.get("voice", "") or ""),
+        model=str(d.get("model", "") or ""),
+        volume_db=volume_db,
+    )
+
+
 def _elevenlabs_from_dict(d: dict) -> ElevenLabsParams:
     if not isinstance(d, dict):
         d = {}
@@ -377,7 +408,7 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
         return None
     provider = str(d.get("provider", "")).strip().lower()
     if provider not in (
-        PROVIDER_PIPER, PROVIDER_MINIMAX, PROVIDER_FISH, PROVIDER_GEMINI, PROVIDER_ELEVENLABS,
+        PROVIDER_PIPER, PROVIDER_MINIMAX, PROVIDER_FISH, PROVIDER_GEMINI, PROVIDER_MAI, PROVIDER_ELEVENLABS,
     ):
         log.warning("Voice catalog: skipping %r with unknown provider %r", name, provider)
         return None
@@ -393,6 +424,7 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
         _elevenlabs_from_dict(d.get("elevenlabs") or {})
         if provider == PROVIDER_ELEVENLABS else None
     )
+    mai = _mai_from_dict(d.get("mai") or {}) if provider == PROVIDER_MAI else None
     if provider == PROVIDER_MINIMAX and not (minimax and minimax.voice_id):
         log.warning("Voice catalog: skipping minimax voice %r with no voice_id", name)
         return None
@@ -405,6 +437,9 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
     if provider == PROVIDER_ELEVENLABS and not (elevenlabs and elevenlabs.voice_id):
         log.warning("Voice catalog: skipping elevenlabs voice %r with no voice_id", name)
         return None
+    if provider == PROVIDER_MAI and not (mai and mai.voice):
+        log.warning("Voice catalog: skipping mai voice %r with no voice", name)
+        return None
     return VoiceRecord(
         name=name,
         label=label,
@@ -415,6 +450,7 @@ def _record_from_dict(name: str, d: dict) -> Optional[VoiceRecord]:
         fish=fish,
         gemini=gemini,
         elevenlabs=elevenlabs,
+        mai=mai,
         fallback=_names(d.get("fallback")),
     )
 

@@ -39,7 +39,7 @@ class PluginTests(unittest.TestCase):
             return plugins.create_providers(self.store)
 
     def test_every_plugin_answers_in_registration_order(self):
-        self.assertEqual(list(self._providers()), ["minimax", "fish", "gemini", "elevenlabs"])
+        self.assertEqual(list(self._providers()), ["minimax", "fish", "gemini", "mai", "elevenlabs"])
 
     def test_only_configured_providers_are_built(self):
         providers = self._providers(FISH_API_KEY="fk", FISH_REFERENCE_ID="ref")

@@ -104,7 +104,7 @@ Everything is configured through environment variables — see
 | `FISH_REFERENCE_ID` | Fish voice ID; seeds the `fish-default` profile |
 | `FISH_TTFA_TIMEOUT` | Seconds to wait for Fish's first audio packet before Piper (default 5) |
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEYS` | Enables ElevenLabs; several keys form a ring (see below) |
-| `OPENROUTER_API_KEY` | Enables Gemini voices through OpenRouter (optional) |
+| `OPENROUTER_API_KEY` | Enables Gemini and MAI-Voice voices through OpenRouter (optional) |
 | `TTS_QUOTA_COOLDOWN_SECONDS` | Pause a cloud provider after a balance/plan error (default 1800) |
 | `OWNER_IDS` | Users who may change settings shared by every server (the bot's application owner always may) |
 

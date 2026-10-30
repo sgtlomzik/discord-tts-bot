@@ -138,6 +138,8 @@ def _provider_tag(rec) -> str:
         return "Fish Audio"
     if rec.is_gemini:
         return "Gemini"
+    if rec.is_mai:
+        return "MAI"
     if rec.is_elevenlabs:
         return "ElevenLabs"
     return "MiniMax" if rec.is_minimax else "Piper"

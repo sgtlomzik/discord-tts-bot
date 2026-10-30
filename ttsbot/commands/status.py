@@ -30,6 +30,7 @@ def register(bot, tts_group, fallback_group, shared: dict) -> dict:
         cache = getattr(disp, "cache", None)
         fish = disp.provider_for("fish")
         gemini = disp.provider_for("gemini")
+        mai = disp.provider_for("mai")
         elevenlabs = disp.provider_for("elevenlabs")
         embed = discord.Embed(title="📊 TTS • Статистика", color=0x5865F2)
         if cache is not None:
@@ -67,6 +68,12 @@ def register(bot, tts_group, fallback_group, shared: dict) -> dict:
             embed.add_field(
                 name="Gemini запросы / символы (сессия)",
                 value=f"{_fmt_int(gemini.session_requests)} / {_fmt_int(gemini.session_chars)}",
+                inline=True,
+            )
+        if mai is not None:
+            embed.add_field(
+                name="MAI запросы / символы (сессия)",
+                value=f"{_fmt_int(mai.session_requests)} / {_fmt_int(mai.session_chars)}",
                 inline=True,
             )
         if elevenlabs is not None:
@@ -152,6 +159,8 @@ def register(bot, tts_group, fallback_group, shared: dict) -> dict:
                     extra += f" · {rec.fish.emotion}"
             elif rec.is_gemini and rec.gemini is not None:
                 extra = f" · {rec.gemini.voice}"
+            elif rec.is_mai and rec.mai is not None:
+                extra = f" · {rec.mai.voice}"
             elif rec.is_elevenlabs and rec.elevenlabs is not None:
                 configured = _configured_model("elevenlabs", "eleven_v4_turbo")
                 extra = f" · {rec.elevenlabs.model or configured}"

@@ -106,7 +106,7 @@ python bot.py
 | `FISH_REFERENCE_ID` | ID голоса Fish; создаёт профиль `fish-default` |
 | `FISH_TTFA_TIMEOUT` | Сколько секунд ждать первый аудиопакет от Fish до перехода на Piper (по умолчанию 5) |
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEYS` | Включает ElevenLabs; несколько ключей образуют кольцо (см. ниже) |
-| `OPENROUTER_API_KEY` | Включает голоса Gemini через OpenRouter (опционально) |
+| `OPENROUTER_API_KEY` | Включает голоса Gemini и MAI-Voice через OpenRouter (опционально) |
 | `TTS_QUOTA_COOLDOWN_SECONDS` | Пауза для облачного сервиса, когда закончился баланс или лимит тарифа (по умолчанию 1800) |
 | `OWNER_IDS` | Кто может менять общие для всех серверов настройки (владелец приложения бота может всегда) |
 

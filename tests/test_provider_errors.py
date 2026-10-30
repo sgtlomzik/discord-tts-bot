@@ -10,7 +10,8 @@ import unittest
 
 import httpx
 
-from ttsbot.gemini import GeminiError, _http_error as gemini_http_error
+from ttsbot.gemini import GeminiError
+from ttsbot.openrouter import http_error as gemini_http_error
 from ttsbot.health import FailureKind, classify_failure
 
 

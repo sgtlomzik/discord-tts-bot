@@ -459,7 +459,7 @@ QUICK_CHECK_SECONDS = 60.0
 RESET_MARGIN_SECONDS = 120.0
 
 PROVIDER_LABELS = {
-    "minimax": "MiniMax", "fish": "Fish", "gemini": "Gemini", "elevenlabs": "ElevenLabs",
+    "minimax": "MiniMax", "fish": "Fish", "gemini": "Gemini", "mai": "MAI", "elevenlabs": "ElevenLabs",
     "piper": "Piper",
 }
 

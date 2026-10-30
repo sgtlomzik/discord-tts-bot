@@ -98,7 +98,7 @@ def register(bot, tts_group, fallback_group, shared: dict) -> dict:
     _PROVIDER_CHOICES = [
         app_commands.Choice(name=label, value=name)
         for name, label in (("elevenlabs", "ElevenLabs"), ("fish", "Fish Audio"),
-                            ("gemini", "Gemini"), ("minimax", "MiniMax"))
+                            ("gemini", "Gemini"), ("mai", "MAI"), ("minimax", "MiniMax"))
     ]
 
     @fallback_group.command(name="status", description="Состояние TTS-провайдеров: паузы, квоты, цепочка")
