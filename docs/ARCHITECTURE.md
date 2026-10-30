@@ -56,9 +56,11 @@ The active runtime pieces are:
   - `pipeline.py` - Piper/MiniMax/Fish/Gemini/ElevenLabs synthesis, the
     streaming paths and the prefetch generation worker.
   - `playback.py` - PCM preparation and the continuous Opus player feed.
-  - `commands.py` - `build_commands(bot)` creates the /voicebot and
-    /fallback groups bound to a bot instance; `events.py` -
-    `register_events(bot)`.
+  - `commands/` - `build_commands(bot)` creates the /voicebot and
+    /fallback groups bound to a bot instance; one module per area
+    (`server`, `voices`, `emoji`, `fallback`, `status`, `prefix`) registers
+    its commands, `completion` the shared autocompletes and `common` the
+    guards tests patch; `events.py` - `register_events(bot)`.
   - `recording/` - voice receive (off unless `RECORDING_ENABLED=1`):
     `client.py` (a `VoiceClient` subclass), `rtp.py` (transport
     decryption), `recorder.py` (per-stream chunk files with a reorder

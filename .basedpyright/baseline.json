@@ -104,7 +104,7 @@
                 }
             }
         ],
-        "./ttsbot/commands.py": [
+        "./ttsbot/commands/fallback.py": [
             {
                 "code": "reportArgumentType",
                 "range": {
@@ -112,7 +112,9 @@
                     "endColumn": 61,
                     "lineCount": 1
                 }
-            },
+            }
+        ],
+        "./ttsbot/commands/status.py": [
             {
                 "code": "reportAttributeAccessIssue",
                 "range": {
