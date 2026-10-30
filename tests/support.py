@@ -18,6 +18,7 @@ import discord
 
 from ttsbot import app, audio, config, models, store, textnorm, voice_registry
 from ttsbot import commands as tts_commands
+from ttsbot.commands import common as tts_commands_common
 from ttsbot import events as tts_events
 from ttsbot.core import TTSBot, intents
 from ttsbot.statedb import StateDB, import_json_state
@@ -51,13 +52,20 @@ def _names(module) -> dict:
 def load_bot_module() -> types.SimpleNamespace:
     bot, objects = app.create_bot()
     ns: dict = {}
-    for module in (textnorm, models, store, audio, tts_commands):
+    for module in (textnorm, models, store, audio):
         ns.update(_names(module))
+    # The commands package's helpers, not its submodules (emoji, status,
+    # ... would shadow textnorm's emoji library and friends).
+    ns.update({name: value for name, value in _names(tts_commands).items()
+               if not isinstance(value, types.ModuleType)})
     ns.update({name: value for name, value in vars(config).items() if name.isupper()})
     ns.update(objects)
     ns.update(
         bot=bot, TTSBot=TTSBot, intents=intents, config=config, voice_registry=voice_registry,
-        tts_commands=tts_commands, tts_events=tts_events, parse_user_ids=config.parse_user_ids,
+        # Tests patch the command guards (is_guild_manager, require_bot_owner,
+        # ...) on bot_mod.tts_commands; the commands call them from
+        # ttsbot.commands.common.
+        tts_commands=tts_commands_common, tts_events=tts_events, parse_user_ids=config.parse_user_ids,
         asyncio=asyncio, time=time, discord=discord,
     )
     return types.SimpleNamespace(**ns)
