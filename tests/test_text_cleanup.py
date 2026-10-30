@@ -35,7 +35,7 @@ class TextCleanupTests(unittest.TestCase):
         self.assertEqual(normalize_for_tts("раз два три четыре", max_chars=13), "раз два три")
 
     def test_a_single_digit_is_still_spoken(self):
-        self.assertEqual(normalize_for_tts("1"), "1")
+        self.assertEqual(normalize_for_tts("1"), "один")
 
     def test_every_path_cleans_the_same_way(self):
         aliases = {"1": "кекис"}

@@ -17,6 +17,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
+from ttsbot import numerals
 from ttsbot import voice_registry
 from ttsbot import plugins
 from ttsbot.fish import FishConfig
@@ -147,6 +148,10 @@ class TTSBot(
             fish.config = replace(fish.config, latency=mode)
 
     async def setup_hook(self) -> None:
+        if config.TTS_NUMBERS:
+            # The morphology dictionary loads in ~0.1 s: now, before the
+            # gateway connects, not on the first message.
+            numerals.warm_up()
         if self.tts_group is not None:
             self.tree.add_command(self.tts_group)
         for group in self.extra_groups:

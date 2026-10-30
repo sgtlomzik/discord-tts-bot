@@ -7,6 +7,9 @@ davey==0.1.5
 piper-tts==1.4.2
 httpx==0.28.1
 emoji==2.15.0
+# Numbers spelled out in Russian (ttsbot/numerals.py); [fast] is the C DAWG
+num2words==0.5.14
+pymorphy3[fast]==2.0.6
 soxr==1.1.0
 # Voice activity detection for recordings (ttsbot/recording/vad.py)
 webrtcvad-wheels==2.0.14

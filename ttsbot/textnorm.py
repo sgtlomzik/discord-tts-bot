@@ -12,6 +12,7 @@ import discord
 import emoji
 
 from ttsbot import config
+from ttsbot.numerals import speak_numbers
 
 log = logging.getLogger("tts_bot")
 
@@ -185,12 +186,16 @@ def speak_unicode_emoji(text: str) -> str:
 # Punctuation that already ends a clause: a line break after it needs no
 # extra period.
 _CLAUSE_END = ".!?…,;:"
+# Text past the length cap kept for spelling out the numbers before it:
+# the words after the last number set its case and gender.
+_NUMBERS_CONTEXT = 100
 
 
 def _clean_for_speech(
     raw: str,
     aliases: dict[str, str] | None = None,
     mentions: dict[str, str] | None = None,
+    limit: int | None = None,
 ) -> str:
     """The spoken form of a Discord message, or "" when nothing is left to say.
 
@@ -198,9 +203,12 @@ def _clean_for_speech(
     become their alias (by id), then the legacy name in EMOJI_MAP, else
     silence; mentions become the resolved name, else silence; Unicode emoji
     are spoken by name; invisible and control characters are dropped. Each
-    line break ends a sentence unless the line already ends one. A result
-    without a single letter or digit ("...", a row of unaliased emoji) is
-    nothing to say, so it is never synthesized.
+    line break ends a sentence unless the line already ends one. Numbers
+    become Russian words (TTS_NUMBERS) last, so those in mentioned names
+    and emoji names do too; with a length ``limit`` only the text it can
+    keep is spelled out. A result without a single letter or digit ("...",
+    a row of unaliased emoji) is nothing to say, so it is never
+    synthesized.
     """
     if not raw:
         return ""
@@ -224,6 +232,16 @@ def _clean_for_speech(
         if spoken:
             spoken += " " if spoken[-1] in _CLAUSE_END else ". "
         spoken += line
+    if config.TTS_NUMBERS:
+        if limit and len(spoken) > limit + _NUMBERS_CONTEXT:
+            # Words are no shorter than the digits they replace, so the cap
+            # keeps no more than this; the rest would only cost time (a
+            # 4000-character message of numbers took 26 ms to spell).
+            spoken = spoken[:limit + _NUMBERS_CONTEXT].rsplit(" ", 1)[0]
+        try:
+            spoken = speak_numbers(spoken)
+        except Exception:
+            log.exception("Spelling out numbers failed; the digits stay")
     return spoken if any(ch.isalnum() for ch in spoken) else ""
 
 
@@ -246,10 +264,10 @@ def normalize_for_tts(
     """The text to synthesize: the spoken form, capped at ``max_chars``
     (MAX_TEXT_LENGTH by default) between words. None when nothing is left
     to say: the caller drops the message instead of spending a request."""
-    text = _clean_for_speech(raw, emoji_aliases, mentions)
+    limit = max_chars if max_chars is not None else config.MAX_TEXT_LENGTH
+    text = _clean_for_speech(raw, emoji_aliases, mentions, limit)
     if not text:
         return None
-    limit = max_chars if max_chars is not None else config.MAX_TEXT_LENGTH
     if limit and len(text) > limit:
         cut = text[:limit]
         if not text[limit].isspace() and " " in cut:
