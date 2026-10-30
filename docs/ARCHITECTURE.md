@@ -114,7 +114,8 @@ configured `tts-connection-keepalive`, `tts-provider-health` and
 
 ### 3.2 Message Intake
 
-`on_message()` lets a message in when the guild has TTS on, the author is
+`on_message()` skips `!tts ...` prefix commands (`COMMAND_PREFIXES`) and
+lets a message in when the guild has TTS on, the author is
 allowed (the guild's list or `WHITELIST_USERS`, unless the guild denied
 them) and is in a voice channel. `queue_message()` hands the raw text and
 its resolved mentions to `enqueue_tts()`, which cleans it once, applies
@@ -127,6 +128,12 @@ or merged.
 `on_voice_state_update()` auto-connects when an allowed member joins or
 switches a channel (not on mute, deafen or stream toggles) and schedules
 the idle disconnect when no allowed member remains with the bot.
+
+`on_ready()` (start, and every reconnect that could not resume the
+session) schedules `rejoin_occupied_voice()`: in each enabled guild the
+bot is not connected in, it joins the voice channel with the most allowed
+members through `auto_connect_for_member()`, so the same checks apply and
+recording resumes without waiting for someone to move.
 
 ## 4. Queue and Worker Model
 
@@ -343,7 +350,8 @@ silence trimmed by ffmpeg (`TTS_TRIM_SILENCE`).
 The bot manages voice state separately from synthesis. It is kept in the
 guild's `GuildSession`, next to its queue:
 
-- `voice_lock` prevents concurrent connect/move races;
+- `voice_lock` serialises connects, moves and disconnects (idle and
+  explicit), so a disconnect never lands before a connect in progress;
 - `connect_cooldown_until` prevents rapid retry loops after a failed
   connect or move; it is checked only when the bot has to connect or move,
   never against a connection that already works (`VoiceCooldown` skips the
@@ -352,14 +360,19 @@ guild's `GuildSession`, next to its queue:
   allowed members, and `idle_stop_task` stops an idle continuous player;
 - `auto_connect_suppressed_until` holds auto-connect off briefly after an
   explicit or idle disconnect;
-- `player` is the guild's `ContinuousTTSAudioSource`.
+- `player` is the guild's `ContinuousTTSAudioSource`; `queue-clear`
+  cancels the jobs and calls `player.clear()`, which cuts the phrase being
+  spoken.
 
 This is a good separation to preserve when adding a new engine, because the TTS backend should not be responsible for voice lifecycle policy.
 
 ### 7.1 Voice recording
 
 With `RECORDING_ENABLED=1` the bot joins voice undeafened (a deafened
-member receives nothing) as `recording.client.RecordingVoiceClient`.
+member receives nothing) as `recording.client.RecordingVoiceClient`, in
+the guilds listed in `RECORDING_GUILD_IDS` (all guilds when it is empty;
+`voice_lifecycle.records_guild()`). Elsewhere it joins deafened with the
+plain client and only speaks.
 discord.py 2.7 has no receive API, so the client uses two internal hooks,
 which is why requirements.txt pins discord.py:
 
@@ -468,6 +481,12 @@ retention, service), `ttsbot/web` the HTTP layer. The bot's only part in
 it: `session.json` also keeps `guild_name` / `channel_name`, written
 atomically. See [RECORDINGS_WEB.md](RECORDINGS_WEB.md).
 
+The site uses HTTP Basic auth when `WEB_PASSWORD` is set; wrong passwords
+are rate limited per peer (`web.app.FailedLogins`: 10 in 5 minutes give
+429). In production its port is bound to 127.0.0.1 and it is reached
+through nginx_proxy_manager on the LAN and `tailscale serve` (HTTPS) on
+the tailnet; see `docs/internal/CURRENT_STATE.md`.
+
 ## 8. Persistence and Guild State
 
 All persistent state lives in one SQLite file, `data/state.db`
@@ -494,6 +513,12 @@ and `provider_health.json` of earlier versions are imported once on
 startup and left in place (an older image still finds them); a damaged
 `provider_health.json` is skipped with a warning, since it only caches
 provider pauses. `sqlite3 data/state.db .dump` shows everything.
+
+The database runs in WAL mode with `synchronous=NORMAL`: a commit does
+not wait for an fsync (saves run on the event loop), and after a crash or
+power cut the database is consistent, losing at most the last commits.
+Copy `state.db` together with `state.db-wal` (or stop the bot) when
+backing it up.
 
 ## 9. Commands
 
@@ -639,7 +664,11 @@ Stores the active Piper voice model files.
 If the goal is to add a new voice engine, the architecture points that matter most are:
 
 1. keep `on_message()` and `queue_message()` mostly stable;
-2. add the engine at the provider boundary (`TTSDispatcher`, `_stream_voice_into`);
+2. add the engine as a provider plugin: a module with `NAME`,
+   `create(store)` (the configured provider or None) and optionally
+   `seed_voices(registry)`, listed in `PLUGINS` (`ttsbot/plugins.py`); the
+   provider answers `stream_spec(text, voice)` (`ttsbot/streams.py`) and
+   `TTSDispatcher` streams it through the generic path;
 3. preserve `TTSJob`, queueing, and worker flow;
 4. make engine selection a profile-level concern, not a scattered global `if`;
 5. keep playback and voice lifecycle unchanged unless the new engine genuinely needs a different artifact format;

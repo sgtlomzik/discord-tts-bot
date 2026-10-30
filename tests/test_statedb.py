@@ -95,10 +95,20 @@ class SaveFailureTests(_Dir):
         self.db.close()
         super().tearDown()
 
-    def test_a_failed_commit_does_not_block_later_saves(self):
+    def test_a_reader_does_not_block_saves_in_wal_mode(self):
         store = BotConfigStore(self.db, set())
-        # A reader (an sqlite3 shell, a script) holds a shared lock, so the
-        # COMMIT cannot get the exclusive lock it needs.
+        self.other.execute("BEGIN")
+        self.other.execute("SELECT * FROM guilds").fetchall()
+        store.add_user(1, 5)
+        self.other.execute("ROLLBACK")
+        self.assertTrue(BotConfigStore(self.reopen(), set()).is_allowed(1, 5))
+
+    def test_a_failed_commit_does_not_block_later_saves(self):
+        # Rollback journal (WAL can be unavailable, e.g. on some network
+        # filesystems): a reader (an sqlite3 shell, a script) holds a shared
+        # lock, so the COMMIT cannot get the exclusive lock it needs.
+        self.db._conn.execute("PRAGMA journal_mode = DELETE")
+        store = BotConfigStore(self.db, set())
         self.other.execute("BEGIN")
         self.other.execute("SELECT * FROM guilds").fetchall()
         with self.assertRaises(OSError):
