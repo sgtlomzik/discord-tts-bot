@@ -26,6 +26,7 @@ from ttsbot import config
 from ttsbot.recording import rtp
 from ttsbot.recording.recorder import ChannelRecorder, RecorderSettings
 from ttsbot.recording.vad import webrtc_detector_factory
+from ttsbot.voice_connection import PromptVoiceConnectionState, TTSVoiceClient
 
 log = logging.getLogger("tts_bot")
 
@@ -58,7 +59,7 @@ def settings_from_config() -> RecorderSettings:
     )
 
 
-class RecordingVoiceClient(discord.VoiceClient):
+class RecordingVoiceClient(TTSVoiceClient):
     def __init__(self, client: discord.Client, channel: discord.abc.Connectable) -> None:
         self._ssrc_users: dict[int, int] = {}
         self._ignored_ssrcs: set[int] = set()  # Go-Live sound streams
@@ -71,7 +72,7 @@ class RecordingVoiceClient(discord.VoiceClient):
         super().__init__(client, channel)
 
     def create_connection_state(self) -> VoiceConnectionState:
-        return VoiceConnectionState(self, hook=self._ws_hook)
+        return PromptVoiceConnectionState(self, hook=self._ws_hook)
 
     # -- lifecycle -----------------------------------------------------
 
