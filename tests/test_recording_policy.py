@@ -25,6 +25,7 @@ from test_bot import load_bot_module
 from ttsbot.recording import fsutil, worker
 from ttsbot.recording.client import RecordingVoiceClient
 from ttsbot.recording.groq import AudioBudget, TranscriptionError
+from ttsbot.voice_connection import TTSVoiceClient
 from ttsbot.voice_lifecycle import records_guild
 
 
@@ -80,7 +81,7 @@ class ConnectClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_another_guild_joins_deafened_without_recording(self):
         kwargs = await self._connect(2)
-        self.assertNotIn("cls", kwargs)
+        self.assertIs(kwargs.get("cls"), TTSVoiceClient)
         self.assertTrue(kwargs["self_deaf"])
 
 

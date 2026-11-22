@@ -16,6 +16,7 @@ import discord
 
 from ttsbot import config
 from ttsbot.recording.client import RecordingVoiceClient
+from ttsbot.voice_connection import TTSVoiceClient
 
 if TYPE_CHECKING:
     from ttsbot.session import GuildSession
@@ -278,7 +279,7 @@ class VoiceLifecycleMixin:
                             timeout=60.0, self_deaf=False, cls=RecordingVoiceClient
                         )
                     else:
-                        vc = await voice_channel.connect(timeout=60.0, self_deaf=True)
+                        vc = await voice_channel.connect(timeout=60.0, self_deaf=True, cls=TTSVoiceClient)
                 except discord.errors.ClientException as exc:
                     if "Already connected" in str(exc):
                         # State desync: discord.py internal state has an active voice client
@@ -320,11 +321,13 @@ class VoiceLifecycleMixin:
                     self.set_voice_connect_cooldown(guild_id, f"move:{type(exc).__name__}")
                     raise
 
+                # move_to() returns normally after its own 30 s timeout too.
                 log.info(
-                    "Voice move done guild=%s channel=%s took=%.3fs",
+                    "Voice move done guild=%s channel=%s took=%.3fs connected=%s",
                     guild_id,
                     voice_channel.id,
                     time.perf_counter() - started,
+                    vc.is_connected(),
                 )
             else:
                 log.debug(
